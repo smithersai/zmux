@@ -4,7 +4,7 @@ A tmux-style PTY session multiplexer, written in Zig and shipped as a Zig
 package. A long-lived daemon owns the mux model and PTY child processes;
 clients attach and detach over a UNIX-domain JSON-RPC socket.
 
-`zmux` is the session backbone behind [Tabmonsters](https://github.com/smithersai)
+`zmux` is the session backbone behind the [Smithers App](https://github.com/smithersai)
 and is intended for any application that needs persistent terminal sessions
 without depending on `tmux(1)` itself: native desktop apps, GTK frontends,
 web terminals, headless agent runtimes, and CI fixtures all attach to the
