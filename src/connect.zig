@@ -1,7 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const rpc_line_reader = @import("rpc_line_reader.zig");
 
 const posix = std.posix;
+const LineReader = rpc_line_reader.LineReader;
 
 const buffer_size: usize = 32 * 1024;
 const rpc_line_max: usize = 1024 * 1024;
@@ -61,10 +63,12 @@ pub fn main() !void {
 
     const socket_fd = try connectWithRetry(allocator, path, spawn_daemon);
     defer posix.close(socket_fd);
+    var socket_reader: LineReader = .{};
 
     const initial_size = terminalSize(0) orelse @as(TerminalSize, .{ .rows = 24, .cols = 80 });
     const attach_response = try attachOrCreate(
         allocator,
+        &socket_reader,
         socket_fd,
         sid,
         initial_size,
@@ -100,7 +104,7 @@ pub fn main() !void {
     // Send an initial resize from our terminal's current size, if known.
     sendResize(allocator, socket_fd, target_pane_id, stdout_fd) catch {};
 
-    runLoop(stdin_fd, stdout_fd, socket_fd, allocator, target_pane_id) catch |err| {
+    runLoop(stdin_fd, stdout_fd, socket_fd, &socket_reader, allocator, target_pane_id) catch |err| {
         restoreTermios();
         var ebuf: [256]u8 = undefined;
         var ew = std.fs.File.stderr().writer(&ebuf);
@@ -118,13 +122,14 @@ pub fn main() !void {
 // payload is returned (so the caller can print it).
 fn attachOrCreate(
     allocator: std.mem.Allocator,
+    reader: *LineReader,
     socket_fd: posix.fd_t,
     sid: []const u8,
     size: TerminalSize,
     auto_create: bool,
     create_command: ?[]const u8,
 ) ![]u8 {
-    var first = try sendAttach(allocator, socket_fd, sid, size, 1);
+    var first = try sendAttach(allocator, reader, socket_fd, sid, size, 1);
     // The errdefer is guarded so the manual `allocator.free(first)` below
     // doesn't double-free if a later step (`sendCreate`, the create
     // response read, the retry attach) returns an error.
@@ -143,17 +148,18 @@ fn attachOrCreate(
     // including this connection, which has not attached yet. Filter on the
     // JSON-RPC `id` so we don't consume a notification as the create
     // response.
-    const create_response = try readRpcResponse(allocator, socket_fd, 2);
+    const create_response = try readRpcResponse(allocator, reader, socket_fd, 2);
     defer allocator.free(create_response);
     if (findJsonField(create_response, "\"error\"")) |_| {
         return try allocator.dupe(u8, create_response);
     }
 
-    return try sendAttach(allocator, socket_fd, sid, size, 3);
+    return try sendAttach(allocator, reader, socket_fd, sid, size, 3);
 }
 
 fn sendAttach(
     allocator: std.mem.Allocator,
+    reader: *LineReader,
     socket_fd: posix.fd_t,
     sid: []const u8,
     size: TerminalSize,
@@ -166,7 +172,7 @@ fn sendAttach(
     );
     defer allocator.free(req);
     try writeAll(socket_fd, req);
-    return readRpcResponse(allocator, socket_fd, rpc_id);
+    return readRpcResponse(allocator, reader, socket_fd, rpc_id);
 }
 
 // Read newline-delimited JSON-RPC frames until we find the response
@@ -174,9 +180,9 @@ fn sendAttach(
 // out-of-order responses are silently discarded. We keep this helper
 // internal to the bootstrap (attach + create) sequence; once `runLoop`
 // takes over it has its own classifier in `processServerLine`.
-fn readRpcResponse(allocator: std.mem.Allocator, fd: posix.fd_t, expected_id: u32) ![]u8 {
+fn readRpcResponse(allocator: std.mem.Allocator, reader: *LineReader, fd: posix.fd_t, expected_id: u32) ![]u8 {
     while (true) {
-        const line = try readLineAlloc(allocator, fd, rpc_line_max);
+        const line = try reader.readLineAlloc(allocator, fd, rpc_line_max);
         if (matchesRpcId(allocator, line, expected_id)) return line;
         allocator.free(line);
     }
@@ -234,6 +240,7 @@ fn runLoop(
     stdin_fd: posix.fd_t,
     stdout_fd: posix.fd_t,
     socket_fd: posix.fd_t,
+    reader: *LineReader,
     allocator: std.mem.Allocator,
     session_id: []const u8,
 ) !void {
@@ -252,9 +259,7 @@ fn runLoop(
         if (ready == 0) continue;
 
         if ((fds[1].revents & posix.POLL.IN) != 0) {
-            const line = try readLineAlloc(allocator, socket_fd, rpc_line_max);
-            defer allocator.free(line);
-            if (try handleServerLine(allocator, line, session_id, stdout_fd)) return;
+            if (try handleReadableSocket(allocator, reader, socket_fd, session_id, stdout_fd)) return;
         }
 
         if ((fds[1].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return;
@@ -272,6 +277,26 @@ fn runLoop(
 
         if ((fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return;
     }
+}
+
+fn handleReadableSocket(
+    allocator: std.mem.Allocator,
+    reader: *LineReader,
+    socket_fd: posix.fd_t,
+    session_id: []const u8,
+    stdout_fd: posix.fd_t,
+) !bool {
+    const first_line = try reader.readLineAlloc(allocator, socket_fd, rpc_line_max);
+    defer allocator.free(first_line);
+    if (try handleServerLine(allocator, first_line, session_id, stdout_fd)) return true;
+
+    while (try reader.nextBufferedLineAlloc(allocator, rpc_line_max)) |line| {
+        const should_exit = try handleServerLine(allocator, line, session_id, stdout_fd);
+        allocator.free(line);
+        if (should_exit) return true;
+    }
+
+    return false;
 }
 
 fn connectWithRetry(allocator: std.mem.Allocator, path: []const u8, spawn_daemon: bool) !posix.fd_t {
@@ -472,22 +497,6 @@ fn writeAll(fd: posix.fd_t, bytes: []const u8) !void {
 
 fn writeAllFd(fd: posix.fd_t, bytes: []const u8) !void {
     return writeAll(fd, bytes);
-}
-
-fn readLineAlloc(allocator: std.mem.Allocator, fd: posix.fd_t, max_len: usize) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    while (out.items.len < max_len) {
-        var byte: [1]u8 = undefined;
-        const n = posix.read(fd, &byte) catch |err| switch (err) {
-            error.WouldBlock => continue,
-            else => return err,
-        };
-        if (n == 0) return error.ConnectionClosed;
-        try out.append(allocator, byte[0]);
-        if (byte[0] == '\n') return out.toOwnedSlice(allocator);
-    }
-    return error.MessageTooLarge;
 }
 
 fn handleServerLine(
