@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const server_mod = @import("server.zig");
 
 const default_idle_timeout_seconds: i64 = 60 * 60;
+const startup_probe_timeout_ms: i64 = 2000;
 var shutdown_requested = std.atomic.Value(bool).init(false);
 
 const StartLock = struct {
@@ -53,13 +54,16 @@ pub fn main() !void {
         try socketPath(allocator);
     defer allocator.free(path);
 
+    detachFromControllingTerminal();
+    installShutdownHandlers();
+
     var start_lock: ?StartLock = try acquireStartLock(allocator, path);
     defer if (start_lock) |*lock| lock.release();
 
     // If a server came up while we waited for the lock, this daemon instance
     // has nothing to do. Exiting successfully mirrors tmux's start-server
     // race behavior without unlinking another server's live socket.
-    if (socketAcceptsConnection(path)) return;
+    if (socketPathExists(path) and waitForSocketAcceptsConnection(path, startup_probe_timeout_ms)) return;
 
     var server = try server_mod.Server.init(allocator, path, idle_timeout_seconds);
     if (start_lock) |*lock| {
@@ -69,7 +73,6 @@ pub fn main() !void {
     try writePidFile(allocator);
     defer server.deinit();
     server.shutdown_probe = shutdownRequested;
-    installShutdownHandlers();
     try server.run();
 }
 
@@ -147,6 +150,20 @@ fn socketAcceptsConnection(socket_path: []const u8) bool {
     return true;
 }
 
+fn waitForSocketAcceptsConnection(socket_path: []const u8, timeout_ms: i64) bool {
+    const deadline_ms = std.time.milliTimestamp() + timeout_ms;
+    while (true) {
+        if (socketAcceptsConnection(socket_path)) return true;
+        if (std.time.milliTimestamp() >= deadline_ms) return false;
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+    }
+}
+
+fn socketPathExists(socket_path: []const u8) bool {
+    std.fs.accessAbsolute(socket_path, .{}) catch return false;
+    return true;
+}
+
 fn printUsage() !void {
     var buffer: [1024]u8 = undefined;
     var stderr = std.fs.File.stderr().writer(&buffer);
@@ -166,6 +183,11 @@ fn shutdownSignalHandler(_: c_int) callconv(.c) void {
     shutdown_requested.store(true, .seq_cst);
 }
 
+fn detachFromControllingTerminal() void {
+    if (builtin.os.tag == .windows) return;
+    _ = std.c.setsid();
+}
+
 fn installShutdownHandlers() void {
     var act: std.posix.Sigaction = undefined;
     @memset(std.mem.asBytes(&act), 0);
@@ -174,7 +196,13 @@ fn installShutdownHandlers() void {
     act.flags = 0;
     std.posix.sigaction(std.c.SIG.TERM, &act, null);
     std.posix.sigaction(std.c.SIG.INT, &act, null);
-    std.posix.sigaction(std.c.SIG.HUP, &act, null);
+
+    var ignore_hup: std.posix.Sigaction = undefined;
+    @memset(std.mem.asBytes(&ignore_hup), 0);
+    ignore_hup.handler = .{ .handler = std.posix.SIG.IGN };
+    ignore_hup.mask = std.mem.zeroes(std.posix.sigset_t);
+    ignore_hup.flags = 0;
+    std.posix.sigaction(std.c.SIG.HUP, &ignore_hup, null);
 }
 
 test "socket path falls back to smithers directory" {
