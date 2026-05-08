@@ -21,6 +21,8 @@ pub fn main() !void {
     var session_id: ?[]const u8 = null;
     var explicit_socket_path: ?[]const u8 = null;
     var spawn_daemon = false;
+    var auto_create = true;
+    var create_command: ?[]const u8 = null;
 
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -31,6 +33,12 @@ pub fn main() !void {
             explicit_socket_path = argv[i];
         } else if (std.mem.eql(u8, a, "--spawn-daemon")) {
             spawn_daemon = true;
+        } else if (std.mem.eql(u8, a, "--no-create")) {
+            auto_create = false;
+        } else if (std.mem.eql(u8, a, "--command")) {
+            i += 1;
+            if (i >= argv.len) return fail("missing value for --command", .{});
+            create_command = argv[i];
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             try printUsage();
             return;
@@ -55,15 +63,14 @@ pub fn main() !void {
     defer posix.close(socket_fd);
 
     const initial_size = terminalSize(0) orelse @as(TerminalSize, .{ .rows = 24, .cols = 80 });
-    const attach_req = try std.fmt.allocPrint(
+    const attach_response = try attachOrCreate(
         allocator,
-        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"client.attach\",\"params\":{{\"paneId\":{f},\"rows\":{},\"cols\":{}}}}}\n",
-        .{ std.json.fmt(sid, .{}), initial_size.rows, initial_size.cols },
+        socket_fd,
+        sid,
+        initial_size,
+        auto_create,
+        create_command,
     );
-    defer allocator.free(attach_req);
-    try writeAll(socket_fd, attach_req);
-
-    const attach_response = try readLineAlloc(allocator, socket_fd, rpc_line_max);
     defer allocator.free(attach_response);
     if (findJsonField(attach_response, "\"error\"")) |_| {
         try stderrWrite(attach_response);
@@ -93,6 +100,113 @@ pub fn main() !void {
         ew.interface.flush() catch {};
         std.process.exit(1);
     };
+}
+
+// Send `client.attach` and, if the daemon reports `PaneNotFound` and
+// `auto_create` is enabled, try `session.create` followed by a second attach.
+// On success the returned slice is the final `client.attach` response and the
+// caller owns it. Errors propagating from the underlying I/O bubble up
+// unchanged. If both attempts return JSON-RPC errors, the latest error
+// payload is returned (so the caller can print it).
+fn attachOrCreate(
+    allocator: std.mem.Allocator,
+    socket_fd: posix.fd_t,
+    sid: []const u8,
+    size: TerminalSize,
+    auto_create: bool,
+    create_command: ?[]const u8,
+) ![]u8 {
+    var first = try sendAttach(allocator, socket_fd, sid, size, 1);
+    // The errdefer is guarded so the manual `allocator.free(first)` below
+    // doesn't double-free if a later step (`sendCreate`, the create
+    // response read, the retry attach) returns an error.
+    errdefer if (first.len != 0) allocator.free(first);
+
+    if (!isPaneNotFound(first)) return first;
+    if (!auto_create) return first;
+
+    allocator.free(first);
+    first = &.{};
+
+    try sendCreate(allocator, socket_fd, sid, size, create_command, 2);
+
+    // The daemon broadcasts pane_output / pane_activity / pane_bell
+    // notifications to every connection as soon as the PTY child starts —
+    // including this connection, which has not attached yet. Filter on the
+    // JSON-RPC `id` so we don't consume a notification as the create
+    // response.
+    const create_response = try readRpcResponse(allocator, socket_fd, 2);
+    defer allocator.free(create_response);
+    if (findJsonField(create_response, "\"error\"")) |_| {
+        return try allocator.dupe(u8, create_response);
+    }
+
+    return try sendAttach(allocator, socket_fd, sid, size, 3);
+}
+
+fn sendAttach(
+    allocator: std.mem.Allocator,
+    socket_fd: posix.fd_t,
+    sid: []const u8,
+    size: TerminalSize,
+    rpc_id: u32,
+) ![]u8 {
+    const req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"client.attach\",\"params\":{{\"paneId\":{f},\"rows\":{},\"cols\":{}}}}}\n",
+        .{ rpc_id, std.json.fmt(sid, .{}), size.rows, size.cols },
+    );
+    defer allocator.free(req);
+    try writeAll(socket_fd, req);
+    return readRpcResponse(allocator, socket_fd, rpc_id);
+}
+
+// Read newline-delimited JSON-RPC frames until we find the response
+// matching `expected_id`. Notifications (no `id` field) and any
+// out-of-order responses are silently discarded. We keep this helper
+// internal to the bootstrap (attach + create) sequence; once `runLoop`
+// takes over it has its own classifier in `processServerLine`.
+fn readRpcResponse(allocator: std.mem.Allocator, fd: posix.fd_t, expected_id: u32) ![]u8 {
+    while (true) {
+        const line = try readLineAlloc(allocator, fd, rpc_line_max);
+        if (matchesRpcId(allocator, line, expected_id)) return line;
+        allocator.free(line);
+    }
+}
+
+fn matchesRpcId(allocator: std.mem.Allocator, line: []const u8, expected_id: u32) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const id_value = parsed.value.object.get("id") orelse return false;
+    if (id_value != .integer) return false;
+    return id_value.integer == @as(i64, expected_id);
+}
+
+fn sendCreate(
+    allocator: std.mem.Allocator,
+    socket_fd: posix.fd_t,
+    sid: []const u8,
+    size: TerminalSize,
+    command: ?[]const u8,
+    rpc_id: u32,
+) !void {
+    const req = if (command) |cmd| try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"session.create\",\"params\":{{\"id\":{f},\"rows\":{},\"cols\":{},\"command\":{f}}}}}\n",
+        .{ rpc_id, std.json.fmt(sid, .{}), size.rows, size.cols, std.json.fmt(cmd, .{}) },
+    ) else try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"session.create\",\"params\":{{\"id\":{f},\"rows\":{},\"cols\":{}}}}}\n",
+        .{ rpc_id, std.json.fmt(sid, .{}), size.rows, size.cols },
+    );
+    defer allocator.free(req);
+    try writeAll(socket_fd, req);
+}
+
+fn isPaneNotFound(response: []const u8) bool {
+    if (findJsonField(response, "\"error\"") == null) return false;
+    return findJsonField(response, "\"PaneNotFound\"") != null;
 }
 
 fn runLoop(
@@ -486,7 +600,14 @@ fn printUsage() !void {
     var w = std.fs.File.stderr().writer(&buf);
     try w.interface.writeAll(
         \\Usage: zmux-connect <session_id> [--socket PATH] [--spawn-daemon]
+        \\                    [--no-create] [--command CMD]
         \\       smithers-session-connect <session_id> [--socket PATH] [--spawn-daemon]
+        \\                                [--no-create] [--command CMD]
+        \\
+        \\If <session_id> is not an existing pane id or session name, a new
+        \\session with that name is created and then attached. Pass --no-create
+        \\to require an existing session, or --command to override the shell
+        \\command spawned in the new session.
         \\
     );
     try w.interface.flush();

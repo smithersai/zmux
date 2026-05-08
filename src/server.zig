@@ -324,7 +324,11 @@ pub const Server = struct {
     }
 
     fn createSession(self: *Server, connection: *ClientConnection, req: *const protocol.Request) !void {
-        var create_args = try muxCreateArgsFromParams(self.allocator, req.params());
+        // session.create is the only place where `id` should also stand in
+        // for the session title — for window.new / pane.split the same `id`
+        // field is the existing target alias, so it must NOT be repurposed
+        // as the new window/pane title.
+        var create_args = try muxCreateArgsFromParams(self.allocator, req.params(), .{ .id_aliases_title = true });
         defer create_args.deinit();
 
         const created = try self.manager.create(create_args.opts);
@@ -344,7 +348,7 @@ pub const Server = struct {
         const session_id = sessionIdParam(req.params()) orelse {
             return self.writeError(connection, req.id_json, protocol.ErrorCode.invalid_params, "sessionId is required");
         };
-        var create_args = try muxCreateArgsFromParams(self.allocator, req.params());
+        var create_args = try muxCreateArgsFromParams(self.allocator, req.params(), .{});
         defer create_args.deinit();
         _ = try self.manager.newWindow(session_id, create_args.opts);
         try self.writeSnapshotResponse(connection, req.id_json);
@@ -354,7 +358,7 @@ pub const Server = struct {
         const pane_id = paneIdParam(req.params()) orelse {
             return self.writeError(connection, req.id_json, protocol.ErrorCode.invalid_params, "paneId is required");
         };
-        var create_args = try muxCreateArgsFromParams(self.allocator, req.params());
+        var create_args = try muxCreateArgsFromParams(self.allocator, req.params(), .{});
         defer create_args.deinit();
         _ = try self.manager.splitPane(pane_id, axisParam(req.params()), create_args.opts);
         try self.writeSnapshotResponse(connection, req.id_json);
@@ -911,14 +915,27 @@ const MuxCreateArgs = struct {
     }
 };
 
-fn muxCreateArgsFromParams(allocator: Allocator, params: ?Value) !MuxCreateArgs {
+const CreateArgsOptions = struct {
+    // When true, `id` falls back into the title slot. Only `session.create`
+    // sets this — for `window.new` and `pane.split` the request's `id` field
+    // already aliases the *target* (via paneIdParam / sessionIdParam), and
+    // repurposing it as the new window/pane title would silently rename
+    // them on every call.
+    id_aliases_title: bool = false,
+};
+
+fn muxCreateArgsFromParams(allocator: Allocator, params: ?Value, options: CreateArgsOptions) !MuxCreateArgs {
     const env_entries = try envEntriesFromParams(allocator, params);
     errdefer if (env_entries) |entries| freeStringSlice(allocator, entries);
+    const title_keys: []const []const u8 = if (options.id_aliases_title)
+        &.{ "title", "name", "id" }
+    else
+        &.{ "title", "name" };
     return .{
         .allocator = allocator,
         .env_entries = env_entries,
         .opts = .{
-            .title = firstStringParam(params, &.{ "title", "name" }),
+            .title = firstStringParam(params, title_keys),
             .shell = stringParam(params, "shell"),
             .command = stringParam(params, "command"),
             .cwd = firstStringParam(params, &.{ "cwd", "workingDirectory" }),

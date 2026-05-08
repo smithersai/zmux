@@ -130,7 +130,9 @@ Produces:
 
 ## Quickstart
 
-Start the daemon on a private socket, create a session, attach a client:
+Start the daemon on a private socket, then attach a client. If the named
+session does not yet exist, `zmux-connect` creates it automatically and
+attaches:
 
 ```sh
 # Terminal 1 — daemon
@@ -140,6 +142,9 @@ zmuxd --socket /tmp/zmux.sock
 zmux-connect work --socket /tmp/zmux.sock
 ```
 
+Pass `--no-create` to require an existing session, or `--command CMD` to
+override the shell command spawned in the new session.
+
 Drive the same daemon programmatically — every method is JSON-RPC 2.0:
 
 ```sh
@@ -147,6 +152,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"daemon.ping"}' \
   | nc -U /tmp/zmux.sock
 # {"jsonrpc":"2.0","id":1,"result":{"version":"0.1.0"}}
 ```
+
+`session.create` accepts `id` (or equivalently `name`/`title`) as the
+human-readable session name; the daemon allocates a separate auto-generated
+pane id and returns it in the response. `client.attach` accepts either id
+form for `paneId` — i.e. `"work"` or `"pane-1-…"`.
 
 ```sh
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"session.create",
