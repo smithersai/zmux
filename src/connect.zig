@@ -77,6 +77,14 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
+    // The user may have launched us with a session NAME ("work"), but every
+    // subsequent RPC (`session.send`, `session.resize`) is routed through
+    // the daemon's pane lookup, which is keyed on the auto-generated pane
+    // id. Pull the canonical paneId out of the attach response so we don't
+    // try to resolve a name on every keystroke.
+    const target_pane_id = paneIdFromAttach(allocator, attach_response) catch try allocator.dupe(u8, sid);
+    defer allocator.free(target_pane_id);
+
     const stdin_fd: posix.fd_t = 0;
     const stdout_fd: posix.fd_t = 1;
 
@@ -90,9 +98,9 @@ pub fn main() !void {
     replayScrollbackFromAttach(allocator, attach_response, stdout_fd) catch {};
 
     // Send an initial resize from our terminal's current size, if known.
-    sendResize(allocator, socket_fd, sid, stdout_fd) catch {};
+    sendResize(allocator, socket_fd, target_pane_id, stdout_fd) catch {};
 
-    runLoop(stdin_fd, stdout_fd, socket_fd, allocator, sid) catch |err| {
+    runLoop(stdin_fd, stdout_fd, socket_fd, allocator, target_pane_id) catch |err| {
         restoreTermios();
         var ebuf: [256]u8 = undefined;
         var ew = std.fs.File.stderr().writer(&ebuf);
@@ -207,6 +215,19 @@ fn sendCreate(
 fn isPaneNotFound(response: []const u8) bool {
     if (findJsonField(response, "\"error\"") == null) return false;
     return findJsonField(response, "\"PaneNotFound\"") != null;
+}
+
+// Extract `result.paneId` (the daemon's canonical pane id) from a
+// `client.attach` response. The daemon answers every input RPC by looking
+// up the pane via that id, so we use it instead of whatever the user
+// passed on the command line (which may be a session name).
+fn paneIdFromAttach(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.MissingPaneId;
+    const result = parsed.value.object.get("result") orelse return error.MissingPaneId;
+    const pane_id = jsonObjectString(result, "paneId") orelse return error.MissingPaneId;
+    return allocator.dupe(u8, pane_id);
 }
 
 fn runLoop(
