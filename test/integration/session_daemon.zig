@@ -821,3 +821,129 @@ fn decodeBase64(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
     try decoder.decode(out, encoded);
     return out;
 }
+
+// Regression: the README quickstart promises `zmux-connect work` "open or
+// create a session named 'work'", but the underlying RPC could not honor it
+// — `session.create` ignored the user-supplied `id`, and `client.attach`
+// only looked up panes by their auto-generated id. This test pins the
+// fix: `session.create { id: "work" }` names the session "work", and
+// `client.attach { paneId: "work" }` resolves through the session name to
+// its active pane.
+test "session.create honors id and client.attach resolves session names" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const socket_path = try tempSocketPath(allocator);
+    defer allocator.free(socket_path);
+    std.fs.deleteFileAbsolute(socket_path) catch {};
+    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+
+    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var ctx = RunServerCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
+
+    var server_stopped = false;
+    errdefer {
+        if (!server_stopped) {
+            server.running.store(false, .seq_cst);
+            thread.join();
+            server.deinit();
+        }
+    }
+
+    try waitForSocket(socket_path, 2_000);
+
+    // session.create with id="work" — the session's title (and therefore
+    // its lookup name) must be set from `id` when no explicit title is
+    // given.
+    {
+        const line = try rpcLine(
+            allocator,
+            socket_path,
+            "{\"id\":1,\"method\":\"session.create\",\"params\":" ++
+                "{\"id\":\"work\",\"shell\":\"/bin/sh\",\"command\":\"exec /bin/sh\",\"rows\":24,\"cols\":80}}\n",
+            64 * 1024,
+        );
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("error") == null);
+        const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
+        const title_val = result_val.object.get("title") orelse return error.MissingTitle;
+        try std.testing.expectEqualStrings("work", title_val.string);
+    }
+
+    // client.attach with paneId="work" — the daemon must resolve the
+    // session name to the session's active pane and return a client.
+    var session_id_owned: []u8 = &.{};
+    defer if (session_id_owned.len > 0) allocator.free(session_id_owned);
+    var pane_id_owned: []u8 = &.{};
+    defer if (pane_id_owned.len > 0) allocator.free(pane_id_owned);
+    {
+        const line = try rpcLine(
+            allocator,
+            socket_path,
+            "{\"id\":2,\"method\":\"client.attach\",\"params\":" ++
+                "{\"paneId\":\"work\",\"rows\":24,\"cols\":80}}\n",
+            64 * 1024,
+        );
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("error") == null);
+        const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
+        try std.testing.expect(result_val.object.get("clientId") != null);
+        const session_id_val = result_val.object.get("sessionId") orelse return error.MissingSessionId;
+        session_id_owned = try allocator.dupe(u8, session_id_val.string);
+        // The attach response carries the canonical pane id back to the
+        // client so it can route subsequent input through it. Without this
+        // round-trip, a client that only knows the human-readable name
+        // would have to guess at the pane id for every keystroke.
+        const pane_id_val = result_val.object.get("paneId") orelse return error.MissingPaneId;
+        pane_id_owned = try allocator.dupe(u8, pane_id_val.string);
+    }
+
+    // Regression: keystrokes from `zmux-connect` flow through `session.send`,
+    // which the daemon resolves via `Manager.find` (pane-id only). After
+    // `client.attach` the client must use the returned `paneId`, not the
+    // user-supplied session name, or every keystroke gets rejected with
+    // `session not found` — the symptom that broke typing in the first
+    // version of the create-or-attach flow.
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":3,\"method\":\"session.send\",\"params\":{{\"sessionId\":\"{s}\",\"text\":\"PROBE\"}}}}\n",
+            .{pane_id_owned},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("error") == null);
+        const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
+        const ok = result_val.object.get("ok") orelse return error.MissingOk;
+        try std.testing.expect(ok == .bool and ok.bool);
+    }
+
+    // Cleanup: terminate the session and shut down the daemon.
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":4,\"method\":\"session.terminate\",\"params\":{{\"sessionId\":\"{s}\"}}}}\n",
+            .{session_id_owned},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
+        defer allocator.free(line);
+    }
+    {
+        const line = try rpcLine(allocator, socket_path, "{\"id\":5,\"method\":\"daemon.shutdown\",\"params\":{}}\n", 64 * 1024);
+        defer allocator.free(line);
+    }
+
+    thread.join();
+    server.deinit();
+    server_stopped = true;
+    try std.testing.expect(ctx.run_error == null);
+}

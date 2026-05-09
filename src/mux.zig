@@ -510,7 +510,7 @@ pub const Manager = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const found = self.findPaneWithParentsLocked(target_pane_id) orelse return error.PaneNotFound;
+        const found = self.resolveTargetPaneLocked(target_pane_id) orelse return error.PaneNotFound;
         const client_id = try self.nextIdLocked("client", &self.next_client_id);
         errdefer self.allocator.free(client_id);
 
@@ -815,6 +815,27 @@ pub const Manager = struct {
         return null;
     }
 
+    // Resolve a target identifier to a pane. Tries pane id first, then falls
+    // back to session id / session name (resolving to that session's active
+    // window and active pane). This lets clients attach by a tmux-style name
+    // like "work" without having to remember the auto-generated pane id.
+    fn resolveTargetPaneLocked(self: *Manager, id: []const u8) ?struct { session: *Session, window: *Window, pane: *Pane } {
+        if (self.findPaneWithParentsLocked(id)) |hit| {
+            return .{ .session = hit.session, .window = hit.window, .pane = hit.pane };
+        }
+
+        const session = self.findSessionLocked(id) orelse return null;
+        for (session.windows.items) |window| {
+            if (!std.mem.eql(u8, window.id, session.active_window_id)) continue;
+            for (window.panes.items) |pane| {
+                if (std.mem.eql(u8, pane.id, window.active_pane_id)) {
+                    return .{ .session = session, .window = window, .pane = pane };
+                }
+            }
+        }
+        return null;
+    }
+
     fn findPaneLocked(self: *Manager, id: []const u8) ?*Pane {
         const found = self.findPaneWithParentsLocked(id) orelse return null;
         return found.pane;
@@ -1023,6 +1044,50 @@ test "mux manager splits panes and records layout" {
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"kind\":\"split\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"axis\":\"horizontal\"") != null);
+}
+
+test "attachClient resolves a session name to its active pane" {
+    var manager = Manager.init(std.testing.allocator, null);
+    defer manager.deinit();
+
+    const pane = try manager.createSessionPane(.{
+        .title = "work",
+        .shell = "/bin/sh",
+        .command = "true",
+    });
+    const expected_pane_id = try std.testing.allocator.dupe(u8, pane.id);
+    defer std.testing.allocator.free(expected_pane_id);
+
+    const client = try manager.attachClient("work", 24, 80);
+    try std.testing.expectEqualStrings(expected_pane_id, client.pane_id);
+}
+
+test "attachClient still resolves an explicit pane id" {
+    var manager = Manager.init(std.testing.allocator, null);
+    defer manager.deinit();
+
+    const pane = try manager.createSessionPane(.{
+        .title = "work",
+        .shell = "/bin/sh",
+        .command = "true",
+    });
+    const pane_id = try std.testing.allocator.dupe(u8, pane.id);
+    defer std.testing.allocator.free(pane_id);
+
+    const client = try manager.attachClient(pane_id, 24, 80);
+    try std.testing.expectEqualStrings(pane_id, client.pane_id);
+}
+
+test "attachClient on an unknown name returns PaneNotFound" {
+    var manager = Manager.init(std.testing.allocator, null);
+    defer manager.deinit();
+
+    _ = try manager.createSessionPane(.{
+        .title = "work",
+        .shell = "/bin/sh",
+        .command = "true",
+    });
+    try std.testing.expectError(error.PaneNotFound, manager.attachClient("ghost", 24, 80));
 }
 
 test "mux key binding executes tmux-like split command" {

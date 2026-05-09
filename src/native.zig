@@ -275,18 +275,6 @@ pub const NativeSession = struct {
             if (self.state() == .terminated) return;
             self.pollForegroundChange() catch {};
 
-            const readable = self.handle.pollReadable(100) catch {
-                self.markTerminated(null);
-                return;
-            };
-            if (!readable) {
-                if (self.handle.reapExited()) |status| {
-                    self.markTerminated(status);
-                    return;
-                }
-                continue;
-            }
-
             const n = self.handle.read(&read_buf) catch {
                 self.markTerminated(null);
                 return;

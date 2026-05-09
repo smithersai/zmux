@@ -4,9 +4,11 @@ const builtin = @import("builtin");
 const mux = @import("mux.zig");
 const native_mod = @import("native.zig");
 const protocol = @import("protocol.zig");
+const rpc_line_reader = @import("rpc_line_reader.zig");
 
 const Allocator = std.mem.Allocator;
 const NativeSession = native_mod.NativeSession;
+const LineReader = rpc_line_reader.LineReader;
 const Value = std.json.Value;
 const posix = std.posix;
 
@@ -21,6 +23,7 @@ const attach_replay_max_bytes: usize = 256 * 1024;
 const ClientConnection = struct {
     allocator: Allocator,
     fd: posix.fd_t,
+    reader: LineReader = .{},
     write_mutex: std.Thread.Mutex = .{},
     attachment_mutex: std.Thread.Mutex = .{},
     ref_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
@@ -44,10 +47,16 @@ const ClientConnection = struct {
     fn release(self: *ClientConnection) void {
         const prev = self.ref_count.fetchSub(1, .seq_cst);
         if (prev == 1) {
+            // Copy the allocator out of `self` before any destroy: the
+            // ArrayList's deinit + the destroy(self) below both need the
+            // allocator, but reading `self.allocator` after `destroy(self)`
+            // is a use-after-free that the testing allocator's poisoning
+            // turns into a segfault.
+            const allocator = self.allocator;
             var mux_clients = self.takeMuxClients();
-            defer mux_clients.deinit(self.allocator);
-            for (mux_clients.items) |client_id| self.allocator.free(client_id);
-            self.allocator.destroy(self);
+            for (mux_clients.items) |client_id| allocator.free(client_id);
+            mux_clients.deinit(allocator);
+            allocator.destroy(self);
         }
     }
 
@@ -119,7 +128,6 @@ pub const Server = struct {
     listener_fd: posix.fd_t,
     manager: mux.Manager,
     connections: std.ArrayList(*ClientConnection) = .empty,
-    pending_events: std.ArrayList([]u8) = .empty,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     active_connections: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     last_activity_seconds: std.atomic.Value(i64),
@@ -162,9 +170,7 @@ pub const Server = struct {
         self.closeConnections();
         self.manager.event_sink = null;
         self.manager.deinit();
-        self.freePendingEvents();
         self.connections.deinit(self.allocator);
-        self.pending_events.deinit(self.allocator);
         self.allocator.free(self.socket_path);
     }
 
@@ -182,8 +188,6 @@ pub const Server = struct {
         };
         while (!self.shouldStop()) {
             if (self.shouldExitForIdle()) break;
-
-            try self.flushPendingEvents();
 
             var fds = [_]posix.pollfd{.{
                 .fd = self.listener_fd,
@@ -213,8 +217,6 @@ pub const Server = struct {
         while (self.active_connections.load(.seq_cst) > 0 and spins < 100) : (spins += 1) {
             std.Thread.sleep(10 * std.time.ns_per_ms);
         }
-
-        try self.flushPendingEvents();
     }
 
     fn shouldExitForIdle(self: *Server) bool {
@@ -252,7 +254,7 @@ pub const Server = struct {
 
     fn handleClient(self: *Server, connection: *ClientConnection) void {
         while (self.running.load(.seq_cst)) {
-            const line = readLine(self.allocator, connection.fd, max_request_bytes) catch |err| {
+            const line = connection.reader.readLineAllocMaybe(self.allocator, connection.fd, max_request_bytes) catch |err| {
                 if (connection.isClosed()) return;
                 self.writeError(connection, "null", protocol.ErrorCode.parse_error, @errorName(err)) catch {};
                 return;
@@ -324,7 +326,11 @@ pub const Server = struct {
     }
 
     fn createSession(self: *Server, connection: *ClientConnection, req: *const protocol.Request) !void {
-        var create_args = try muxCreateArgsFromParams(self.allocator, req.params());
+        // session.create is the only place where `id` should also stand in
+        // for the session title — for window.new / pane.split the same `id`
+        // field is the existing target alias, so it must NOT be repurposed
+        // as the new window/pane title.
+        var create_args = try muxCreateArgsFromParams(self.allocator, req.params(), .{ .id_aliases_title = true });
         defer create_args.deinit();
 
         const created = try self.manager.create(create_args.opts);
@@ -344,7 +350,7 @@ pub const Server = struct {
         const session_id = sessionIdParam(req.params()) orelse {
             return self.writeError(connection, req.id_json, protocol.ErrorCode.invalid_params, "sessionId is required");
         };
-        var create_args = try muxCreateArgsFromParams(self.allocator, req.params());
+        var create_args = try muxCreateArgsFromParams(self.allocator, req.params(), .{});
         defer create_args.deinit();
         _ = try self.manager.newWindow(session_id, create_args.opts);
         try self.writeSnapshotResponse(connection, req.id_json);
@@ -354,7 +360,7 @@ pub const Server = struct {
         const pane_id = paneIdParam(req.params()) orelse {
             return self.writeError(connection, req.id_json, protocol.ErrorCode.invalid_params, "paneId is required");
         };
-        var create_args = try muxCreateArgsFromParams(self.allocator, req.params());
+        var create_args = try muxCreateArgsFromParams(self.allocator, req.params(), .{});
         defer create_args.deinit();
         _ = try self.manager.splitPane(pane_id, axisParam(req.params()), create_args.opts);
         try self.writeSnapshotResponse(connection, req.id_json);
@@ -688,40 +694,6 @@ pub const Server = struct {
         }
     }
 
-    fn freePendingEvents(self: *Server) void {
-        self.mutex.lock();
-        var pending = self.pending_events;
-        self.pending_events = .empty;
-        self.mutex.unlock();
-
-        defer pending.deinit(self.allocator);
-        for (pending.items) |payload| self.allocator.free(payload);
-    }
-
-    fn enqueueNotification(self: *Server, payload: []u8) void {
-        self.mutex.lock();
-        self.pending_events.append(self.allocator, payload) catch {
-            self.mutex.unlock();
-            self.allocator.free(payload);
-            return;
-        };
-        self.mutex.unlock();
-    }
-
-    fn flushPendingEvents(self: *Server) !void {
-        self.mutex.lock();
-        var pending = self.pending_events;
-        self.pending_events = .empty;
-        self.mutex.unlock();
-
-        defer pending.deinit(self.allocator);
-
-        for (pending.items) |payload| {
-            defer self.allocator.free(payload);
-            try self.broadcast(payload);
-        }
-    }
-
     fn broadcast(self: *Server, payload: []const u8) !void {
         self.mutex.lock();
         const snapshot = self.allocator.alloc(*ClientConnection, self.connections.items.len) catch |err| {
@@ -795,7 +767,8 @@ pub const Server = struct {
             },
         } catch return;
 
-        self.enqueueNotification(payload);
+        defer self.allocator.free(payload);
+        self.broadcast(payload) catch {};
     }
 };
 
@@ -823,29 +796,6 @@ fn setSocketPermissions(allocator: Allocator, socket_path: []const u8) !void {
     defer allocator.free(path_z);
     if (std.c.chmod(path_z.ptr, 0o600) != 0) {
         return error.PermissionDenied;
-    }
-}
-
-fn readLine(allocator: Allocator, fd: posix.fd_t, max_len: usize) !?[]u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
-
-    var byte: [1]u8 = undefined;
-    while (true) {
-        const n = try posix.read(fd, &byte);
-        if (n == 0) {
-            if (out.items.len == 0) {
-                out.deinit(allocator);
-                return null;
-            }
-            return try out.toOwnedSlice(allocator);
-        }
-        if (byte[0] == '\n') {
-            try out.append(allocator, '\n');
-            return try out.toOwnedSlice(allocator);
-        }
-        try out.append(allocator, byte[0]);
-        if (out.items.len > max_len) return error.RequestTooLarge;
     }
 }
 
@@ -911,14 +861,27 @@ const MuxCreateArgs = struct {
     }
 };
 
-fn muxCreateArgsFromParams(allocator: Allocator, params: ?Value) !MuxCreateArgs {
+const CreateArgsOptions = struct {
+    // When true, `id` falls back into the title slot. Only `session.create`
+    // sets this — for `window.new` and `pane.split` the request's `id` field
+    // already aliases the *target* (via paneIdParam / sessionIdParam), and
+    // repurposing it as the new window/pane title would silently rename
+    // them on every call.
+    id_aliases_title: bool = false,
+};
+
+fn muxCreateArgsFromParams(allocator: Allocator, params: ?Value, options: CreateArgsOptions) !MuxCreateArgs {
     const env_entries = try envEntriesFromParams(allocator, params);
     errdefer if (env_entries) |entries| freeStringSlice(allocator, entries);
+    const title_keys: []const []const u8 = if (options.id_aliases_title)
+        &.{ "title", "name", "id" }
+    else
+        &.{ "title", "name" };
     return .{
         .allocator = allocator,
         .env_entries = env_entries,
         .opts = .{
-            .title = firstStringParam(params, &.{ "title", "name" }),
+            .title = firstStringParam(params, title_keys),
             .shell = stringParam(params, "shell"),
             .command = stringParam(params, "command"),
             .cwd = firstStringParam(params, &.{ "cwd", "workingDirectory" }),
@@ -1134,6 +1097,27 @@ test "server deinit unlinks its owned socket" {
 
     server.deinit();
     try std.testing.expect(!socketExists(socket_path));
+}
+
+test "server connection reader keeps leftover request bytes" {
+    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
+
+    const fds = try std.posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    _ = try posix.write(fds[1], "{\"id\":1}\n{\"id\":2}\n");
+
+    var connection = try ClientConnection.create(std.testing.allocator, fds[0]);
+    defer connection.release();
+
+    const first = (try connection.reader.readLineAllocMaybe(std.testing.allocator, fds[0], 64)).?;
+    defer std.testing.allocator.free(first);
+    const second = (try connection.reader.readLineAllocMaybe(std.testing.allocator, fds[0], 64)).?;
+    defer std.testing.allocator.free(second);
+
+    try std.testing.expectEqualStrings("{\"id\":1}\n", first);
+    try std.testing.expectEqualStrings("{\"id\":2}\n", second);
 }
 
 fn tempPath(allocator: Allocator, prefix: []const u8) ![]u8 {
