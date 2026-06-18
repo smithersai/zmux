@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            runner: ubuntu-latest
+            zig_target: x86_64-linux-musl
+          - name: macos-arm64
+            runner: macos-latest
+            zig_target: aarch64-macos
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build (ReleaseSafe)
+        run: zig build -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe
+
+      - name: Rename assets
+        run: |
+          cp zig-out/bin/zmuxd "zmuxd-${{ matrix.name }}"
+          cp zig-out/bin/zmux-connect "zmux-connect-${{ matrix.name }}"
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            zmuxd-${{ matrix.name }}
+            zmux-connect-${{ matrix.name }}
+          fail_on_unmatched_files: true
