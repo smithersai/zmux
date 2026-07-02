@@ -324,7 +324,7 @@ fn sendCreate(
 
 fn isPaneNotFound(response: []const u8) bool {
     if (findJsonField(response, "\"error\"") == null) return false;
-    return findJsonField(response, "\"PaneNotFound\"") != null;
+    return findJsonField(response, "PaneNotFound") != null;
 }
 
 // Extract `result.paneId` (the daemon's canonical pane id) from a
@@ -1249,6 +1249,158 @@ test "readRpcResponse returns ReadTimeout" {
         error.ReadTimeout,
         readRpcResponse(std.testing.allocator, &reader, fds[0], 1, deadline),
     );
+}
+
+fn socketPairForTest() ![2]posix.fd_t {
+    var pair: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &pair) != 0) return error.SkipZigTest;
+    return pair;
+}
+
+fn readRequestLineForTest(allocator: std.mem.Allocator, reader: *LineReader, fd: posix.fd_t) ![]u8 {
+    return reader.readLineAllocWithDeadline(allocator, fd, rpc_line_max, std.time.milliTimestamp() + 2_000);
+}
+
+test "attachOrCreate returns an attach success without creating" {
+    const allocator = std.testing.allocator;
+    const pair = try socketPairForTest();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    try writeAll(pair[1], "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"clientId\":\"client-1\",\"paneId\":\"work\"}}\n");
+
+    var reader: LineReader = .{};
+    const response = try attachOrCreate(
+        allocator,
+        &reader,
+        pair[0],
+        "work",
+        .{ .rows = 24, .cols = 80 },
+        true,
+        null,
+        std.time.milliTimestamp() + 2_000,
+    );
+    defer allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"clientId\":\"client-1\"") != null);
+
+    var request_reader: LineReader = .{};
+    const attach_req = try readRequestLineForTest(allocator, &request_reader, pair[1]);
+    defer allocator.free(attach_req);
+    try std.testing.expect(std.mem.indexOf(u8, attach_req, "\"method\":\"client.attach\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach_req, "\"id\":1") != null);
+}
+
+test "attachOrCreate creates after PaneNotFound and skips interleaved notifications" {
+    const allocator = std.testing.allocator;
+    const pair = try socketPairForTest();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    try writeAll(
+        pair[1],
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"PaneNotFound: work\"}}\n" ++
+            "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{}}\n" ++
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"id\":\"work\"}}\n" ++
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"clientId\":\"client-2\",\"paneId\":\"pane-2\"}}\n",
+    );
+
+    var reader: LineReader = .{};
+    const response = try attachOrCreate(
+        allocator,
+        &reader,
+        pair[0],
+        "work",
+        .{ .rows = 40, .cols = 120 },
+        true,
+        "printf ok",
+        std.time.milliTimestamp() + 2_000,
+    );
+    defer allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"clientId\":\"client-2\"") != null);
+
+    var request_reader: LineReader = .{};
+    const first_attach = try readRequestLineForTest(allocator, &request_reader, pair[1]);
+    defer allocator.free(first_attach);
+    const create_req = try readRequestLineForTest(allocator, &request_reader, pair[1]);
+    defer allocator.free(create_req);
+    const second_attach = try readRequestLineForTest(allocator, &request_reader, pair[1]);
+    defer allocator.free(second_attach);
+
+    try std.testing.expect(std.mem.indexOf(u8, first_attach, "\"method\":\"client.attach\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, create_req, "\"method\":\"session.create\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, create_req, "\"command\":\"printf ok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second_attach, "\"id\":3") != null);
+}
+
+test "attachOrCreate returns PaneNotFound when auto create is disabled" {
+    const allocator = std.testing.allocator;
+    const pair = try socketPairForTest();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    const pane_error = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"PaneNotFound\"}}\n";
+    try writeAll(pair[1], pane_error);
+
+    var reader: LineReader = .{};
+    const response = try attachOrCreate(
+        allocator,
+        &reader,
+        pair[0],
+        "missing",
+        .{ .rows = 24, .cols = 80 },
+        false,
+        null,
+        std.time.milliTimestamp() + 2_000,
+    );
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings(pane_error, response);
+
+    var request_reader: LineReader = .{};
+    const attach_req = try readRequestLineForTest(allocator, &request_reader, pair[1]);
+    defer allocator.free(attach_req);
+    try std.testing.expect(std.mem.indexOf(u8, attach_req, "\"method\":\"client.attach\"") != null);
+}
+
+test "attachOrCreate returns create errors without retrying attach" {
+    const allocator = std.testing.allocator;
+    const pair = try socketPairForTest();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    const create_error = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"bad create\"}}\n";
+    try writeAll(
+        pair[1],
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"PaneNotFound\"}}\n" ++
+            create_error,
+    );
+
+    var reader: LineReader = .{};
+    const response = try attachOrCreate(
+        allocator,
+        &reader,
+        pair[0],
+        "bad",
+        .{ .rows = 24, .cols = 80 },
+        true,
+        null,
+        std.time.milliTimestamp() + 2_000,
+    );
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings(create_error, response);
+
+    var request_reader: LineReader = .{};
+    const attach_req = try readRequestLineForTest(allocator, &request_reader, pair[1]);
+    defer allocator.free(attach_req);
+    const create_req = try readRequestLineForTest(allocator, &request_reader, pair[1]);
+    defer allocator.free(create_req);
+    try std.testing.expect(std.mem.indexOf(u8, attach_req, "\"method\":\"client.attach\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, create_req, "\"method\":\"session.create\"") != null);
+}
+
+test "isPaneNotFound only matches error payloads containing PaneNotFound" {
+    try std.testing.expect(isPaneNotFound("{\"error\":{\"message\":\"PaneNotFound\"}}\n"));
+    try std.testing.expect(!isPaneNotFound("{\"result\":{\"message\":\"PaneNotFound\"}}\n"));
+    try std.testing.expect(!isPaneNotFound("{\"error\":{\"message\":\"other\"}}\n"));
 }
 
 test "paneIdFromAttach extracts canonical pane id" {

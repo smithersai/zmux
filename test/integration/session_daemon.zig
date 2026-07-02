@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const build_options = @import("test_build_options");
 const server_mod = @import("zmux_server");
 
 const posix = std.posix;
@@ -384,13 +385,30 @@ fn waitForCaptureContains(
 const RunServerCtx = struct {
     server: *server_mod.Server,
     run_error: ?anyerror = null,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn run(self: *RunServerCtx) void {
+        defer self.done.store(true, .seq_cst);
         self.server.run() catch |err| {
             self.run_error = err;
         };
     }
 };
+
+var test_shutdown_requested = std.atomic.Value(bool).init(false);
+
+fn testShutdownProbe() bool {
+    return test_shutdown_requested.load(.seq_cst);
+}
+
+fn waitForRunDone(ctx: *RunServerCtx, timeout_ms: i64) !void {
+    const deadline = std.time.milliTimestamp() + timeout_ms;
+    while (std.time.milliTimestamp() < deadline) {
+        if (ctx.done.load(.seq_cst)) return;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    return error.ServerRunTimeout;
+}
 
 fn expectRpcErrorCode(allocator: std.mem.Allocator, line: []const u8, expected_code: i64) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
@@ -402,6 +420,322 @@ fn expectRpcErrorCode(allocator: std.mem.Allocator, line: []const u8, expected_c
     const code_val = err_val.object.get("code") orelse return error.MissingErrorCode;
     try std.testing.expect(code_val == .integer);
     try std.testing.expectEqual(expected_code, code_val.integer);
+}
+
+fn expectNoRpcError(allocator: std.mem.Allocator, line: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    if (parsed.value.object.get("error")) |_| return error.UnexpectedRpcError;
+    _ = parsed.value.object.get("result") orelse return error.MissingResult;
+}
+
+fn expectStringField(value: std.json.Value, field: []const u8) ![]const u8 {
+    if (value != .object) return error.ExpectedObject;
+    const field_value = value.object.get(field) orelse return error.MissingField;
+    if (field_value != .string) return error.ExpectedString;
+    return field_value.string;
+}
+
+fn expectIntegerField(value: std.json.Value, field: []const u8) !i64 {
+    if (value != .object) return error.ExpectedObject;
+    const field_value = value.object.get(field) orelse return error.MissingField;
+    if (field_value != .integer) return error.ExpectedInteger;
+    return field_value.integer;
+}
+
+fn expectBoolField(value: std.json.Value, field: []const u8) !bool {
+    if (value != .object) return error.ExpectedObject;
+    const field_value = value.object.get(field) orelse return error.MissingField;
+    if (field_value != .bool) return error.ExpectedBool;
+    return field_value.bool;
+}
+
+fn responseResult(value: std.json.Value) !std.json.Value {
+    if (value != .object) return error.ExpectedObject;
+    if (value.object.get("error")) |_| return error.UnexpectedRpcError;
+    return value.object.get("result") orelse return error.MissingResult;
+}
+
+fn findPaneInSnapshot(snapshot: std.json.Value, pane_id: []const u8) ?std.json.Value {
+    if (snapshot != .object) return null;
+    const sessions = snapshot.object.get("sessions") orelse return null;
+    if (sessions != .array) return null;
+    for (sessions.array.items) |session| {
+        const windows = session.object.get("windows") orelse continue;
+        if (windows != .array) continue;
+        for (windows.array.items) |window| {
+            const panes = window.object.get("panes") orelse continue;
+            if (panes != .array) continue;
+            for (panes.array.items) |pane| {
+                const id = pane.object.get("id") orelse continue;
+                if (id == .string and std.mem.eql(u8, id.string, pane_id)) return pane;
+            }
+        }
+    }
+    return null;
+}
+
+fn panePidFromSnapshot(allocator: std.mem.Allocator, socket_path: []const u8, pane_id: []const u8) !i64 {
+    const line = try rpcLine(allocator, socket_path, "{\"id\":81,\"method\":\"mux.snapshot\",\"params\":{}}\n", 1024 * 1024);
+    defer allocator.free(line);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    const result_val = try responseResult(parsed.value);
+    const pane = findPaneInSnapshot(result_val, pane_id) orelse return error.MissingPane;
+    return try expectIntegerField(pane, "pid");
+}
+
+fn expectPaneAlert(
+    allocator: std.mem.Allocator,
+    socket_path: []const u8,
+    pane_id: []const u8,
+    field: []const u8,
+    expected: bool,
+) !void {
+    const line = try rpcLine(allocator, socket_path, "{\"id\":82,\"method\":\"mux.snapshot\",\"params\":{}}\n", 1024 * 1024);
+    defer allocator.free(line);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    const result_val = try responseResult(parsed.value);
+    const pane = findPaneInSnapshot(result_val, pane_id) orelse return error.MissingPane;
+    const alerts = pane.object.get("alerts") orelse return error.MissingAlerts;
+    try std.testing.expectEqual(expected, try expectBoolField(alerts, field));
+}
+
+fn expectPaneAlertTimestampNonZero(
+    allocator: std.mem.Allocator,
+    socket_path: []const u8,
+    pane_id: []const u8,
+    field: []const u8,
+) !void {
+    const line = try rpcLine(allocator, socket_path, "{\"id\":83,\"method\":\"mux.snapshot\",\"params\":{}}\n", 1024 * 1024);
+    defer allocator.free(line);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    const result_val = try responseResult(parsed.value);
+    const pane = findPaneInSnapshot(result_val, pane_id) orelse return error.MissingPane;
+    const alerts = pane.object.get("alerts") orelse return error.MissingAlerts;
+    const ts = try expectIntegerField(alerts, field);
+    try std.testing.expect(ts > 0);
+}
+
+fn attachReplay(
+    allocator: std.mem.Allocator,
+    socket_path: []const u8,
+    pane_id: []const u8,
+    rpc_id: i64,
+) ![]u8 {
+    const client = try connectClient(socket_path);
+    defer posix.close(client);
+    const attach_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":{},\"method\":\"client.attach\",\"params\":{{\"paneId\":\"{s}\",\"rows\":24,\"cols\":80}}}}\n",
+        .{ rpc_id, pane_id },
+    );
+    defer allocator.free(attach_req);
+    try writeAll(client, attach_req);
+
+    const line = try readRpcResponseLine(allocator, client, rpc_id, 1024 * 1024);
+    defer allocator.free(line);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    const result_val = try responseResult(parsed.value);
+    const replay_val = result_val.object.get("replayBase64") orelse return error.MissingReplayField;
+    if (replay_val != .string) return error.MissingReplayField;
+    return decodeBase64(allocator, replay_val.string);
+}
+
+fn readNotificationLine(
+    allocator: std.mem.Allocator,
+    fd: posix.fd_t,
+    expected_method: []const u8,
+    expected_pane_id: []const u8,
+    timeout_ms: i64,
+) ![]u8 {
+    const deadline = std.time.milliTimestamp() + timeout_ms;
+    while (true) {
+        const now = std.time.milliTimestamp();
+        if (now >= deadline) return error.NotificationTimeout;
+        const line = try readLineAllocTimeout(allocator, fd, 1024 * 1024, deadline - now);
+        errdefer allocator.free(line);
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch {
+            allocator.free(line);
+            continue;
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) {
+            allocator.free(line);
+            continue;
+        }
+        const method = parsed.value.object.get("method") orelse {
+            allocator.free(line);
+            continue;
+        };
+        if (method != .string or !std.mem.eql(u8, method.string, expected_method)) {
+            allocator.free(line);
+            continue;
+        }
+        const params = parsed.value.object.get("params") orelse {
+            allocator.free(line);
+            continue;
+        };
+        if (params != .object) {
+            allocator.free(line);
+            continue;
+        }
+        const pane_id = params.object.get("pane_id") orelse params.object.get("session_id") orelse {
+            allocator.free(line);
+            continue;
+        };
+        if (pane_id == .string and std.mem.eql(u8, pane_id.string, expected_pane_id)) return line;
+        allocator.free(line);
+    }
+}
+
+fn readPaneOutputContaining(
+    allocator: std.mem.Allocator,
+    fd: posix.fd_t,
+    pane_id: []const u8,
+    needle: []const u8,
+    timeout_ms: i64,
+) ![]u8 {
+    const deadline = std.time.milliTimestamp() + timeout_ms;
+    while (true) {
+        const now = std.time.milliTimestamp();
+        if (now >= deadline) return error.PaneOutputTimeout;
+        const line = try readNotificationLine(allocator, fd, "pane_output", pane_id, deadline - now);
+        defer allocator.free(line);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const params = parsed.value.object.get("params") orelse return error.MissingParams;
+        const encoded = try expectStringField(params, "data_base64");
+        const decoded = try decodeBase64(allocator, encoded);
+        if (std.mem.indexOf(u8, decoded, needle) != null) return decoded;
+        allocator.free(decoded);
+    }
+}
+
+fn expectTermExited(term: std.process.Child.Term, expected_code: u8) !void {
+    switch (term) {
+        .Exited => |code| try std.testing.expectEqual(expected_code, code),
+        else => return error.UnexpectedChildTerm,
+    }
+}
+
+test "built CLI binaries handle version help and unknown flags" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const binaries = [_]struct {
+        path: []const u8,
+        name: []const u8,
+    }{
+        .{ .path = build_options.zmuxd_path, .name = "zmuxd" },
+        .{ .path = build_options.smithers_session_daemon_path, .name = "smithers-session-daemon" },
+        .{ .path = build_options.zmux_connect_path, .name = "zmux-connect" },
+        .{ .path = build_options.smithers_session_connect_path, .name = "smithers-session-connect" },
+    };
+
+    for (binaries) |binary| {
+        {
+            const result = try std.process.Child.run(.{
+                .allocator = allocator,
+                .argv = &.{ binary.path, "--version" },
+                .max_output_bytes = 4096,
+            });
+            defer allocator.free(result.stdout);
+            defer allocator.free(result.stderr);
+            try expectTermExited(result.term, 0);
+            _ = binary.name;
+            try std.testing.expect(std.mem.indexOf(u8, result.stdout, "zmux") != null);
+        }
+        {
+            const result = try std.process.Child.run(.{
+                .allocator = allocator,
+                .argv = &.{ binary.path, "--help" },
+                .max_output_bytes = 4096,
+            });
+            defer allocator.free(result.stdout);
+            defer allocator.free(result.stderr);
+            try expectTermExited(result.term, 0);
+            try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Usage:") != null);
+        }
+        {
+            const result = try std.process.Child.run(.{
+                .allocator = allocator,
+                .argv = &.{ binary.path, "--definitely-not-a-zmux-flag" },
+                .max_output_bytes = 4096,
+            });
+            defer allocator.free(result.stdout);
+            defer allocator.free(result.stderr);
+            switch (result.term) {
+                .Exited => |code| try std.testing.expect(code != 0),
+                else => return error.UnexpectedChildTerm,
+            }
+            try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Usage") != null or
+                std.mem.indexOf(u8, result.stderr, "Try") != null);
+        }
+    }
+}
+
+test "daemon restart over a stale socket file binds and serves" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const socket_path = try tempSocketPath(allocator);
+    defer allocator.free(socket_path);
+    const pid_path = try std.fmt.allocPrint(allocator, "{s}.pid", .{socket_path});
+    defer allocator.free(pid_path);
+    std.fs.deleteFileAbsolute(socket_path) catch {};
+    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    defer std.fs.deleteFileAbsolute(pid_path) catch {};
+
+    var child = std.process.Child.init(&.{ build_options.zmuxd_path, "--socket", socket_path, "--idle-seconds", "0" }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+    var child_running = true;
+    errdefer if (child_running) {
+        _ = std.c.kill(child.id, std.c.SIG.KILL);
+        _ = child.wait() catch {};
+    };
+
+    try waitForSocket(socket_path, 2_000);
+    if (std.c.kill(child.id, std.c.SIG.KILL) != 0) return error.KillFailed;
+    _ = try child.wait();
+    child_running = false;
+    try std.fs.accessAbsolute(socket_path, .{});
+
+    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var ctx = RunServerCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
+    var server_stopped = false;
+    errdefer {
+        if (!server_stopped) {
+            server.running.store(false, .seq_cst);
+            thread.join();
+            server.deinit();
+        }
+    }
+
+    try waitForSocket(socket_path, 2_000);
+    {
+        const line = try rpcLine(allocator, socket_path, "{\"id\":1,\"method\":\"daemon.ping\",\"params\":{}}\n", 64 * 1024);
+        defer allocator.free(line);
+        try expectNoRpcError(allocator, line);
+    }
+    {
+        const line = try rpcLine(allocator, socket_path, "{\"id\":2,\"method\":\"daemon.shutdown\",\"params\":{}}\n", 64 * 1024);
+        defer allocator.free(line);
+    }
+
+    thread.join();
+    server.deinit();
+    server_stopped = true;
+    try std.testing.expect(ctx.run_error == null);
 }
 
 test "daemon JSON-RPC errors are framed and the connection remains usable" {
@@ -453,8 +787,41 @@ test "daemon JSON-RPC errors are framed and the connection remains usable" {
     }
 
     {
-        try writeAll(client, "{\"id\":4,\"method\":\"daemon.ping\",\"params\":{}}\n");
+        try writeAll(client, "{\"id\":4,\"method\":\"client.detach\",\"params\":{\"clientId\":\"client-missing\"}}\n");
         const line = try readRpcResponseLine(allocator, client, 4, 64 * 1024);
+        defer allocator.free(line);
+        try expectRpcErrorCode(allocator, line, -32000);
+    }
+
+    {
+        try writeAll(client, "{\"id\":{\"trace\":[1,2]},\"method\":\"daemon.ping\",\"params\":{}}\n");
+        const line = try readRpcResponseWithAnyId(allocator, client, 64 * 1024);
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const id_val = parsed.value.object.get("id") orelse return error.MissingId;
+        try std.testing.expect(id_val == .object);
+        try std.testing.expect(parsed.value.object.get("result") != null);
+    }
+
+    {
+        const oversized = try allocator.alloc(u8, 1024 * 1024 + 2);
+        defer allocator.free(oversized);
+        @memset(oversized[0 .. oversized.len - 1], 'x');
+        oversized[oversized.len - 1] = '\n';
+
+        const overflow = try connectClient(socket_path);
+        defer posix.close(overflow);
+        try writeAll(overflow, oversized);
+        const line = try readRpcResponseWithAnyId(allocator, overflow, 64 * 1024);
+        defer allocator.free(line);
+        try expectRpcErrorCode(allocator, line, -32700);
+        try std.testing.expectError(error.EndOfStream, readLineAllocTimeout(allocator, overflow, 64 * 1024, 2_000));
+    }
+
+    {
+        try writeAll(client, "{\"id\":5,\"method\":\"daemon.ping\",\"params\":{}}\n");
+        const line = try readRpcResponseLine(allocator, client, 5, 64 * 1024);
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
@@ -464,8 +831,8 @@ test "daemon JSON-RPC errors are framed and the connection remains usable" {
     }
 
     {
-        try writeAll(client, "{\"id\":5,\"method\":\"daemon.shutdown\",\"params\":{}}\n");
-        const line = try readRpcResponseLine(allocator, client, 5, 64 * 1024);
+        try writeAll(client, "{\"id\":6,\"method\":\"daemon.shutdown\",\"params\":{}}\n");
+        const line = try readRpcResponseLine(allocator, client, 6, 64 * 1024);
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
@@ -543,6 +910,7 @@ test "natural child exit is reaped and broadcasts session_exited" {
         try std.testing.expect(exit_status == .integer);
         try std.testing.expectEqual(@as(i64, 7), exit_status.integer);
     }
+    try expectPaneAlert(allocator, socket_path, pane_id, "exited", true);
 
     {
         const line = try rpcLine(allocator, socket_path, "{\"id\":3,\"method\":\"daemon.shutdown\",\"params\":{}}\n", 64 * 1024);
@@ -694,6 +1062,241 @@ test "server shutdown waits for an idle client handler to exit" {
     thread.join();
     try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.seq_cst));
     try std.testing.expectEqual(@as(usize, 0), server.active_writer_threads.load(.seq_cst));
+    server.deinit();
+    server_stopped = true;
+    try std.testing.expect(ctx.run_error == null);
+}
+
+test "shutdown probe stops the server and deinit terminates live sessions" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const socket_path = try tempSocketPath(allocator);
+    defer allocator.free(socket_path);
+    std.fs.deleteFileAbsolute(socket_path) catch {};
+    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    test_shutdown_requested.store(false, .seq_cst);
+    defer test_shutdown_requested.store(false, .seq_cst);
+
+    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    server.shutdown_probe = testShutdownProbe;
+    var ctx = RunServerCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
+    var server_deinited = false;
+    errdefer {
+        if (!server_deinited) {
+            server.running.store(false, .seq_cst);
+            thread.join();
+            server.deinit();
+        }
+    }
+
+    try waitForSocket(socket_path, 2_000);
+
+    var pane_id: []u8 = &.{};
+    defer if (pane_id.len > 0) allocator.free(pane_id);
+    var child_pid: posix.pid_t = 0;
+    {
+        const line = try rpcLine(
+            allocator,
+            socket_path,
+            "{\"id\":1,\"method\":\"session.create\",\"params\":{\"shell\":\"/bin/sh\",\"command\":\"cat\",\"rows\":24,\"cols\":80}}\n",
+            64 * 1024,
+        );
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const result_val = try responseResult(parsed.value);
+        pane_id = try allocator.dupe(u8, try expectStringField(result_val, "id"));
+        child_pid = @intCast(try expectIntegerField(result_val, "pid"));
+    }
+    {
+        const client = try connectClient(socket_path);
+        defer posix.close(client);
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":2,\"method\":\"client.attach\",\"params\":{{\"paneId\":\"{s}\",\"rows\":24,\"cols\":80}}}}\n",
+            .{pane_id},
+        );
+        defer allocator.free(req);
+        try writeAll(client, req);
+        const line = try readRpcResponseLine(allocator, client, 2, 1024 * 1024);
+        defer allocator.free(line);
+        try expectNoRpcError(allocator, line);
+
+        test_shutdown_requested.store(true, .seq_cst);
+        try waitForRunDone(&ctx, 2_000);
+    }
+
+    thread.join();
+    server.deinit();
+    server_deinited = true;
+    try waitForProcessGone(child_pid, 1_000);
+    try std.testing.expect(ctx.run_error == null);
+    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(socket_path, .{}));
+}
+
+test "daemon.shutdown with live attached sessions terminates cleanly" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const socket_path = try tempSocketPath(allocator);
+    defer allocator.free(socket_path);
+    std.fs.deleteFileAbsolute(socket_path) catch {};
+    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+
+    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var ctx = RunServerCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
+    var server_stopped = false;
+    errdefer {
+        if (!server_stopped) {
+            server.running.store(false, .seq_cst);
+            thread.join();
+            server.deinit();
+        }
+    }
+
+    try waitForSocket(socket_path, 2_000);
+
+    var pane_id: []u8 = &.{};
+    defer if (pane_id.len > 0) allocator.free(pane_id);
+    var child_pid: posix.pid_t = 0;
+    {
+        const line = try rpcLine(
+            allocator,
+            socket_path,
+            "{\"id\":1,\"method\":\"session.create\",\"params\":{\"shell\":\"/bin/sh\",\"command\":\"cat\",\"rows\":24,\"cols\":80}}\n",
+            64 * 1024,
+        );
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const result_val = try responseResult(parsed.value);
+        pane_id = try allocator.dupe(u8, try expectStringField(result_val, "id"));
+        child_pid = @intCast(try expectIntegerField(result_val, "pid"));
+    }
+
+    var attached = [_]posix.fd_t{ try connectClient(socket_path), try connectClient(socket_path) };
+    defer {
+        for (attached) |fd| posix.close(fd);
+    }
+    for (&attached, 0..) |*fd, index| {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":{},\"method\":\"client.attach\",\"params\":{{\"paneId\":\"{s}\",\"rows\":24,\"cols\":80}}}}\n",
+            .{ index + 2, pane_id },
+        );
+        defer allocator.free(req);
+        try writeAll(fd.*, req);
+        const line = try readRpcResponseLine(allocator, fd.*, @intCast(index + 2), 1024 * 1024);
+        defer allocator.free(line);
+        try expectNoRpcError(allocator, line);
+    }
+
+    {
+        const line = try rpcLine(allocator, socket_path, "{\"id\":10,\"method\":\"daemon.shutdown\",\"params\":{}}\n", 64 * 1024);
+        defer allocator.free(line);
+        try expectNoRpcError(allocator, line);
+    }
+
+    thread.join();
+    try waitForProcessGone(child_pid, 1_000);
+    server.deinit();
+    server_stopped = true;
+    try std.testing.expect(ctx.run_error == null);
+}
+
+test "idle timeout exits with no sessions and unlinks its socket after deinit" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const socket_path = try tempSocketPath(allocator);
+    defer allocator.free(socket_path);
+    std.fs.deleteFileAbsolute(socket_path) catch {};
+    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+
+    var server = try server_mod.Server.init(allocator, socket_path, 1);
+    var ctx = RunServerCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
+    var server_deinited = false;
+    errdefer {
+        if (!server_deinited) {
+            server.running.store(false, .seq_cst);
+            thread.join();
+            server.deinit();
+        }
+    }
+
+    try waitForSocket(socket_path, 2_000);
+    try waitForRunDone(&ctx, 3_000);
+    thread.join();
+    server.deinit();
+    server_deinited = true;
+    try std.testing.expect(ctx.run_error == null);
+    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(socket_path, .{}));
+}
+
+test "idle timeout waits for a live session then exits after it is terminated" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const socket_path = try tempSocketPath(allocator);
+    defer allocator.free(socket_path);
+    std.fs.deleteFileAbsolute(socket_path) catch {};
+    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+
+    var server = try server_mod.Server.init(allocator, socket_path, 1);
+    var ctx = RunServerCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
+    var server_stopped = false;
+    errdefer {
+        if (!server_stopped) {
+            server.running.store(false, .seq_cst);
+            thread.join();
+            server.deinit();
+        }
+    }
+
+    try waitForSocket(socket_path, 2_000);
+
+    var pane_id: []u8 = &.{};
+    defer if (pane_id.len > 0) allocator.free(pane_id);
+    {
+        const line = try rpcLine(
+            allocator,
+            socket_path,
+            "{\"id\":1,\"method\":\"session.create\",\"params\":{\"shell\":\"/bin/sh\",\"command\":\"cat\",\"rows\":24,\"cols\":80}}\n",
+            64 * 1024,
+        );
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const result_val = try responseResult(parsed.value);
+        pane_id = try allocator.dupe(u8, try expectStringField(result_val, "id"));
+    }
+
+    std.Thread.sleep(1_500 * std.time.ns_per_ms);
+    try std.testing.expect(!ctx.done.load(.seq_cst));
+    {
+        const line = try rpcLine(allocator, socket_path, "{\"id\":2,\"method\":\"daemon.ping\",\"params\":{}}\n", 64 * 1024);
+        defer allocator.free(line);
+        try expectNoRpcError(allocator, line);
+    }
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":3,\"method\":\"session.terminate\",\"params\":{{\"sessionId\":\"{s}\"}}}}\n",
+            .{pane_id},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
+        defer allocator.free(line);
+        try expectNoRpcError(allocator, line);
+    }
+
+    try waitForRunDone(&ctx, 3_000);
+    thread.join();
     server.deinit();
     server_stopped = true;
     try std.testing.expect(ctx.run_error == null);
@@ -886,6 +1489,145 @@ test "stalled client does not block live pane output or active termination" {
     }
     {
         const line = try rpcLine(allocator, socket_path, "{\"id\":5,\"method\":\"daemon.shutdown\",\"params\":{}}\n", 64 * 1024);
+        defer allocator.free(line);
+    }
+
+    thread.join();
+    server.deinit();
+    server_stopped = true;
+    try std.testing.expect(ctx.run_error == null);
+}
+
+test "attached clients receive pane output activity and bell notifications" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const socket_path = try tempSocketPath(allocator);
+    defer allocator.free(socket_path);
+    std.fs.deleteFileAbsolute(socket_path) catch {};
+    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+
+    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var ctx = RunServerCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
+    var server_stopped = false;
+    errdefer {
+        if (!server_stopped) {
+            server.running.store(false, .seq_cst);
+            thread.join();
+            server.deinit();
+        }
+    }
+
+    try waitForSocket(socket_path, 2_000);
+
+    var pane_id: []u8 = &.{};
+    defer if (pane_id.len > 0) allocator.free(pane_id);
+    {
+        const line = try rpcLine(
+            allocator,
+            socket_path,
+            "{\"id\":1,\"method\":\"session.create\",\"params\":{\"shell\":\"/bin/sh\",\"command\":\"cat\",\"rows\":24,\"cols\":80}}\n",
+            64 * 1024,
+        );
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const result_val = try responseResult(parsed.value);
+        pane_id = try allocator.dupe(u8, try expectStringField(result_val, "id"));
+    }
+
+    var client_a: ?posix.fd_t = try connectClient(socket_path);
+    defer if (client_a) |fd| posix.close(fd);
+    const client_b = try connectClient(socket_path);
+    defer posix.close(client_b);
+
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":2,\"method\":\"client.attach\",\"params\":{{\"paneId\":\"{s}\",\"rows\":24,\"cols\":80}}}}\n",
+            .{pane_id},
+        );
+        defer allocator.free(req);
+        try writeAll(client_a.?, req);
+        const line = try readRpcResponseLine(allocator, client_a.?, 2, 1024 * 1024);
+        defer allocator.free(line);
+        try expectNoRpcError(allocator, line);
+    }
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":3,\"method\":\"client.attach\",\"params\":{{\"paneId\":\"{s}\",\"rows\":24,\"cols\":80}}}}\n",
+            .{pane_id},
+        );
+        defer allocator.free(req);
+        try writeAll(client_b, req);
+        const line = try readRpcResponseLine(allocator, client_b, 3, 1024 * 1024);
+        defer allocator.free(line);
+        try expectNoRpcError(allocator, line);
+    }
+
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":4,\"method\":\"session.send\",\"params\":{{\"sessionId\":\"{s}\",\"text\":\"ZMUX_NOTIFY_ONE\\n\"}}}}\n",
+            .{pane_id},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
+        defer allocator.free(line);
+        try expectNoRpcError(allocator, line);
+    }
+
+    const output_a = try readPaneOutputContaining(allocator, client_a.?, pane_id, "ZMUX_NOTIFY_ONE", 4_000);
+    defer allocator.free(output_a);
+    const output_b = try readPaneOutputContaining(allocator, client_b, pane_id, "ZMUX_NOTIFY_ONE", 4_000);
+    defer allocator.free(output_b);
+    try std.testing.expectEqualStrings(output_a, output_b);
+
+    {
+        const activity_a = try readNotificationLine(allocator, client_a.?, "pane_activity", pane_id, 4_000);
+        defer allocator.free(activity_a);
+        const activity_b = try readNotificationLine(allocator, client_b, "pane_activity", pane_id, 4_000);
+        defer allocator.free(activity_b);
+    }
+
+    posix.close(client_a.?);
+    client_a = null;
+
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":5,\"method\":\"session.send\",\"params\":{{\"sessionId\":\"{s}\",\"dataBase64\":\"Bwo=\"}}}}\n",
+            .{pane_id},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
+        defer allocator.free(line);
+        try expectNoRpcError(allocator, line);
+    }
+    {
+        const bell = try readNotificationLine(allocator, client_b, "pane_bell", pane_id, 4_000);
+        defer allocator.free(bell);
+    }
+
+    try expectPaneAlert(allocator, socket_path, pane_id, "activity", true);
+    try expectPaneAlertTimestampNonZero(allocator, socket_path, pane_id, "lastActivityMs");
+    try expectPaneAlert(allocator, socket_path, pane_id, "bell", true);
+    try expectPaneAlertTimestampNonZero(allocator, socket_path, pane_id, "lastBellMs");
+
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":6,\"method\":\"session.terminate\",\"params\":{{\"sessionId\":\"{s}\"}}}}\n",
+            .{pane_id},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
+        defer allocator.free(line);
+    }
+    {
+        const line = try rpcLine(allocator, socket_path, "{\"id\":7,\"method\":\"daemon.shutdown\",\"params\":{}}\n", 64 * 1024);
         defer allocator.free(line);
     }
 
@@ -1227,6 +1969,95 @@ test "client.attach replays scrollback on reattach so reopened sessions keep the
     try std.testing.expect(ctx.run_error == null);
 }
 
+test "client.attach replay is capped to the newest 256 KiB tail" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const socket_path = try tempSocketPath(allocator);
+    defer allocator.free(socket_path);
+    std.fs.deleteFileAbsolute(socket_path) catch {};
+    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+
+    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var ctx = RunServerCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
+    var server_stopped = false;
+    errdefer {
+        if (!server_stopped) {
+            server.running.store(false, .seq_cst);
+            thread.join();
+            server.deinit();
+        }
+    }
+
+    try waitForSocket(socket_path, 2_000);
+
+    const sentinel = "ZMUX_REPLAY_TAIL";
+    var pane_id: []u8 = &.{};
+    defer if (pane_id.len > 0) allocator.free(pane_id);
+    {
+        const command =
+            "head -c 330000 /dev/zero | tr '\\000' A; " ++
+            "printf ZMUX_REPLAY_TAIL; cat";
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":1,\"method\":\"session.create\",\"params\":{{\"shell\":\"/bin/sh\",\"command\":{f},\"rows\":24,\"cols\":80}}}}\n",
+            .{std.json.fmt(command, .{})},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const result_val = try responseResult(parsed.value);
+        pane_id = try allocator.dupe(u8, try expectStringField(result_val, "id"));
+    }
+
+    const replay_cap = 256 * 1024;
+    var decoded: []u8 = &.{};
+    var saw_replay = false;
+    const deadline = std.time.milliTimestamp() + 5_000;
+    var rpc_id: i64 = 20;
+    while (std.time.milliTimestamp() < deadline) : (rpc_id += 1) {
+        const replay = try attachReplay(allocator, socket_path, pane_id, rpc_id);
+        if (std.mem.endsWith(u8, replay, sentinel)) {
+            decoded = replay;
+            saw_replay = true;
+            break;
+        }
+        allocator.free(replay);
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+    }
+    if (!saw_replay) return error.ReplayTailTimeout;
+    defer allocator.free(decoded);
+
+    try std.testing.expectEqual(@as(usize, replay_cap), decoded.len);
+    try std.testing.expect(std.mem.endsWith(u8, decoded, sentinel));
+    for (decoded[0 .. decoded.len - sentinel.len]) |byte| {
+        try std.testing.expectEqual(@as(u8, 'A'), byte);
+    }
+
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":2,\"method\":\"session.terminate\",\"params\":{{\"sessionId\":\"{s}\"}}}}\n",
+            .{pane_id},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
+        defer allocator.free(line);
+    }
+    {
+        const line = try rpcLine(allocator, socket_path, "{\"id\":3,\"method\":\"daemon.shutdown\",\"params\":{}}\n", 64 * 1024);
+        defer allocator.free(line);
+    }
+
+    thread.join();
+    server.deinit();
+    server_stopped = true;
+    try std.testing.expect(ctx.run_error == null);
+}
+
 test "logical client auto-detaches when connection closes so a reopened tab can reattach" {
     if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
 
@@ -1440,6 +2271,123 @@ test "session RPCs resolve session names and returned session ids, and attach re
         const line = try rpcLine(
             allocator,
             socket_path,
+            "{\"id\":45,\"method\":\"session.send\",\"params\":{\"sessionId\":\"work\",\"dataBase64\":\"!!!\"}}\n",
+            64 * 1024,
+        );
+        defer allocator.free(line);
+        try expectRpcErrorCode(allocator, line, -32602);
+    }
+
+    {
+        const line = try rpcLine(
+            allocator,
+            socket_path,
+            "{\"id\":46,\"method\":\"daemon.ping\",\"params\":{}}\n",
+            64 * 1024,
+        );
+        defer allocator.free(line);
+        try expectNoRpcError(allocator, line);
+    }
+
+    {
+        const line = try rpcLine(
+            allocator,
+            socket_path,
+            "{\"id\":47,\"method\":\"session.resize\",\"params\":{\"sessionId\":\"work\",\"rows\":50,\"cols\":120}}\n",
+            64 * 1024,
+        );
+        defer allocator.free(line);
+        try expectNoRpcError(allocator, line);
+    }
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":48,\"method\":\"session.send\",\"params\":{{\"sessionId\":\"work\",\"text\":\"stty size\\n\"}}}}\n",
+            .{},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
+        defer allocator.free(line);
+        try expectNoRpcError(allocator, line);
+        const captured = try waitForCaptureContains(allocator, socket_path, returned_session_id, "50 120", 4_000);
+        defer allocator.free(captured);
+    }
+
+    {
+        const line = try rpcLine(
+            allocator,
+            socket_path,
+            "{\"id\":49,\"method\":\"session.resize\",\"params\":{\"sessionId\":\"work\",\"rows\":\"tall\",\"cols\":-1}}\n",
+            64 * 1024,
+        );
+        defer allocator.free(line);
+        try expectNoRpcError(allocator, line);
+    }
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":50,\"method\":\"session.send\",\"params\":{{\"sessionId\":\"work\",\"text\":\"stty size\\n\"}}}}\n",
+            .{},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
+        defer allocator.free(line);
+        try expectNoRpcError(allocator, line);
+        const captured = try waitForCaptureContains(allocator, socket_path, returned_session_id, "24 80", 4_000);
+        defer allocator.free(captured);
+    }
+
+    var exited_pane_id: []u8 = &.{};
+    defer if (exited_pane_id.len > 0) allocator.free(exited_pane_id);
+    {
+        const line = try rpcLine(
+            allocator,
+            socket_path,
+            "{\"id\":51,\"method\":\"session.create\",\"params\":{\"shell\":\"/bin/sh\",\"command\":\"true\",\"rows\":24,\"cols\":80}}\n",
+            64 * 1024,
+        );
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const result_val = try responseResult(parsed.value);
+        exited_pane_id = try allocator.dupe(u8, try expectStringField(result_val, "id"));
+    }
+    {
+        const deadline = std.time.milliTimestamp() + 4_000;
+        while (true) {
+            if (std.time.milliTimestamp() >= deadline) return error.TerminatedPaneTimeout;
+            const req = try std.fmt.allocPrint(
+                allocator,
+                "{{\"id\":52,\"method\":\"session.info\",\"params\":{{\"sessionId\":\"{s}\"}}}}\n",
+                .{exited_pane_id},
+            );
+            defer allocator.free(req);
+            const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
+            defer allocator.free(line);
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+            defer parsed.deinit();
+            const result_val = try responseResult(parsed.value);
+            const state = try expectStringField(result_val, "state");
+            if (std.mem.eql(u8, state, "terminated")) break;
+            std.Thread.sleep(20 * std.time.ns_per_ms);
+        }
+    }
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":53,\"method\":\"session.resize\",\"params\":{{\"sessionId\":\"{s}\",\"rows\":60,\"cols\":140}}}}\n",
+            .{exited_pane_id},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
+        defer allocator.free(line);
+        try expectRpcErrorCode(allocator, line, -32000);
+    }
+
+    {
+        const line = try rpcLine(
+            allocator,
+            socket_path,
             "{\"id\":5,\"method\":\"session.terminate\",\"params\":{\"sessionId\":\"work\"}}\n",
             64 * 1024,
         );
@@ -1505,6 +2453,10 @@ test "mux model API owns windows panes clients key bindings and respawn state" {
     defer if (session_id.len > 0) allocator.free(session_id);
     var window_id: []u8 = &.{};
     defer if (window_id.len > 0) allocator.free(window_id);
+    var second_window_id: []u8 = &.{};
+    defer if (second_window_id.len > 0) allocator.free(second_window_id);
+    var split_pane_id: []u8 = &.{};
+    defer if (split_pane_id.len > 0) allocator.free(split_pane_id);
     {
         const line = try rpcLine(allocator, socket_path, "{\"id\":2,\"method\":\"mux.snapshot\",\"params\":{}}\n", 1024 * 1024);
         defer allocator.free(line);
@@ -1532,7 +2484,19 @@ test "mux model API owns windows panes clients key bindings and respawn state" {
         defer allocator.free(req);
         const line = try rpcLine(allocator, socket_path, req, 1024 * 1024);
         defer allocator.free(line);
-        try std.testing.expect(std.mem.indexOf(u8, line, "\"name\":\"second\"") != null);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const result_val = try responseResult(parsed.value);
+        const sessions = result_val.object.get("sessions") orelse return error.MissingSessions;
+        const windows = sessions.array.items[0].object.get("windows") orelse return error.MissingWindows;
+        for (windows.array.items) |window| {
+            const name = window.object.get("name") orelse continue;
+            if (name == .string and std.mem.eql(u8, name.string, "second")) {
+                second_window_id = try allocator.dupe(u8, try expectStringField(window, "id"));
+                break;
+            }
+        }
+        if (second_window_id.len == 0) return error.MissingWindowId;
     }
 
     {
@@ -1544,8 +2508,26 @@ test "mux model API owns windows panes clients key bindings and respawn state" {
         defer allocator.free(req);
         const line = try rpcLine(allocator, socket_path, req, 1024 * 1024);
         defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const result_val = try responseResult(parsed.value);
         try std.testing.expect(std.mem.indexOf(u8, line, "\"kind\":\"split\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, line, "\"axis\":\"horizontal\"") != null);
+        const sessions = result_val.object.get("sessions") orelse return error.MissingSessions;
+        const windows = sessions.array.items[0].object.get("windows") orelse return error.MissingWindows;
+        for (windows.array.items) |window| {
+            const panes = window.object.get("panes") orelse continue;
+            if (panes != .array) continue;
+            for (panes.array.items) |pane| {
+                const id = try expectStringField(pane, "id");
+                if (!std.mem.eql(u8, id, first_pane_id)) {
+                    split_pane_id = try allocator.dupe(u8, id);
+                    break;
+                }
+            }
+            if (split_pane_id.len > 0) break;
+        }
+        if (split_pane_id.len == 0) return error.MissingPaneId;
     }
 
     {
@@ -1558,6 +2540,92 @@ test "mux model API owns windows panes clients key bindings and respawn state" {
         const panes_val = result_val.object.get("panes") orelse return error.MissingPanes;
         try std.testing.expectEqual(@as(i64, 1), sessions_val.integer);
         try std.testing.expectEqual(@as(i64, 3), panes_val.integer);
+    }
+
+    {
+        const line = try rpcLine(allocator, socket_path, "{\"id\":42,\"method\":\"session.list\",\"params\":{}}\n", 1024 * 1024);
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const result_val = try responseResult(parsed.value);
+        try std.testing.expect(result_val == .array);
+        try std.testing.expect(result_val.array.items.len >= 3);
+        const first = result_val.array.items[0];
+        _ = try expectStringField(first, "sessionId");
+        _ = try expectStringField(first, "windowId");
+        _ = try expectStringField(first, "paneId");
+        _ = try expectStringField(first, "state");
+    }
+
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":43,\"method\":\"session.info\",\"params\":{{\"sessionId\":\"{s}\"}}}}\n",
+            .{first_pane_id},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const result_val = try responseResult(parsed.value);
+        try std.testing.expectEqualStrings(first_pane_id, try expectStringField(result_val, "id"));
+        try std.testing.expectEqualStrings("running", try expectStringField(result_val, "state"));
+    }
+
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":44,\"method\":\"window.select\",\"params\":{{\"windowId\":\"{s}\"}}}}\n",
+            .{second_window_id},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 1024 * 1024);
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const result_val = try responseResult(parsed.value);
+        const sessions = result_val.object.get("sessions") orelse return error.MissingSessions;
+        try std.testing.expectEqualStrings(second_window_id, try expectStringField(sessions.array.items[0], "activeWindowId"));
+    }
+
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":45,\"method\":\"pane.select\",\"params\":{{\"paneId\":\"{s}\"}}}}\n",
+            .{split_pane_id},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 1024 * 1024);
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const result_val = try responseResult(parsed.value);
+        const sessions = result_val.object.get("sessions") orelse return error.MissingSessions;
+        const session = sessions.array.items[0];
+        try std.testing.expectEqualStrings(window_id, try expectStringField(session, "activeWindowId"));
+        const windows = session.object.get("windows") orelse return error.MissingWindows;
+        var saw_active_pane = false;
+        for (windows.array.items) |window| {
+            const id = try expectStringField(window, "id");
+            if (std.mem.eql(u8, id, window_id)) {
+                try std.testing.expectEqualStrings(split_pane_id, try expectStringField(window, "activePaneId"));
+                saw_active_pane = true;
+            }
+        }
+        try std.testing.expect(saw_active_pane);
+    }
+
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":46,\"method\":\"pane.select\",\"params\":{{\"paneId\":\"{s}\"}}}}\n",
+            .{first_pane_id},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 1024 * 1024);
+        defer allocator.free(line);
+        try expectNoRpcError(allocator, line);
     }
 
     var client_one: []u8 = &.{};
@@ -1609,6 +2677,57 @@ test "mux model API owns windows panes clients key bindings and respawn state" {
     {
         const req = try std.fmt.allocPrint(
             allocator,
+            "{{\"id\":71,\"method\":\"client.switch\",\"params\":{{\"clientId\":\"{s}\",\"paneId\":\"{s}\"}}}}\n",
+            .{ client_one, split_pane_id },
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 1024 * 1024);
+        defer allocator.free(line);
+        try expectNoRpcError(allocator, line);
+    }
+    {
+        const line = try rpcLine(allocator, socket_path, "{\"id\":72,\"method\":\"client.list\",\"params\":{}}\n", 64 * 1024);
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const result_val = try responseResult(parsed.value);
+        var saw_switched = false;
+        for (result_val.array.items) |client| {
+            const id = try expectStringField(client, "id");
+            if (std.mem.eql(u8, id, client_one)) {
+                try std.testing.expectEqualStrings(split_pane_id, try expectStringField(client, "paneId"));
+                saw_switched = true;
+            }
+        }
+        try std.testing.expect(saw_switched);
+    }
+
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":73,\"method\":\"session.sendKey\",\"params\":{{\"sessionId\":\"{s}\",\"key\":\"Enter\"}}}}\n",
+            .{first_pane_id},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
+        defer allocator.free(line);
+        try expectNoRpcError(allocator, line);
+    }
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":74,\"method\":\"session.sendKey\",\"params\":{{\"sessionId\":\"{s}\",\"key\":\"Bogus\"}}}}\n",
+            .{first_pane_id},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
+        defer allocator.free(line);
+        try expectRpcErrorCode(allocator, line, -32602);
+    }
+
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
             "{{\"id\":8,\"method\":\"key.bind\",\"params\":{{\"table\":\"prefix\",\"key\":\"%\",\"command\":\"split-window -h\"}}}}\n",
             .{},
         );
@@ -1616,6 +2735,17 @@ test "mux model API owns windows panes clients key bindings and respawn state" {
         const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
         defer allocator.free(line);
         try std.testing.expect(std.mem.indexOf(u8, line, "split-window -h") != null);
+    }
+    {
+        const line = try rpcLine(allocator, socket_path, "{\"id\":75,\"method\":\"key.list\",\"params\":{}}\n", 64 * 1024);
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const result_val = try responseResult(parsed.value);
+        try std.testing.expect(result_val == .array);
+        try std.testing.expect(result_val.array.items.len >= 1);
+        try std.testing.expectEqualStrings("%", try expectStringField(result_val.array.items[0], "key"));
+        try std.testing.expectEqualStrings("split-window -h", try expectStringField(result_val.array.items[0], "command"));
     }
     {
         const req = try std.fmt.allocPrint(
@@ -1666,13 +2796,95 @@ test "mux model API owns windows panes clients key bindings and respawn state" {
     {
         const req = try std.fmt.allocPrint(
             allocator,
+            "{{\"id\":76,\"method\":\"command.exec\",\"params\":{{\"paneId\":\"{s}\",\"command\":\"new-window -n exec-window cat\"}}}}\n",
+            .{first_pane_id},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 1024 * 1024);
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const result_val = try responseResult(parsed.value);
+        const sessions = result_val.object.get("sessions") orelse return error.MissingSessions;
+        const windows = sessions.array.items[0].object.get("windows") orelse return error.MissingWindows;
+        var saw_exec_window = false;
+        for (windows.array.items) |window| {
+            const name = try expectStringField(window, "name");
+            if (std.mem.eql(u8, name, "exec-window")) saw_exec_window = true;
+        }
+        try std.testing.expect(saw_exec_window);
+    }
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":77,\"method\":\"command.exec\",\"params\":{{\"paneId\":\"{s}\",\"command\":\"frobnicate\"}}}}\n",
+            .{first_pane_id},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
+        defer allocator.free(line);
+        try expectRpcErrorCode(allocator, line, -32602);
+    }
+
+    const old_respawn_pid = try panePidFromSnapshot(allocator, socket_path, first_pane_id);
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":78,\"method\":\"session.send\",\"params\":{{\"sessionId\":\"{s}\",\"dataBase64\":\"BA==\"}}}}\n",
+            .{first_pane_id},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
+        defer allocator.free(line);
+        try expectNoRpcError(allocator, line);
+    }
+    try waitForSessionExited(allocator, client_two_fd.?, first_pane_id, 0, 4_000);
+    try expectPaneAlert(allocator, socket_path, first_pane_id, "exited", true);
+
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
             "{{\"id\":13,\"method\":\"pane.respawn\",\"params\":{{\"paneId\":\"{s}\"}}}}\n",
             .{first_pane_id},
         );
         defer allocator.free(req);
         const line = try rpcLine(allocator, socket_path, req, 1024 * 1024);
         defer allocator.free(line);
-        try std.testing.expect(std.mem.indexOf(u8, line, "\"sessions\"") != null);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const result_val = try responseResult(parsed.value);
+        const pane = findPaneInSnapshot(result_val, first_pane_id) orelse return error.MissingPane;
+        try std.testing.expectEqualStrings(first_pane_id, try expectStringField(pane, "id"));
+        try std.testing.expectEqualStrings("running", try expectStringField(pane, "state"));
+        const new_pid = try expectIntegerField(pane, "pid");
+        try std.testing.expect(new_pid != old_respawn_pid);
+        const alerts = pane.object.get("alerts") orelse return error.MissingAlerts;
+        try std.testing.expect(!try expectBoolField(alerts, "exited"));
+    }
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":79,\"method\":\"session.send\",\"params\":{{\"sessionId\":\"{s}\",\"text\":\"RESPAWN_OK\\n\"}}}}\n",
+            .{first_pane_id},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
+        defer allocator.free(line);
+        try expectNoRpcError(allocator, line);
+        const captured = try waitForCaptureContains(allocator, socket_path, first_pane_id, "RESPAWN_OK", 4_000);
+        defer allocator.free(captured);
+    }
+    {
+        const line = try rpcLine(
+            allocator,
+            socket_path,
+            "{\"id\":80,\"method\":\"pane.respawn\",\"params\":{\"paneId\":\"pane-missing\"}}\n",
+            64 * 1024,
+        );
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("error") != null);
     }
 
     {

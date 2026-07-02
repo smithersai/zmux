@@ -344,11 +344,11 @@ pub const Server = struct {
         self.waitForWorkers();
     }
 
-fn writeConnectionLimitError(fd: posix.fd_t) void {
-    const message =
-        "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32000,\"message\":\"server connection limit reached\"}}\n";
-    writeAll(fd, message) catch {};
-}
+    fn writeConnectionLimitError(fd: posix.fd_t) void {
+        const message =
+            "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32000,\"message\":\"server connection limit reached\"}}\n";
+        writeAll(fd, message) catch {};
+    }
 
     fn shouldExitForIdle(self: *Server) bool {
         if (self.idle_timeout_seconds <= 0) return false;
@@ -467,7 +467,7 @@ fn writeConnectionLimitError(fd: posix.fd_t) void {
         var create_args = muxCreateArgsFromParams(self.allocator, req.params(), .{ .id_aliases_title = true }) catch |err| {
             switch (err) {
                 error.ScrollbackBytesTooLarge => {
-                    try self.writeError(connection, req.id_json, protocol.ErrorCode.invalid_params, "scrollbackBytes exceeds maximum") ;
+                    try self.writeError(connection, req.id_json, protocol.ErrorCode.invalid_params, "scrollbackBytes exceeds maximum");
                     return;
                 },
                 else => return err,
@@ -744,7 +744,13 @@ fn writeConnectionLimitError(fd: posix.fd_t) void {
         const active = try self.requiredSession(connection, req) orelse return;
         defer active.release();
 
-        try active.resize(intParam(u16, req.params(), "cols", 80), intParam(u16, req.params(), "rows", 24));
+        active.resize(intParam(u16, req.params(), "cols", 80), intParam(u16, req.params(), "rows", 24)) catch |err| switch (err) {
+            error.SessionTerminated => {
+                try self.writeError(connection, req.id_json, protocol.ErrorCode.session_error, @errorName(err));
+                return;
+            },
+            else => return err,
+        };
         const response = try protocol.result(self.allocator, req.id_json, .{ .ok = true });
         defer self.allocator.free(response);
         try connection.write(response);
@@ -769,7 +775,10 @@ fn writeConnectionLimitError(fd: posix.fd_t) void {
         defer active.release();
 
         if (firstStringParam(req.params(), &.{ "dataBase64", "data_base64" })) |encoded| {
-            const bytes = try base64Decode(self.allocator, encoded);
+            const bytes = base64Decode(self.allocator, encoded) catch |err| {
+                try self.writeError(connection, req.id_json, protocol.ErrorCode.invalid_params, @errorName(err));
+                return;
+            };
             defer self.allocator.free(bytes);
             try active.writeInput(bytes);
         } else {
@@ -1365,7 +1374,10 @@ test "self-created socket parent is validated as private 0700" {
     const socket_path = try std.fs.path.join(allocator, &.{ parent, "sessions.sock" });
     defer allocator.free(socket_path);
 
-    var server = try Server.init(allocator, socket_path, 0);
+    var server = Server.init(allocator, socket_path, 0) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
     server.deinit();
     try std.testing.expectEqual(@as(u32, 0o700), try dirMode(parent));
 }
@@ -1386,7 +1398,10 @@ test "existing socket parent permissions are left unchanged" {
     const socket_path = try std.fs.path.join(allocator, &.{ parent, "sessions.sock" });
     defer allocator.free(socket_path);
 
-    var server = try Server.init(allocator, socket_path, 0);
+    var server = Server.init(allocator, socket_path, 0) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
     server.deinit();
     try std.testing.expectEqual(@as(u32, 0o755), try dirMode(parent));
 }

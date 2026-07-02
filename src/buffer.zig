@@ -122,6 +122,90 @@ test "scrollback captures last lines" {
     try std.testing.expectEqualStrings("three\nfour\n", capture);
 }
 
+test "scrollback append larger than capacity keeps only the newest tail" {
+    var buffer = try ScrollbackBuffer.init(std.testing.allocator, 8);
+    defer buffer.deinit();
+
+    buffer.append("0123456789abcdefghijkl");
+
+    const snap = try buffer.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snap);
+    try std.testing.expectEqualStrings("efghijkl", snap);
+}
+
+test "scrollback repeated wrap cycles match a reference tail" {
+    var buffer = try ScrollbackBuffer.init(std.testing.allocator, 13);
+    defer buffer.deinit();
+
+    var reference = std.ArrayList(u8).empty;
+    defer reference.deinit(std.testing.allocator);
+
+    const chunks = [_][]const u8{
+        "abc",
+        "defgh",
+        "ij",
+        "klmnop",
+        "qrst",
+        "uvwxyz",
+        "0123456789",
+    };
+    for (chunks) |chunk| {
+        buffer.append(chunk);
+        try reference.appendSlice(std.testing.allocator, chunk);
+        const snap = try buffer.snapshot(std.testing.allocator);
+        defer std.testing.allocator.free(snap);
+        const expected = if (reference.items.len > buffer.capacity())
+            reference.items[reference.items.len - buffer.capacity() ..]
+        else
+            reference.items;
+        try std.testing.expectEqualStrings(expected, snap);
+    }
+}
+
+test "scrollback captureLastLines handles boundaries and wrapped oldest line" {
+    {
+        var empty = try ScrollbackBuffer.init(std.testing.allocator, 8);
+        defer empty.deinit();
+        const capture = try empty.captureLastLines(std.testing.allocator, 10);
+        defer std.testing.allocator.free(capture);
+        try std.testing.expectEqualStrings("", capture);
+    }
+
+    var buffer = try ScrollbackBuffer.init(std.testing.allocator, 32);
+    defer buffer.deinit();
+    buffer.append("one\ntwo\nthree");
+
+    const zero = try buffer.captureLastLines(std.testing.allocator, 0);
+    defer std.testing.allocator.free(zero);
+    try std.testing.expectEqualStrings("", zero);
+
+    const all = try buffer.captureLastLines(std.testing.allocator, 99);
+    defer std.testing.allocator.free(all);
+    try std.testing.expectEqualStrings("one\ntwo\nthree", all);
+
+    const one = try buffer.captureLastLines(std.testing.allocator, 1);
+    defer std.testing.allocator.free(one);
+    try std.testing.expectEqualStrings("three", one);
+
+    var wrapped = try ScrollbackBuffer.init(std.testing.allocator, 10);
+    defer wrapped.deinit();
+    wrapped.append("oldest\nnew\nlast\n");
+    const wrapped_capture = try wrapped.captureLastLines(std.testing.allocator, 2);
+    defer std.testing.allocator.free(wrapped_capture);
+    try std.testing.expectEqualStrings("new\nlast\n", wrapped_capture);
+}
+
+test "scrollback exact-capacity append fills the buffer" {
+    var buffer = try ScrollbackBuffer.init(std.testing.allocator, 8);
+    defer buffer.deinit();
+
+    buffer.append("12345678");
+
+    const snap = try buffer.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snap);
+    try std.testing.expectEqualStrings("12345678", snap);
+}
+
 test "scrollback initialization clamps oversized capacity" {
     const capacity = 3 * 1024 * 1024 * 1024;
     const capped = @min(@max(capacity, 1), max_capacity);

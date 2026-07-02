@@ -162,3 +162,128 @@ test "readLineAllocWithDeadline returns ReadTimeout" {
         reader.readLineAllocWithDeadline(std.testing.allocator, fds[0], 64, deadline),
     );
 }
+
+const DelayedWrite = struct {
+    fd: posix.fd_t,
+    bytes: []const u8,
+    delay_ms: u64,
+
+    fn run(self: DelayedWrite) void {
+        std.Thread.sleep(self.delay_ms * std.time.ns_per_ms);
+        _ = posix.write(self.fd, self.bytes) catch {};
+    }
+};
+
+test "line reader assembles a line split across multiple reads" {
+    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
+
+    const fds = try std.posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    _ = try posix.write(fds[1], "par");
+    const writer = try std.Thread.spawn(.{}, DelayedWrite.run, .{DelayedWrite{
+        .fd = fds[1],
+        .bytes = "tial\n",
+        .delay_ms = 20,
+    }});
+    defer writer.join();
+
+    var reader: LineReader = .{};
+    const line = try reader.readLineAlloc(std.testing.allocator, fds[0], 64);
+    defer std.testing.allocator.free(line);
+    try std.testing.expectEqualStrings("partial\n", line);
+}
+
+test "line reader enforces max_len while accumulating a partial line" {
+    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
+
+    const fds = try std.posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var bytes: [2048]u8 = undefined;
+    @memset(&bytes, 'x');
+    _ = try posix.write(fds[1], &bytes);
+
+    var reader: LineReader = .{};
+    try std.testing.expectError(
+        error.MessageTooLarge,
+        reader.readLineAllocMaybe(std.testing.allocator, fds[0], 1024),
+    );
+}
+
+test "line reader max_len accepts an exact boundary and rejects one byte over" {
+    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
+
+    {
+        const fds = try std.posix.pipe();
+        defer posix.close(fds[0]);
+        defer posix.close(fds[1]);
+
+        _ = try posix.write(fds[1], "1234\n");
+        var reader: LineReader = .{};
+        const line = try reader.readLineAlloc(std.testing.allocator, fds[0], 5);
+        defer std.testing.allocator.free(line);
+        try std.testing.expectEqualStrings("1234\n", line);
+    }
+
+    {
+        const fds = try std.posix.pipe();
+        defer posix.close(fds[0]);
+        defer posix.close(fds[1]);
+
+        _ = try posix.write(fds[1], "12345\n");
+        var reader: LineReader = .{};
+        try std.testing.expectError(
+            error.MessageTooLarge,
+            reader.readLineAlloc(std.testing.allocator, fds[0], 5),
+        );
+    }
+}
+
+test "line reader distinguishes EOF partial lines for strict and maybe reads" {
+    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
+
+    {
+        const fds = try std.posix.pipe();
+        defer posix.close(fds[0]);
+        _ = try posix.write(fds[1], "noeol");
+        posix.close(fds[1]);
+
+        var reader: LineReader = .{};
+        try std.testing.expectError(
+            error.ConnectionClosed,
+            reader.readLineAlloc(std.testing.allocator, fds[0], 64),
+        );
+    }
+
+    {
+        const fds = try std.posix.pipe();
+        defer posix.close(fds[0]);
+        _ = try posix.write(fds[1], "noeol");
+        posix.close(fds[1]);
+
+        var reader: LineReader = .{};
+        const line = (try reader.readLineAllocMaybe(std.testing.allocator, fds[0], 64)).?;
+        defer std.testing.allocator.free(line);
+        try std.testing.expectEqualStrings("noeol", line);
+    }
+}
+
+test "nextBufferedLineAlloc leaves partial buffered data until newline arrives" {
+    var reader: LineReader = .{};
+    @memcpy(reader.buffer[0..3], "abc");
+    reader.start = 0;
+    reader.end = 3;
+
+    try std.testing.expect((try reader.nextBufferedLineAlloc(std.testing.allocator, 16)) == null);
+    try std.testing.expectEqual(@as(usize, 0), reader.start);
+    try std.testing.expectEqual(@as(usize, 3), reader.end);
+
+    reader.buffer[3] = '\n';
+    reader.end = 4;
+    const line = (try reader.nextBufferedLineAlloc(std.testing.allocator, 16)).?;
+    defer std.testing.allocator.free(line);
+    try std.testing.expectEqualStrings("abc\n", line);
+}

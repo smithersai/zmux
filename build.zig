@@ -92,13 +92,20 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(connect_tests).step);
 
     const server_mod = createRootModule(b, target, optimize, "src/server.zig");
+    const integration_options = b.addOptions();
+    integration_options.addOptionPath("zmuxd_path", daemon.getEmittedBin());
+    integration_options.addOptionPath("smithers_session_daemon_path", smithers_daemon.getEmittedBin());
+    integration_options.addOptionPath("zmux_connect_path", connect.getEmittedBin());
+    integration_options.addOptionPath("smithers_session_connect_path", smithers_connect.getEmittedBin());
+    const integration_mod = b.createModule(.{
+        .root_source_file = b.path("test/integration/session_daemon.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zmux_server", .module = server_mod }},
+    });
+    integration_mod.addOptions("test_build_options", integration_options);
     const integration_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("test/integration/session_daemon.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "zmux_server", .module = server_mod }},
-        }),
+        .root_module = integration_mod,
     });
     linkPtyArtifact(integration_tests, target);
     test_step.dependOn(&b.addRunArtifact(integration_tests).step);

@@ -234,6 +234,7 @@ pub const NativeSession = struct {
     }
 
     pub fn resize(self: *NativeSession, cols: u16, rows: u16) !void {
+        if (self.state() == .terminated) return error.SessionTerminated;
         try self.handle.resize(cols, rows);
     }
 
