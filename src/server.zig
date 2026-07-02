@@ -1013,6 +1013,56 @@ test "server parses aliases for session id" {
     try std.testing.expectEqualStrings("sess-1", sessionIdParam(parsed.value).?);
 }
 
+test "mux create args treats id as title only for session create" {
+    var parsed = try std.json.parseFromSlice(Value, std.testing.allocator, "{\"id\":\"target-pane\",\"rows\":40,\"cols\":120}", .{});
+    defer parsed.deinit();
+
+    var target_args = try muxCreateArgsFromParams(std.testing.allocator, parsed.value, .{});
+    defer target_args.deinit();
+    try std.testing.expect(target_args.opts.title == null);
+    try std.testing.expectEqual(@as(u16, 40), target_args.opts.rows);
+    try std.testing.expectEqual(@as(u16, 120), target_args.opts.cols);
+
+    var create_args = try muxCreateArgsFromParams(std.testing.allocator, parsed.value, .{ .id_aliases_title = true });
+    defer create_args.deinit();
+    try std.testing.expectEqualStrings("target-pane", create_args.opts.title.?);
+}
+
+test "mux create args converts environment values for native spawn" {
+    var parsed = try std.json.parseFromSlice(
+        Value,
+        std.testing.allocator,
+        "{\"env\":{\"TEXT\":\"one\",\"COUNT\":7,\"FLAG\":true,\"EMPTY\":null},\"scrollbackBytes\":4096}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    var args = try muxCreateArgsFromParams(std.testing.allocator, parsed.value, .{});
+    defer args.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4096), args.opts.scrollback_bytes);
+    const entries = args.opts.env orelse return error.MissingEnvEntries;
+    try std.testing.expectEqual(@as(usize, 4), entries.len);
+    try std.testing.expect(envContains(entries, "TEXT=one"));
+    try std.testing.expect(envContains(entries, "COUNT=7"));
+    try std.testing.expect(envContains(entries, "FLAG=true"));
+    try std.testing.expect(envContains(entries, "EMPTY="));
+}
+
+test "axisParam accepts string and boolean horizontal aliases" {
+    var horizontal_string = try std.json.parseFromSlice(Value, std.testing.allocator, "{\"axis\":\"-h\"}", .{});
+    defer horizontal_string.deinit();
+    try std.testing.expectEqual(mux.Axis.horizontal, axisParam(horizontal_string.value));
+
+    var horizontal_bool = try std.json.parseFromSlice(Value, std.testing.allocator, "{\"horizontal\":true}", .{});
+    defer horizontal_bool.deinit();
+    try std.testing.expectEqual(mux.Axis.horizontal, axisParam(horizontal_bool.value));
+
+    var default_axis = try std.json.parseFromSlice(Value, std.testing.allocator, "{}", .{});
+    defer default_axis.deinit();
+    try std.testing.expectEqual(mux.Axis.vertical, axisParam(default_axis.value));
+}
+
 test "truncatedReplay keeps tail when larger than cap" {
     const full = "abcdefghij";
     try std.testing.expectEqualStrings("ghij", truncatedReplay(full, 4));
@@ -1125,6 +1175,13 @@ fn tempPath(allocator: Allocator, prefix: []const u8) ![]u8 {
     std.crypto.random.bytes(&seed);
     const nonce = std.mem.readInt(u64, &seed, .little);
     return std.fmt.allocPrint(allocator, "/tmp/{s}-{x:0>16}", .{ prefix, nonce });
+}
+
+fn envContains(entries: []const []const u8, expected: []const u8) bool {
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry, expected)) return true;
+    }
+    return false;
 }
 
 fn bindRawUnixListener(path: []const u8) !posix.fd_t {
