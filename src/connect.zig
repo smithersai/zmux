@@ -667,3 +667,103 @@ test "tiocgwinsz encodes the platform ioctl" {
     const req = tiocgwinsz();
     try std.testing.expect(req != 0);
 }
+
+test "matchesRpcId accepts only the expected numeric response id" {
+    try std.testing.expect(matchesRpcId(std.testing.allocator, "{\"id\":7,\"result\":{}}\n", 7));
+    try std.testing.expect(!matchesRpcId(std.testing.allocator, "{\"id\":8,\"result\":{}}\n", 7));
+    try std.testing.expect(!matchesRpcId(std.testing.allocator, "{\"id\":\"7\",\"result\":{}}\n", 7));
+    try std.testing.expect(!matchesRpcId(std.testing.allocator, "{\"method\":\"pane_output\",\"params\":{}}\n", 7));
+    try std.testing.expect(!matchesRpcId(std.testing.allocator, "not json\n", 7));
+}
+
+test "readRpcResponse skips notifications and out-of-order responses" {
+    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
+
+    const fds = try std.posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    try writeAll(
+        fds[1],
+        "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{}}\n" ++
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"stale\":true}}\n" ++
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"ok\":true}}\n",
+    );
+
+    var reader: LineReader = .{};
+    const line = try readRpcResponse(std.testing.allocator, &reader, fds[0], 2);
+    defer std.testing.allocator.free(line);
+
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"ok\":true}}\n", line);
+}
+
+test "paneIdFromAttach extracts canonical pane id" {
+    const pane_id = try paneIdFromAttach(
+        std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"clientId\":\"client-1\",\"paneId\":\"pane-7\"}}\n",
+    );
+    defer std.testing.allocator.free(pane_id);
+
+    try std.testing.expectEqualStrings("pane-7", pane_id);
+    try std.testing.expectError(
+        error.MissingPaneId,
+        paneIdFromAttach(std.testing.allocator, "{\"result\":{\"clientId\":\"client-1\"}}\n"),
+    );
+}
+
+test "handleServerLine writes matching pane output and ignores other panes" {
+    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
+
+    const ignored =
+        "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":" ++
+        "{\"pane_id\":\"pane-other\",\"data_base64\":\"aGVsbG8=\"}}\n";
+    try std.testing.expect(!try handleServerLine(
+        std.testing.allocator,
+        ignored,
+        "pane-1",
+        @as(posix.fd_t, -1),
+    ));
+
+    const fds = try std.posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    const matching =
+        "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":" ++
+        "{\"pane_id\":\"pane-1\",\"data_base64\":\"aGVsbG8=\"}}\n";
+    try std.testing.expect(!try handleServerLine(std.testing.allocator, matching, "pane-1", fds[1]));
+
+    var buf: [16]u8 = undefined;
+    const n = try posix.read(fds[0], &buf);
+    try std.testing.expectEqualStrings("hello", buf[0..n]);
+}
+
+test "handleServerLine exits only for matching session exit notification" {
+    const matching =
+        "{\"jsonrpc\":\"2.0\",\"method\":\"session_exited\",\"params\":" ++
+        "{\"session_id\":\"pane-1\",\"pid\":123}}\n";
+    const other =
+        "{\"jsonrpc\":\"2.0\",\"method\":\"session_exited\",\"params\":" ++
+        "{\"session_id\":\"pane-2\",\"pid\":123}}\n";
+
+    try std.testing.expect(try handleServerLine(std.testing.allocator, matching, "pane-1", @as(posix.fd_t, -1)));
+    try std.testing.expect(!try handleServerLine(std.testing.allocator, other, "pane-1", @as(posix.fd_t, -1)));
+}
+
+test "replayScrollbackFromAttach decodes replay bytes" {
+    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
+
+    const fds = try std.posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    try replayScrollbackFromAttach(
+        std.testing.allocator,
+        "{\"result\":{\"replayBase64\":\"cmVwbGF5IGJ5dGVz\"}}\n",
+        fds[1],
+    );
+
+    var buf: [32]u8 = undefined;
+    const n = try posix.read(fds[0], &buf);
+    try std.testing.expectEqualStrings("replay bytes", buf[0..n]);
+}
