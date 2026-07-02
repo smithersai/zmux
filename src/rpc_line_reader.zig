@@ -9,7 +9,22 @@ pub const LineReader = struct {
     end: usize = 0,
 
     pub fn readLineAlloc(self: *LineReader, allocator: Allocator, fd: posix.fd_t, max_len: usize) ![]u8 {
-        const line = try self.readLineAllocMaybe(allocator, fd, max_len) orelse return error.ConnectionClosed;
+        const line = try self.readLineAllocMaybeWithDeadline(allocator, fd, max_len, std.math.maxInt(i64)) orelse return error.ConnectionClosed;
+        if (line.len == 0 or line[line.len - 1] != '\n') {
+            allocator.free(line);
+            return error.ConnectionClosed;
+        }
+        return line;
+    }
+
+    pub fn readLineAllocWithDeadline(
+        self: *LineReader,
+        allocator: Allocator,
+        fd: posix.fd_t,
+        max_len: usize,
+        deadline_ms: i64,
+    ) ![]u8 {
+        const line = try self.readLineAllocMaybeWithDeadline(allocator, fd, max_len, deadline_ms) orelse return error.ConnectionClosed;
         if (line.len == 0 or line[line.len - 1] != '\n') {
             allocator.free(line);
             return error.ConnectionClosed;
@@ -18,12 +33,41 @@ pub const LineReader = struct {
     }
 
     pub fn readLineAllocMaybe(self: *LineReader, allocator: Allocator, fd: posix.fd_t, max_len: usize) !?[]u8 {
+        return self.readLineAllocMaybeWithDeadline(allocator, fd, max_len, std.math.maxInt(i64));
+    }
+
+    pub fn readLineAllocMaybeWithDeadline(
+        self: *LineReader,
+        allocator: Allocator,
+        fd: posix.fd_t,
+        max_len: usize,
+        deadline_ms: i64,
+    ) !?[]u8 {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
 
         while (true) {
             if (try self.appendBufferedLine(allocator, &out, max_len)) |line| return line;
             if (self.bufferedLen() != 0) try self.appendBufferedBytes(allocator, &out, max_len);
+
+            const now = std.time.milliTimestamp();
+            if (now >= deadline_ms) return error.ReadTimeout;
+
+            var fds = [_]posix.pollfd{.{
+                .fd = fd,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            }};
+            const remaining_ms = @min(deadline_ms - now, std.math.maxInt(i32));
+            const ready = try posix.poll(&fds, @intCast(remaining_ms));
+            if (ready == 0) return error.ReadTimeout;
+
+            if ((fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0 and
+                (fds[0].revents & posix.POLL.IN) == 0)
+            {
+                return error.ConnectionClosed;
+            }
+            if ((fds[0].revents & posix.POLL.IN) == 0) continue;
 
             const n = posix.read(fd, self.buffer[0..]) catch |err| switch (err) {
                 error.WouldBlock => continue,
@@ -102,4 +146,19 @@ test "line reader keeps leftover bytes for the next line" {
 
     try std.testing.expectEqualStrings("one\n", first);
     try std.testing.expectEqualStrings("two\n", second);
+}
+
+test "readLineAllocWithDeadline returns ReadTimeout" {
+    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
+
+    const fds = try std.posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var reader: LineReader = .{};
+    const deadline = std.time.milliTimestamp() + 20;
+    try std.testing.expectError(
+        error.ReadTimeout,
+        reader.readLineAllocWithDeadline(std.testing.allocator, fds[0], 64, deadline),
+    );
 }

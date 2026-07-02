@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const rpc_line_reader = @import("rpc_line_reader.zig");
+const protocol = @import("protocol.zig");
 
 const posix = std.posix;
 const LineReader = rpc_line_reader.LineReader;
@@ -8,6 +9,7 @@ const LineReader = rpc_line_reader.LineReader;
 const buffer_size: usize = 32 * 1024;
 const rpc_line_max: usize = 1024 * 1024;
 const run_loop_poll_timeout_ms: i32 = 100;
+const bootstrap_response_timeout_ms: i64 = 10_000;
 
 var g_saved_termios: ?posix.termios = null;
 var g_saved_termios_fd: posix.fd_t = 0;
@@ -20,7 +22,22 @@ fn connectPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
     std.debug.defaultPanic(msg, first_trace_addr);
 }
 
-pub fn main() !void {
+pub fn main() void {
+    runMain() catch |err| {
+        switch (err) {
+            error.InvalidArguments, error.ReadTimeout => {},
+            else => {
+                var buf: [1024]u8 = undefined;
+                var w = std.fs.File.stderr().writer(&buf);
+                w.interface.print("zmux-connect: {s}\n", .{@errorName(err)}) catch {};
+                w.interface.flush() catch {};
+            },
+        }
+        std.process.exit(1);
+    };
+}
+
+fn runMain() !void {
     var dbg: std.heap.DebugAllocator(.{}) = .init;
     const allocator = dbg.allocator();
     defer _ = dbg.deinit();
@@ -33,6 +50,7 @@ pub fn main() !void {
     var spawn_daemon = false;
     var auto_create = true;
     var create_command: ?[]const u8 = null;
+    var show_version = false;
 
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -49,6 +67,8 @@ pub fn main() !void {
             i += 1;
             if (i >= argv.len) return fail("missing value for --command", .{});
             create_command = argv[i];
+        } else if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "-V")) {
+            show_version = true;
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             try printUsage();
             return;
@@ -69,6 +89,11 @@ pub fn main() !void {
         try resolveSocketPath(allocator);
     defer allocator.free(path);
 
+    if (show_version) {
+        try printVersion();
+        return;
+    }
+
     const socket_fd = try connectWithRetry(allocator, path, spawn_daemon);
     defer posix.close(socket_fd);
     var socket_reader: LineReader = .{};
@@ -82,6 +107,7 @@ pub fn main() !void {
         initial_size,
         auto_create,
         create_command,
+        std.time.milliTimestamp() + bootstrap_response_timeout_ms,
     );
     defer allocator.free(attach_response);
     if (findJsonField(attach_response, "\"error\"")) |_| {
@@ -114,12 +140,18 @@ pub fn main() !void {
 
     runLoop(stdin_fd, stdout_fd, socket_fd, &socket_reader, allocator, target_pane_id) catch |err| {
         restoreTermios();
-        var ebuf: [256]u8 = undefined;
-        var ew = std.fs.File.stderr().writer(&ebuf);
-        ew.interface.print("zmux-connect: {s}\n", .{@errorName(err)}) catch {};
-        ew.interface.flush() catch {};
-        std.process.exit(1);
+        if (err == error.ReadTimeout) {
+            return fail("daemon at {s} is not responding; is zmuxd hung?", .{path});
+        }
+        return fail("{s}", .{@errorName(err)});
     };
+}
+
+fn printVersion() !void {
+    var buf: [64]u8 = undefined;
+    var out = std.fs.File.stdout().writer(&buf);
+    try out.interface.print("zmux-connect {s}\n", .{protocol.version});
+    try out.interface.flush();
 }
 
 // Send `client.attach` and, if the daemon reports `PaneNotFound` and
@@ -136,8 +168,9 @@ fn attachOrCreate(
     size: TerminalSize,
     auto_create: bool,
     create_command: ?[]const u8,
+    deadline_ms: i64,
 ) ![]u8 {
-    var first = try sendAttach(allocator, reader, socket_fd, sid, size, 1);
+    var first = try sendAttach(allocator, reader, socket_fd, sid, size, 1, deadline_ms);
     // The errdefer is guarded so the manual `allocator.free(first)` below
     // doesn't double-free if a later step (`sendCreate`, the create
     // response read, the retry attach) returns an error.
@@ -156,13 +189,13 @@ fn attachOrCreate(
     // including this connection, which has not attached yet. Filter on the
     // JSON-RPC `id` so we don't consume a notification as the create
     // response.
-    const create_response = try readRpcResponse(allocator, reader, socket_fd, 2);
+    const create_response = try readRpcResponse(allocator, reader, socket_fd, 2, deadline_ms);
     defer allocator.free(create_response);
     if (findJsonField(create_response, "\"error\"")) |_| {
         return try allocator.dupe(u8, create_response);
     }
 
-    return try sendAttach(allocator, reader, socket_fd, sid, size, 3);
+    return try sendAttach(allocator, reader, socket_fd, sid, size, 3, deadline_ms);
 }
 
 fn sendAttach(
@@ -172,6 +205,7 @@ fn sendAttach(
     sid: []const u8,
     size: TerminalSize,
     rpc_id: u32,
+    deadline_ms: i64,
 ) ![]u8 {
     const req = try std.fmt.allocPrint(
         allocator,
@@ -180,7 +214,7 @@ fn sendAttach(
     );
     defer allocator.free(req);
     try writeAll(socket_fd, req);
-    return readRpcResponse(allocator, reader, socket_fd, rpc_id);
+    return readRpcResponse(allocator, reader, socket_fd, rpc_id, deadline_ms);
 }
 
 // Read newline-delimited JSON-RPC frames until we find the response
@@ -188,9 +222,15 @@ fn sendAttach(
 // out-of-order responses are silently discarded. We keep this helper
 // internal to the bootstrap (attach + create) sequence; once `runLoop`
 // takes over it has its own classifier in `processServerLine`.
-fn readRpcResponse(allocator: std.mem.Allocator, reader: *LineReader, fd: posix.fd_t, expected_id: u32) ![]u8 {
+fn readRpcResponse(
+    allocator: std.mem.Allocator,
+    reader: *LineReader,
+    fd: posix.fd_t,
+    expected_id: u32,
+    deadline_ms: i64,
+) ![]u8 {
     while (true) {
-        const line = try reader.readLineAlloc(allocator, fd, rpc_line_max);
+        const line = try reader.readLineAllocWithDeadline(allocator, fd, rpc_line_max, deadline_ms);
         if (matchesRpcId(allocator, line, expected_id)) return line;
         allocator.free(line);
     }
@@ -386,11 +426,17 @@ fn spawnDaemonDetached(allocator: std.mem.Allocator, socket_path: []const u8) !v
 
     // Child: detach and exec.
     _ = std.c.setsid();
-    // Redirect stdio to /dev/null.
+    // Redirect stdio to /dev/null, and stderr to the socket log for startup diagnostics.
     const devnull = posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch std.c._exit(127);
     _ = std.c.dup2(devnull, 0);
     _ = std.c.dup2(devnull, 1);
-    _ = std.c.dup2(devnull, 2);
+
+    const log_path = std.fmt.allocPrint(allocator, "{s}.log", .{socket_path}) catch std.c._exit(127);
+    defer allocator.free(log_path);
+    const log_fd = posix.open(log_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, 0o600) catch devnull;
+    _ = std.c.dup2(log_fd, 2);
+    if (log_fd > 2) posix.close(log_fd);
+
     if (devnull > 2) posix.close(devnull);
 
     const daemon_z = allocator.dupeZ(u8, daemon_path) catch std.c._exit(127);
@@ -508,17 +554,38 @@ fn terminalSize(tty_fd: posix.fd_t) ?TerminalSize {
 
 // Mirrors daemon.zig::socketPath. Keep in sync.
 fn resolveSocketPath(allocator: std.mem.Allocator) ![]u8 {
-    if (std.posix.getenv("ZMUX_SOCKET")) |value| {
+    return resolveSocketPathFromEnv(
+        allocator,
+        std.posix.getenv("ZMUX_SOCKET"),
+        std.posix.getenv("SMITHERS_SESSION_SOCKET"),
+        std.posix.getenv("XDG_RUNTIME_DIR"),
+        std.posix.getenv("HOME"),
+    );
+}
+
+fn resolveSocketPathFromEnv(
+    allocator: std.mem.Allocator,
+    zmux_socket: ?[]const u8,
+    smithers_socket: ?[]const u8,
+    xdg_runtime_dir: ?[]const u8,
+    home: ?[]const u8,
+) ![]u8 {
+    if (zmux_socket) |value| {
         if (value.len > 0) return allocator.dupe(u8, value);
     }
-    if (std.posix.getenv("SMITHERS_SESSION_SOCKET")) |value| {
+    if (smithers_socket) |value| {
         if (value.len > 0) return allocator.dupe(u8, value);
     }
-    if (std.posix.getenv("XDG_RUNTIME_DIR")) |xdg| {
+    if (xdg_runtime_dir) |xdg| {
         if (xdg.len > 0) return std.fs.path.join(allocator, &.{ xdg, "smithers-sessions.sock" });
     }
-    const home = std.posix.getenv("HOME") orelse "/tmp";
-    return std.fs.path.join(allocator, &.{ home, ".smithers", "sessions.sock" });
+    if (home) |home_path| {
+        if (home_path.len > 0) return std.fs.path.join(allocator, &.{ home_path, ".smithers", "sessions.sock" });
+    }
+
+    const fallback_dir = try std.fmt.allocPrint(allocator, "/tmp/zmux-{d}", .{posix.geteuid()});
+    defer allocator.free(fallback_dir);
+    return std.fs.path.join(allocator, &.{ fallback_dir, "sessions.sock" });
 }
 
 fn tiocgwinsz() usize {
@@ -666,13 +733,14 @@ fn fail(comptime fmt: []const u8, args: anytype) error{InvalidArguments} {
     var buf: [1024]u8 = undefined;
     var w = std.fs.File.stderr().writer(&buf);
     w.interface.print("zmux-connect: " ++ fmt ++ "\n", args) catch {};
+    w.interface.print("Try 'zmux-connect --help' for usage.\n", .{}) catch {};
     w.interface.flush() catch {};
     return error.InvalidArguments;
 }
 
 fn printUsage() !void {
     var buf: [1024]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.fs.File.stdout().writer(&buf);
     try w.interface.writeAll(
         \\Usage: zmux-connect <session_id> [--socket PATH] [--spawn-daemon]
         \\                    [--no-create] [--command CMD]
@@ -713,6 +781,22 @@ test "tiocgwinsz encodes the platform ioctl" {
     try std.testing.expect(req != 0);
 }
 
+test "resolveSocketPathFromEnv falls back to uid-scoped /tmp path" {
+    const path = try resolveSocketPathFromEnv(std.testing.allocator, null, null, null, null);
+    defer std.testing.allocator.free(path);
+    const expected_prefix = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "/tmp/zmux-{d}/sessions.sock",
+        .{posix.geteuid()},
+    );
+    defer std.testing.allocator.free(expected_prefix);
+    try std.testing.expectEqualStrings(expected_prefix, path);
+
+    const from_home = try resolveSocketPathFromEnv(std.testing.allocator, null, null, null, "/home/me");
+    defer std.testing.allocator.free(from_home);
+    try std.testing.expect(std.mem.endsWith(u8, from_home, "/home/me/.smithers/sessions.sock"));
+}
+
 test "matchesRpcId accepts only the expected numeric response id" {
     try std.testing.expect(matchesRpcId(std.testing.allocator, "{\"id\":7,\"result\":{}}\n", 7));
     try std.testing.expect(!matchesRpcId(std.testing.allocator, "{\"id\":8,\"result\":{}}\n", 7));
@@ -736,10 +820,25 @@ test "readRpcResponse skips notifications and out-of-order responses" {
     );
 
     var reader: LineReader = .{};
-    const line = try readRpcResponse(std.testing.allocator, &reader, fds[0], 2);
+    const line = try readRpcResponse(std.testing.allocator, &reader, fds[0], 2, std.time.milliTimestamp() + 10_000);
     defer std.testing.allocator.free(line);
 
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"ok\":true}}\n", line);
+}
+
+test "readRpcResponse returns ReadTimeout" {
+    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
+
+    const fds = try std.posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var reader: LineReader = .{};
+    const deadline = std.time.milliTimestamp() + 20;
+    try std.testing.expectError(
+        error.ReadTimeout,
+        readRpcResponse(std.testing.allocator, &reader, fds[0], 1, deadline),
+    );
 }
 
 test "paneIdFromAttach extracts canonical pane id" {

@@ -3,6 +3,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const default_capacity = 10 * 1024 * 1024;
+pub const max_capacity = 64 * 1024 * 1024;
 
 pub const ScrollbackBuffer = struct {
     allocator: Allocator,
@@ -11,7 +12,8 @@ pub const ScrollbackBuffer = struct {
     len: usize = 0,
 
     pub fn init(allocator: Allocator, capacity_bytes: usize) !ScrollbackBuffer {
-        const cap = @max(capacity_bytes, 1);
+        const clamped = @max(capacity_bytes, 1);
+        const cap = @min(clamped, max_capacity);
         return .{
             .allocator = allocator,
             .data = try allocator.alloc(u8, cap),
@@ -118,4 +120,12 @@ test "scrollback captures last lines" {
     const capture = try buffer.captureLastLines(std.testing.allocator, 2);
     defer std.testing.allocator.free(capture);
     try std.testing.expectEqualStrings("three\nfour\n", capture);
+}
+
+test "scrollback initialization clamps oversized capacity" {
+    const capacity = 3 * 1024 * 1024 * 1024;
+    const capped = @min(@max(capacity, 1), max_capacity);
+    var buffer = try ScrollbackBuffer.init(std.testing.allocator, capacity);
+    defer buffer.deinit();
+    try std.testing.expectEqual(capped, buffer.capacity());
 }

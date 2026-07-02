@@ -36,11 +36,25 @@ fn requireUnixSocketBind(path: []const u8) !void {
 }
 
 fn connectClient(path: []const u8) !posix.fd_t {
-    const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-    errdefer posix.close(fd);
     const address = try std.net.Address.initUnix(path);
-    try posix.connect(fd, &address.any, address.getOsSockLen());
-    return fd;
+    const deadline_ms = std.time.milliTimestamp() + 2_000;
+    while (true) {
+        const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+        if (posix.connect(fd, &address.any, address.getOsSockLen())) |_| {
+            return fd;
+        } else |err| {
+            posix.close(fd);
+            // A saturated listen backlog surfaces as a transient ECONNREFUSED
+            // on unix sockets (macOS clamps the accept queue to somaxconn):
+            // the server drains and accepts moments later, so retry briefly
+            // rather than treating a full backlog as a hard failure.
+            if (err == error.ConnectionRefused and std.time.milliTimestamp() < deadline_ms) {
+                std.Thread.sleep(2 * std.time.ns_per_ms);
+                continue;
+            }
+            return err;
+        }
+    }
 }
 
 fn writeAll(fd: posix.fd_t, bytes: []const u8) !void {
@@ -266,20 +280,54 @@ fn waitForPaneOutput(
     timeout_ms: i64,
 ) !void {
     const deadline = std.time.milliTimestamp() + timeout_ms;
-    while (std.time.milliTimestamp() < deadline) {
-        const line = try readLineAllocTimeout(allocator, fd, 1024 * 1024, deadline - std.time.milliTimestamp());
-        defer allocator.free(line);
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
-        defer parsed.deinit();
-        if (parsed.value != .object) continue;
-        const method = parsed.value.object.get("method") orelse continue;
-        if (method != .string or !std.mem.eql(u8, method.string, "pane_output")) continue;
-        const params = parsed.value.object.get("params") orelse continue;
-        if (params != .object) continue;
-        const got = params.object.get("pane_id") orelse continue;
-        if (got == .string and std.mem.eql(u8, got.string, pane_id)) return;
+    // Drain in bulk rather than one syscall per byte: a slow reader lets the
+    // server's per-connection broadcast queue overflow while another pane is
+    // flooding, which drops this client (EndOfStream) before the target line
+    // ever arrives. Chunked reads keep the client draining fast enough to stay.
+    var pending = std.ArrayList(u8).empty;
+    defer pending.deinit(allocator);
+    var chunk: [64 * 1024]u8 = undefined;
+    while (true) {
+        const now = std.time.milliTimestamp();
+        if (now >= deadline) return error.PaneOutputTimeout;
+        var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+        const remaining: i32 = @intCast(@min(deadline - now, std.math.maxInt(i32)));
+        const ready = try posix.poll(&fds, remaining);
+        if (ready == 0) return error.PaneOutputTimeout;
+        if ((fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and (fds[0].revents & posix.POLL.IN) == 0) {
+            return error.EndOfStream;
+        }
+        if ((fds[0].revents & posix.POLL.IN) == 0) continue;
+
+        const n = try posix.read(fd, &chunk);
+        if (n == 0) return error.EndOfStream;
+        try pending.appendSlice(allocator, chunk[0..n]);
+
+        var start: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, pending.items, start, '\n')) |nl| {
+            const line = pending.items[start..nl];
+            start = nl + 1;
+            if (paneOutputMatches(allocator, line, pane_id)) return;
+        }
+        if (start > 0) {
+            const rest = pending.items.len - start;
+            std.mem.copyForwards(u8, pending.items[0..rest], pending.items[start..]);
+            pending.shrinkRetainingCapacity(rest);
+        }
     }
-    return error.PaneOutputTimeout;
+}
+
+fn paneOutputMatches(allocator: std.mem.Allocator, line: []const u8, pane_id: []const u8) bool {
+    if (line.len == 0) return false;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const method = parsed.value.object.get("method") orelse return false;
+    if (method != .string or !std.mem.eql(u8, method.string, "pane_output")) return false;
+    const params = parsed.value.object.get("params") orelse return false;
+    if (params != .object) return false;
+    const got = params.object.get("pane_id") orelse return false;
+    return got == .string and std.mem.eql(u8, got.string, pane_id);
 }
 
 fn firstPaneMasterFd(server: *server_mod.Server) !posix.fd_t {
@@ -646,6 +694,100 @@ test "server shutdown waits for an idle client handler to exit" {
     thread.join();
     try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.seq_cst));
     try std.testing.expectEqual(@as(usize, 0), server.active_writer_threads.load(.seq_cst));
+    server.deinit();
+    server_stopped = true;
+    try std.testing.expect(ctx.run_error == null);
+}
+
+test "server rejects connections above max_client_connections" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const socket_path = try tempSocketPath(allocator);
+    defer allocator.free(socket_path);
+    std.fs.deleteFileAbsolute(socket_path) catch {};
+    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+
+    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var ctx = RunServerCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
+    var server_stopped = false;
+    errdefer {
+        if (!server_stopped) {
+            server.running.store(false, .seq_cst);
+            thread.join();
+            server.deinit();
+        }
+    }
+
+    try waitForSocket(socket_path, 2_000);
+
+    const max_connections = server_mod.max_client_connections;
+    var clients = std.ArrayList(posix.fd_t).empty;
+    try clients.ensureTotalCapacity(allocator, max_connections);
+    defer {
+        for (clients.items) |fd| posix.close(fd);
+        clients.deinit(allocator);
+    }
+
+    for (0..max_connections) |_| {
+        try clients.append(allocator, try connectClient(socket_path));
+    }
+
+    const overflow_client = try connectClient(socket_path);
+    defer posix.close(overflow_client);
+    var saw_limit_error = false;
+    var overflow_msg: ?[]u8 = null;
+    overflow_msg = readLineAllocTimeout(
+        allocator,
+        overflow_client,
+        64 * 1024,
+        1_000,
+    ) catch |err| switch (err) {
+        error.EndOfStream, error.ReadTimeout => null,
+        else => return err,
+    };
+    if (overflow_msg) |msg| {
+        defer allocator.free(msg);
+        saw_limit_error = std.mem.indexOf(
+            u8,
+            msg,
+            "server connection limit reached",
+        ) != null;
+    }
+    try std.testing.expect(saw_limit_error);
+
+    // Free one slot and confirm a new live connection is accepted. The control
+    // connection is scoped so it releases its slot before the shutdown request.
+    const released = clients.orderedRemove(0);
+    posix.close(released);
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    {
+        const control = try connectClient(socket_path);
+        defer posix.close(control);
+        try writeAll(control, "{\"id\":99,\"method\":\"daemon.ping\",\"params\":{}}\n");
+        const ping_response = try readLineAllocTimeout(allocator, control, 64 * 1024, 2_000);
+        defer allocator.free(ping_response);
+        try std.testing.expect(std.mem.indexOf(u8, ping_response, "\"result\"") != null);
+    }
+
+    // Release every remaining held client so the shutdown request is not turned
+    // away by the connection cap, then let the accept loop drain the closures.
+    // Clear the list so the outer defer does not double-close these fds.
+    for (clients.items) |fd| posix.close(fd);
+    clients.clearRetainingCapacity();
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    {
+        const shutdown = try connectClient(socket_path);
+        defer posix.close(shutdown);
+        try writeAll(shutdown, "{\"id\":100,\"method\":\"daemon.shutdown\",\"params\":{}}\n");
+        const shutdown_response = try readLineAllocTimeout(allocator, shutdown, 64 * 1024, 2_000);
+        defer allocator.free(shutdown_response);
+    }
+
+    thread.join();
     server.deinit();
     server_stopped = true;
     try std.testing.expect(ctx.run_error == null);

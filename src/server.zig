@@ -21,6 +21,9 @@ const max_request_bytes = 1024 * 1024;
 const attach_replay_max_bytes: usize = 256 * 1024;
 const broadcast_queue_max_bytes: usize = 1024 * 1024;
 const socket_send_timeout_seconds: isize = 2;
+pub const max_client_connections: usize = 256;
+const accept_backoff_ms: i64 = 50;
+const socket_bind_umask: std.c.mode_t = 0o177;
 
 const ClientConnection = struct {
     allocator: Allocator,
@@ -234,12 +237,19 @@ pub const Server = struct {
         const address = try std.net.Address.initUnix(socket_path);
         const listener = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
         errdefer posix.close(listener);
+        const previous_umask = std.c.umask(socket_bind_umask);
+        errdefer _ = std.c.umask(previous_umask);
         try posix.bind(listener, &address.any, address.getOsSockLen());
+        _ = std.c.umask(previous_umask);
 
         // Set socket permissions to owner-only (0600) for security
         try setSocketPermissions(allocator, socket_path);
 
-        try posix.listen(listener, 64);
+        // Size the accept backlog to the connection cap so a burst of clients
+        // (e.g. a fleader spawning many attachers at once) is queued rather
+        // than refused while the accept loop drains it. The kernel silently
+        // clamps to somaxconn.
+        try posix.listen(listener, @intCast(max_client_connections));
         const socket_stat = try socketPathStat(socket_path);
 
         return .{
@@ -288,16 +298,39 @@ pub const Server = struct {
             }};
             const ready = try posix.poll(&fds, 250);
             if (ready == 0) continue;
+            if ((fds[0].revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) return;
             if ((fds[0].revents & posix.POLL.IN) == 0) continue;
 
-            const client_fd = posix.accept(self.listener_fd, null, null, posix.SOCK.CLOEXEC) catch continue;
+            const client_fd = posix.accept(self.listener_fd, null, null, posix.SOCK.CLOEXEC) catch |err| {
+                switch (err) {
+                    error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => {
+                        logAcceptError(err);
+                        std.Thread.sleep(accept_backoff_ms * std.time.ns_per_ms);
+                    },
+                    else => {
+                        logAcceptError(err);
+                        // In the presence of any temporary listener-level fault,
+                        // avoid an accept/read busy loop. This keeps a failed accept
+                        // from consuming 100% CPU while still allowing the server
+                        // to recover.
+                        std.Thread.sleep(accept_backoff_ms * std.time.ns_per_ms);
+                    },
+                }
+                continue;
+            };
             if (!peerHasSameEuid(client_fd)) {
                 posix.close(client_fd);
                 continue;
             }
             setSocketSendTimeout(client_fd);
             self.touch();
-            _ = self.active_connections.fetchAdd(1, .seq_cst);
+            const previous_connections = self.active_connections.fetchAdd(1, .seq_cst);
+            if (previous_connections >= max_client_connections) {
+                _ = self.active_connections.fetchSub(1, .seq_cst);
+                writeConnectionLimitError(client_fd);
+                posix.close(client_fd);
+                continue;
+            }
             const thread = std.Thread.spawn(.{}, Server.handleClientThread, .{ self, client_fd }) catch {
                 _ = self.active_connections.fetchSub(1, .seq_cst);
                 posix.close(client_fd);
@@ -310,6 +343,12 @@ pub const Server = struct {
         self.closeConnections();
         self.waitForWorkers();
     }
+
+fn writeConnectionLimitError(fd: posix.fd_t) void {
+    const message =
+        "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32000,\"message\":\"server connection limit reached\"}}\n";
+    writeAll(fd, message) catch {};
+}
 
     fn shouldExitForIdle(self: *Server) bool {
         if (self.idle_timeout_seconds <= 0) return false;
@@ -425,7 +464,15 @@ pub const Server = struct {
         // for the session title — for window.new / pane.split the same `id`
         // field is the existing target alias, so it must NOT be repurposed
         // as the new window/pane title.
-        var create_args = try muxCreateArgsFromParams(self.allocator, req.params(), .{ .id_aliases_title = true });
+        var create_args = muxCreateArgsFromParams(self.allocator, req.params(), .{ .id_aliases_title = true }) catch |err| {
+            switch (err) {
+                error.ScrollbackBytesTooLarge => {
+                    try self.writeError(connection, req.id_json, protocol.ErrorCode.invalid_params, "scrollbackBytes exceeds maximum") ;
+                    return;
+                },
+                else => return err,
+            }
+        };
         defer create_args.deinit();
 
         const created = try self.manager.create(create_args.opts);
@@ -446,7 +493,15 @@ pub const Server = struct {
         const session_id = sessionIdParam(req.params()) orelse {
             return self.writeError(connection, req.id_json, protocol.ErrorCode.invalid_params, "sessionId is required");
         };
-        var create_args = try muxCreateArgsFromParams(self.allocator, req.params(), .{});
+        var create_args = muxCreateArgsFromParams(self.allocator, req.params(), .{}) catch |err| {
+            switch (err) {
+                error.ScrollbackBytesTooLarge => {
+                    try self.writeError(connection, req.id_json, protocol.ErrorCode.invalid_params, "scrollbackBytes exceeds maximum");
+                    return;
+                },
+                else => return err,
+            }
+        };
         defer create_args.deinit();
         _ = try self.manager.newWindow(session_id, create_args.opts);
         try self.writeSnapshotResponse(connection, req.id_json);
@@ -456,7 +511,15 @@ pub const Server = struct {
         const pane_id = paneIdParam(req.params()) orelse {
             return self.writeError(connection, req.id_json, protocol.ErrorCode.invalid_params, "paneId is required");
         };
-        var create_args = try muxCreateArgsFromParams(self.allocator, req.params(), .{});
+        var create_args = muxCreateArgsFromParams(self.allocator, req.params(), .{}) catch |err| {
+            switch (err) {
+                error.ScrollbackBytesTooLarge => {
+                    try self.writeError(connection, req.id_json, protocol.ErrorCode.invalid_params, "scrollbackBytes exceeds maximum");
+                    return;
+                },
+                else => return err,
+            }
+        };
         defer create_args.deinit();
         _ = try self.manager.splitPane(pane_id, axisParam(req.params()), create_args.opts);
         try self.writeSnapshotResponse(connection, req.id_json);
@@ -911,20 +974,39 @@ pub const Server = struct {
 
 fn ensureSocketParent(socket_path: []const u8) !void {
     const parent = std.fs.path.dirname(socket_path) orelse return;
-    var created = false;
-    std.fs.accessAbsolute(parent, .{}) catch |err| switch (err) {
-        error.FileNotFound => {
-            try std.fs.makeDirAbsolute(parent);
-            created = true;
-        },
+    _ = posix.fstatat(posix.AT.FDCWD, parent, posix.AT.SYMLINK_NOFOLLOW) catch |err| switch (err) {
+        // A missing parent is one zmux owns (the uid-scoped fallback such as
+        // /tmp/zmux-<uid> or ~/.smithers): create it private and validate that
+        // it really is a self-owned 0700 directory before binding there.
+        error.FileNotFound => return createPrivateSocketParent(parent),
+        else => return err,
+    };
+    // A pre-existing parent belongs to a user-specified socket path (e.g.
+    // /tmp): use it as-is — no chmod, no rejection. The socket file itself is
+    // 0600 and every connection is still gated by a same-uid peer-credential
+    // check, so a sticky world-writable parent is an acceptable trust boundary,
+    // matching tmux's model for explicit socket paths.
+}
+
+/// Create a parent directory that zmux owns, then enforce that it is a private
+/// (0700), self-owned, non-symlink directory. Only used for the fallback paths
+/// zmux itself creates.
+fn createPrivateSocketParent(parent: []const u8) !void {
+    std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
         else => return err,
     };
 
-    if (!created) return;
+    {
+        var dir = try std.fs.openDirAbsolute(parent, .{});
+        defer dir.close();
+        _ = std.c.fchmod(dir.fd, 0o700);
+    }
 
-    var dir = std.fs.openDirAbsolute(parent, .{}) catch return;
-    defer dir.close();
-    _ = std.c.fchmod(dir.fd, 0o700);
+    const stat = try posix.fstatat(posix.AT.FDCWD, parent, posix.AT.SYMLINK_NOFOLLOW);
+    if ((stat.mode & std.posix.S.IFMT) != std.posix.S.IFDIR) return error.NotDir;
+    if (stat.uid != posix.geteuid()) return error.PermissionDenied;
+    if ((stat.mode & 0o7777) != 0o700) return error.PermissionDenied;
 }
 
 fn setSocketPermissions(allocator: Allocator, socket_path: []const u8) !void {
@@ -1009,6 +1091,12 @@ fn intParam(comptime T: type, params: ?Value, key: []const u8, default: T) T {
     return std.math.cast(T, integer) orelse default;
 }
 
+fn scrollbackBytesFromParams(params: ?Value) !usize {
+    const bytes = intParam(usize, params, "scrollbackBytes", @import("buffer.zig").default_capacity);
+    if (bytes > @import("buffer.zig").max_capacity) return error.ScrollbackBytesTooLarge;
+    return bytes;
+}
+
 const MuxCreateArgs = struct {
     allocator: Allocator,
     env_entries: ?[][]const u8 = null,
@@ -1048,7 +1136,7 @@ fn muxCreateArgsFromParams(allocator: Allocator, params: ?Value, options: Create
             .env = if (env_entries) |entries| entries else null,
             .rows = intParam(u16, params, "rows", 24),
             .cols = intParam(u16, params, "cols", 80),
-            .scrollback_bytes = intParam(usize, params, "scrollbackBytes", @import("buffer.zig").default_capacity),
+            .scrollback_bytes = try scrollbackBytesFromParams(params),
         },
     };
 }
@@ -1137,7 +1225,7 @@ fn peerHasSameEuid(fd: posix.fd_t) bool {
     return switch (builtin.os.tag) {
         .linux => linuxPeerUid(fd) == posix.geteuid(),
         .macos, .ios, .tvos, .watchos, .visionos => darwinPeerUid(fd) == posix.geteuid(),
-        else => true,
+        else => false,
     };
 }
 
@@ -1166,6 +1254,13 @@ fn darwinPeerUid(fd: posix.fd_t) std.c.uid_t {
 }
 
 extern "c" fn getpeereid(socket: c_int, euid: *std.c.uid_t, egid: *std.c.gid_t) c_int;
+
+fn logAcceptError(err: anytype) void {
+    var buf: [128]u8 = undefined;
+    var w = std.fs.File.stderr().writer(&buf);
+    w.interface.print("zmuxd: accept failed: {s}\n", .{@errorName(err)}) catch {};
+    w.interface.flush() catch {};
+}
 
 test "server parses aliases for session id" {
     var parsed = try std.json.parseFromSlice(Value, std.testing.allocator, "{\"id\":\"sess-1\"}", .{});
@@ -1209,6 +1304,23 @@ test "mux create args converts environment values for native spawn" {
     try std.testing.expect(envContains(entries, "EMPTY="));
 }
 
+test "mux create args rejects oversize scrollbackBytes" {
+    const max = @import("buffer.zig").max_capacity;
+    const payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"scrollbackBytes\":{}}}",
+        .{max + 1},
+    );
+    defer std.testing.allocator.free(payload);
+
+    var parsed = try std.json.parseFromSlice(Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    try std.testing.expectError(
+        error.ScrollbackBytesTooLarge,
+        muxCreateArgsFromParams(std.testing.allocator, parsed.value, .{}),
+    );
+}
+
 test "axisParam accepts string and boolean horizontal aliases" {
     var horizontal_string = try std.json.parseFromSlice(Value, std.testing.allocator, "{\"axis\":\"-h\"}", .{});
     defer horizontal_string.deinit();
@@ -1240,6 +1352,24 @@ test "peer credential check accepts same-user unix socket peer" {
     try std.testing.expect(peerHasSameEuid(sockets[0]));
 }
 
+test "self-created socket parent is validated as private 0700" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const parent = try tempPath(allocator, "zmx-created-parent");
+    defer allocator.free(parent);
+    defer std.fs.deleteTreeAbsolute(parent) catch {};
+
+    // The parent does not exist yet, so zmux owns its creation: Server.init
+    // must bring it up as a private 0700 directory owned by the current uid.
+    const socket_path = try std.fs.path.join(allocator, &.{ parent, "sessions.sock" });
+    defer allocator.free(socket_path);
+
+    var server = try Server.init(allocator, socket_path, 0);
+    server.deinit();
+    try std.testing.expectEqual(@as(u32, 0o700), try dirMode(parent));
+}
+
 test "existing socket parent permissions are left unchanged" {
     if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
 
@@ -1248,16 +1378,16 @@ test "existing socket parent permissions are left unchanged" {
     defer allocator.free(parent);
     defer std.fs.deleteTreeAbsolute(parent) catch {};
 
+    // A pre-existing parent of an explicit socket path must be accepted as-is
+    // and left at its original mode (here 0755), never chmod'd or rejected.
     try std.fs.makeDirAbsolute(parent);
     try chmodAbsolute(allocator, parent, 0o755);
 
     const socket_path = try std.fs.path.join(allocator, &.{ parent, "sessions.sock" });
     defer allocator.free(socket_path);
-    try requireUnixSocketBind(socket_path);
 
     var server = try Server.init(allocator, socket_path, 0);
-    defer server.deinit();
-
+    server.deinit();
     try std.testing.expectEqual(@as(u32, 0o755), try dirMode(parent));
 }
 

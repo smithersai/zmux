@@ -7,8 +7,18 @@ const macos_deployment_target = std.SemanticVersion{ .major = 14, .minor = 0, .p
 comptime {
     if (builtin.zig_version.order(required_zig) != .eq) {
         const msg = std.fmt.comptimePrint(
-            "zmux requires Zig {}. You have {}. Run `zvm use {}`.",
-            .{ required_zig, builtin.zig_version, required_zig },
+            "zmux requires Zig {d}.{d}.{d}. You have {d}.{d}.{d}. Run `zvm use {d}.{d}.{d}`.",
+            .{
+                required_zig.major,
+                required_zig.minor,
+                required_zig.patch,
+                builtin.zig_version.major,
+                builtin.zig_version.minor,
+                builtin.zig_version.patch,
+                required_zig.major,
+                required_zig.minor,
+                required_zig.patch,
+            },
         );
         @compileError(msg);
     }

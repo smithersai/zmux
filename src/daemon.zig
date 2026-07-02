@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const protocol = @import("protocol.zig");
+
 const server_mod = @import("server.zig");
 
 const default_idle_timeout_seconds: i64 = 60 * 60;
@@ -20,6 +22,21 @@ const StartLock = struct {
 };
 
 pub fn main() !void {
+    runMain() catch |err| {
+        switch (err) {
+            error.InvalidArguments => {},
+            else => {
+                var buf: [1024]u8 = undefined;
+                var w = std.fs.File.stderr().writer(&buf);
+                w.interface.print("zmuxd: {s}\n", .{@errorName(err)}) catch {};
+                w.interface.flush() catch {};
+            },
+        }
+        std.process.exit(1);
+    };
+}
+
+fn runMain() !void {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
     const allocator = debug_allocator.allocator();
     defer _ = debug_allocator.deinit();
@@ -31,21 +48,31 @@ pub fn main() !void {
     var explicit_socket_path: ?[]const u8 = null;
 
     var i: usize = 1;
+    var show_version = false;
     while (i < argv.len) : (i += 1) {
         if (std.mem.eql(u8, argv[i], "--socket")) {
             i += 1;
-            if (i >= argv.len) return error.MissingSocketPath;
+            if (i >= argv.len) return fail("missing value for --socket", .{});
             explicit_socket_path = argv[i];
         } else if (std.mem.eql(u8, argv[i], "--idle-seconds")) {
             i += 1;
-            if (i >= argv.len) return error.MissingIdleSeconds;
-            idle_timeout_seconds = try std.fmt.parseInt(i64, argv[i], 10);
+            if (i >= argv.len) return fail("missing value for --idle-seconds", .{});
+            idle_timeout_seconds = std.fmt.parseInt(i64, argv[i], 10) catch |err| {
+                return fail("invalid idle timeout value: {s}", .{@errorName(err)});
+            };
+        } else if (std.mem.eql(u8, argv[i], "--version") or std.mem.eql(u8, argv[i], "-V")) {
+            show_version = true;
         } else if (std.mem.eql(u8, argv[i], "--help") or std.mem.eql(u8, argv[i], "-h")) {
             try printUsage();
             return;
         } else {
-            return error.UnknownArgument;
+            return fail("unknown flag: {s}", .{argv[i]});
         }
+    }
+
+    if (show_version) {
+        try printVersion();
+        return;
     }
 
     const path = if (explicit_socket_path) |value|
@@ -94,17 +121,38 @@ pub fn main() !void {
 }
 
 pub fn socketPath(allocator: std.mem.Allocator) ![]u8 {
-    if (std.posix.getenv("ZMUX_SOCKET")) |value| {
+    return socketPathFromEnv(
+        allocator,
+        std.posix.getenv("ZMUX_SOCKET"),
+        std.posix.getenv("SMITHERS_SESSION_SOCKET"),
+        std.posix.getenv("XDG_RUNTIME_DIR"),
+        std.posix.getenv("HOME"),
+    );
+}
+
+fn socketPathFromEnv(
+    allocator: std.mem.Allocator,
+    zmux_socket: ?[]const u8,
+    smithers_socket: ?[]const u8,
+    xdg_runtime_dir: ?[]const u8,
+    home: ?[]const u8,
+) ![]u8 {
+    if (zmux_socket) |value| {
         if (value.len > 0) return allocator.dupe(u8, value);
     }
-    if (std.posix.getenv("SMITHERS_SESSION_SOCKET")) |value| {
+    if (smithers_socket) |value| {
         if (value.len > 0) return allocator.dupe(u8, value);
     }
-    if (std.posix.getenv("XDG_RUNTIME_DIR")) |xdg| {
+    if (xdg_runtime_dir) |xdg| {
         if (xdg.len > 0) return std.fs.path.join(allocator, &.{ xdg, "smithers-sessions.sock" });
     }
-    const home = std.posix.getenv("HOME") orelse "/tmp";
-    return std.fs.path.join(allocator, &.{ home, ".smithers", "sessions.sock" });
+    if (home) |home_path| {
+        if (home_path.len > 0) return std.fs.path.join(allocator, &.{ home_path, ".smithers", "sessions.sock" });
+    }
+
+    const fallback_dir = try std.fmt.allocPrint(allocator, "/tmp/zmux-{d}", .{std.posix.geteuid()});
+    defer allocator.free(fallback_dir);
+    return std.fs.path.join(allocator, &.{ fallback_dir, "sessions.sock" });
 }
 
 fn pidPath(allocator: std.mem.Allocator, active_socket_path: []const u8) ![]u8 {
@@ -171,19 +219,46 @@ fn ensureParent(path: []const u8) !void {
     };
 }
 
-fn socketAcceptsConnection(socket_path: []const u8) bool {
-    const fd = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0) catch return false;
+const SocketProbe = enum {
+    /// A daemon is listening and accepted our probe connection.
+    live,
+    /// Definitive stale/dead socket: connect() was refused (no listener) or
+    /// the path is gone. No amount of waiting turns this into a live daemon.
+    dead,
+    /// Transient/ambiguous failure (e.g. a daemon that has bound but is not yet
+    /// accepting, or a temporary fd exhaustion): worth retrying to the deadline.
+    retry,
+};
+
+fn probeSocketConnection(socket_path: []const u8) SocketProbe {
+    const fd = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0) catch return .retry;
     defer std.posix.close(fd);
 
-    const address = std.net.Address.initUnix(socket_path) catch return false;
-    std.posix.connect(fd, &address.any, address.getOsSockLen()) catch return false;
-    return true;
+    const address = std.net.Address.initUnix(socket_path) catch return .dead;
+    std.posix.connect(fd, &address.any, address.getOsSockLen()) catch |err| switch (err) {
+        // ECONNREFUSED / ENOENT: the daemon that bound this socket is gone or
+        // the file vanished. Both are definitive stale-socket signals.
+        error.ConnectionRefused, error.FileNotFound => return .dead,
+        else => return .retry,
+    };
+    return .live;
+}
+
+fn socketAcceptsConnection(socket_path: []const u8) bool {
+    return probeSocketConnection(socket_path) == .live;
 }
 
 fn waitForSocketAcceptsConnection(socket_path: []const u8, timeout_ms: i64) bool {
     const deadline_ms = std.time.milliTimestamp() + timeout_ms;
     while (true) {
-        if (socketAcceptsConnection(socket_path)) return true;
+        switch (probeSocketConnection(socket_path)) {
+            .live => return true,
+            // Bail immediately on a definitive dead socket so main() can
+            // proceed to Server.init (which unlinks the stale file) instead of
+            // burning the whole startup budget on doomed retries.
+            .dead => return false,
+            .retry => {},
+        }
         if (std.time.milliTimestamp() >= deadline_ms) return false;
         std.Thread.sleep(50 * std.time.ns_per_ms);
     }
@@ -196,13 +271,29 @@ fn socketPathExists(socket_path: []const u8) bool {
 
 fn printUsage() !void {
     var buffer: [1024]u8 = undefined;
-    var stderr = std.fs.File.stderr().writer(&buffer);
-    try stderr.interface.writeAll(
+    var stdout = std.fs.File.stdout().writer(&buffer);
+    try stdout.interface.writeAll(
         \\Usage: zmuxd [--socket PATH] [--idle-seconds SECONDS]
         \\       smithers-session-daemon [--socket PATH] [--idle-seconds SECONDS]
         \\
     );
-    try stderr.interface.flush();
+    try stdout.interface.flush();
+}
+
+fn printVersion() !void {
+    var buf: [64]u8 = undefined;
+    var out = std.fs.File.stdout().writer(&buf);
+    try out.interface.print("zmuxd {s}\n", .{protocol.version});
+    try out.interface.flush();
+}
+
+fn fail(comptime fmt: []const u8, args: anytype) error{InvalidArguments} {
+    var buf: [1024]u8 = undefined;
+    var w = std.fs.File.stderr().writer(&buf);
+    w.interface.print("zmuxd: " ++ fmt ++ "\n", args) catch {};
+    w.interface.print("Try 'zmuxd --help' for usage.\n", .{}) catch {};
+    w.interface.flush() catch {};
+    return error.InvalidArguments;
 }
 
 fn shutdownRequested() bool {
@@ -244,11 +335,54 @@ fn installShutdownHandlers() void {
     std.posix.sigaction(std.c.SIG.HUP, &ignore_hup, null);
 }
 
-test "socket path falls back to smithers directory" {
-    const path = try socketPath(std.testing.allocator);
+test "socket path falls back to HOME/.smithers when HOME is provided" {
+    const path = try socketPathFromEnv(std.testing.allocator, null, null, null, "/tmp/daemon-home-sim");
     defer std.testing.allocator.free(path);
     try std.testing.expect(std.mem.endsWith(u8, path, "smithers-sessions.sock") or
         std.mem.endsWith(u8, path, ".smithers/sessions.sock"));
+}
+
+test "socket path falls back to uid-scoped /tmp directory when HOME is unavailable" {
+    const path = try socketPathFromEnv(std.testing.allocator, null, null, null, null);
+    defer std.testing.allocator.free(path);
+    const expected = try std.fmt.allocPrint(std.testing.allocator, "/tmp/zmux-{d}/sessions.sock", .{std.posix.geteuid()});
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, path);
+}
+
+test "stale unix socket is rejected immediately during startup probe" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const seed = try std.testing.allocator.alloc(u8, 16);
+    defer allocator.free(seed);
+    std.crypto.random.bytes(seed);
+    const nonce = std.mem.readInt(u64, seed[0..8], .little);
+    const root = switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos, .visionos => "/private/tmp",
+        else => "/tmp",
+    };
+    const path = try std.fmt.allocPrint(allocator, "{s}/zmx-stale-{x:0>16}.sock", .{ root, nonce });
+    defer allocator.free(path);
+    defer std.fs.deleteFileAbsolute(path) catch {};
+    std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+
+    const address = try std.net.Address.initUnix(path);
+    const listener = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+    std.posix.bind(listener, &address.any, address.getOsSockLen()) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    try std.posix.listen(listener, 1);
+    std.posix.close(listener);
+
+    const start = std.time.milliTimestamp();
+    try std.testing.expect(!waitForSocketAcceptsConnection(path, startup_probe_timeout_ms));
+    const elapsed_ms = std.time.milliTimestamp() - start;
+    try std.testing.expect(elapsed_ms < 500);
 }
 
 test "socketAcceptsConnection detects a listening unix socket" {
