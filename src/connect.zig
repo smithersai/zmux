@@ -121,7 +121,13 @@ fn runMain() !void {
         try resolveSocketPath(allocator);
     defer allocator.free(path);
 
-    const socket_fd = try connectWithRetry(allocator, path, spawn_daemon);
+    const socket_fd = connectWithRetry(allocator, path, spawn_daemon) catch |err| {
+        if (try connectFailureMessage(allocator, path, err)) |message| {
+            defer allocator.free(message);
+            return fail("{s}", .{message});
+        }
+        return err;
+    };
     defer posix.close(socket_fd);
     var socket_reader: LineReader = .{};
 
@@ -198,8 +204,14 @@ fn runMain() !void {
     };
 
     restoreTermios();
-    if (outcome == .detached) {
-        stderrWrite("[detached]\n") catch {};
+    switch (outcome) {
+        .detached => stderrWrite("[detached]\n") catch {},
+        .session_ended => stderrWrite("session ended\n") catch {},
+        .connection_lost => {
+            stderrWrite("zmux-connect: daemon connection lost\n") catch {};
+            std.process.exit(1);
+        },
+        .exited => {},
     }
 }
 
@@ -643,7 +655,7 @@ fn verbError(comptime fmt: []const u8, args: anytype) error{RpcError} {
     return error.RpcError;
 }
 
-const RunOutcome = enum { exited, detached };
+const RunOutcome = enum { exited, session_ended, detached, connection_lost };
 
 const RunLoopOptions = struct {
     // Detach chord byte to intercept on stdin, or null to disable interception.
@@ -679,15 +691,15 @@ fn runLoop(
         if (ready == 0) continue;
 
         if ((fds[1].revents & posix.POLL.HUP) != 0) {
-            _ = try drainReadableSocket(allocator, reader, socket_fd, session_id, stdout_fd);
-            return .exited;
+            const saw_exit = try drainReadableSocket(allocator, reader, socket_fd, session_id, stdout_fd);
+            return if (saw_exit) .session_ended else .connection_lost;
         }
 
         if ((fds[1].revents & posix.POLL.IN) != 0) {
-            if (try handleReadableSocket(allocator, reader, socket_fd, session_id, stdout_fd)) return .exited;
+            if (try handleReadableSocket(allocator, reader, socket_fd, session_id, stdout_fd)) return .session_ended;
         }
 
-        if ((fds[1].revents & posix.POLL.ERR) != 0) return .exited;
+        if ((fds[1].revents & posix.POLL.ERR) != 0) return .connection_lost;
 
         if ((fds[0].revents & posix.POLL.IN) != 0) {
             switch (try readStdinChunk(stdin_fd, &buf)) {
@@ -794,6 +806,22 @@ fn connectWithRetry(allocator: std.mem.Allocator, path: []const u8, spawn_daemon
         }
     }
     return error.DaemonUnavailable;
+}
+
+fn connectFailureMessage(allocator: std.mem.Allocator, path: []const u8, err: anyerror) !?[]u8 {
+    return switch (err) {
+        error.ConnectionRefused, error.FileNotFound => try std.fmt.allocPrint(
+            allocator,
+            "no daemon at {s}; start zmuxd or pass --spawn-daemon",
+            .{path},
+        ),
+        error.DaemonUnavailable => try std.fmt.allocPrint(
+            allocator,
+            "daemon at {s} did not become ready within 2s; see {s}.log",
+            .{ path, path },
+        ),
+        else => null,
+    };
 }
 
 fn tryConnect(path: []const u8) !posix.fd_t {
@@ -1552,7 +1580,7 @@ test "runLoop drains final socket output after HUP" {
 
     var reader: LineReader = .{};
     const outcome = try runLoop(stdin_fds[0], stdout_fds[1], socket_fds[0], &reader, allocator, "pane-1", .{});
-    try std.testing.expectEqual(RunOutcome.exited, outcome);
+    try std.testing.expectEqual(RunOutcome.connection_lost, outcome);
 
     posix.close(stdout_fds[1]);
     stdout_write_open = false;
@@ -1561,6 +1589,35 @@ test "runLoop drains final socket output after HUP" {
 
     try std.testing.expect(std.mem.indexOf(u8, output, "FIRST\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, marker) != null);
+}
+
+test "runLoop reports session end when the daemon sends a matching exit notification" {
+    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const stdin_fds = try std.posix.pipe();
+    defer posix.close(stdin_fds[0]);
+    defer posix.close(stdin_fds[1]);
+
+    const socket_fds = try std.posix.pipe();
+    defer posix.close(socket_fds[0]);
+    var socket_write_open = true;
+    defer if (socket_write_open) posix.close(socket_fds[1]);
+
+    const stdout_fds = try std.posix.pipe();
+    defer posix.close(stdout_fds[0]);
+    defer posix.close(stdout_fds[1]);
+
+    try writeAll(
+        socket_fds[1],
+        "{\"jsonrpc\":\"2.0\",\"method\":\"session_exited\",\"params\":{\"session_id\":\"pane-1\",\"pid\":123,\"exit_code\":0,\"signal\":null}}\n",
+    );
+    posix.close(socket_fds[1]);
+    socket_write_open = false;
+
+    var reader: LineReader = .{};
+    const outcome = try runLoop(stdin_fds[0], stdout_fds[1], socket_fds[0], &reader, allocator, "pane-1", .{});
+    try std.testing.expectEqual(RunOutcome.session_ended, outcome);
 }
 
 test "run loop poll timeout bounds idle SIGWINCH latency" {
@@ -1806,4 +1863,24 @@ test "daemonVersion reads the daemon-reported protocol version" {
     const version = try daemonVersion(allocator, &reader, pair[0], std.time.milliTimestamp() + 2_000);
     defer allocator.free(version);
     try std.testing.expectEqualStrings("9.9.9", version);
+}
+
+test "connectFailureMessage explains expected bootstrap failures" {
+    const allocator = std.testing.allocator;
+
+    const missing = (try connectFailureMessage(allocator, "/tmp/missing.sock", error.FileNotFound)) orelse
+        return error.MissingMessage;
+    defer allocator.free(missing);
+    try std.testing.expect(std.mem.indexOf(u8, missing, "no daemon at /tmp/missing.sock") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing, "--spawn-daemon") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing, "FileNotFound") == null);
+
+    const unavailable = (try connectFailureMessage(allocator, "/tmp/slow.sock", error.DaemonUnavailable)) orelse
+        return error.MissingMessage;
+    defer allocator.free(unavailable);
+    try std.testing.expect(std.mem.indexOf(u8, unavailable, "did not become ready within 2s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unavailable, "/tmp/slow.sock.log") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unavailable, "DaemonUnavailable") == null);
+
+    try std.testing.expect((try connectFailureMessage(allocator, "/tmp/x.sock", error.AccessDenied)) == null);
 }

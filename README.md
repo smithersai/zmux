@@ -88,6 +88,29 @@ live processes alive across an operating-system reboot.
 
 `zmux` requires Zig **0.15.2** (pinned at `comptime` in `build.zig`).
 
+### Prebuilt binaries
+
+GitHub Releases publish tarballs for:
+
+| Asset | Target |
+|-------|--------|
+| `zmuxd-linux-x64.tar.gz` / `zmux-connect-linux-x64.tar.gz` | Linux x86_64, musl |
+| `zmuxd-linux-arm64.tar.gz` / `zmux-connect-linux-arm64.tar.gz` | Linux arm64, musl |
+| `zmuxd-macos-arm64.tar.gz` / `zmux-connect-macos-arm64.tar.gz` | macOS arm64 |
+| `zmuxd-macos-x64.tar.gz` / `zmux-connect-macos-x64.tar.gz` | macOS x86_64 |
+
+Each tarball includes the binary and `LICENSE`, with a matching `.sha256`
+sidecar:
+
+```sh
+release_tag=vX.Y.Z
+curl -LO "https://github.com/smithersai/zmux/releases/download/${release_tag}/zmux-connect-linux-x64.tar.gz"
+curl -LO "https://github.com/smithersai/zmux/releases/download/${release_tag}/zmux-connect-linux-x64.tar.gz.sha256"
+shasum -a 256 -c zmux-connect-linux-x64.tar.gz.sha256
+tar -xzf zmux-connect-linux-x64.tar.gz
+chmod +x zmux-connect
+```
+
 ### As a Zig package
 
 ```sh
@@ -130,9 +153,29 @@ Produces:
 
 ## Quickstart
 
-Start the daemon on a private socket, then attach a client. If the named
-session does not yet exist, `zmux-connect` creates it automatically and
-attaches:
+The tmux-like one-command path starts a daemon on demand, opens or creates a
+session named `work`, and attaches your terminal:
+
+```sh
+zmux-connect work --spawn-daemon
+```
+
+`--spawn-daemon` looks for a sibling `zmuxd` next to the `zmux-connect`
+binary (`smithers-session-connect` prefers `smithers-session-daemon`) and
+waits up to 2 seconds for the socket. An auto-spawned daemon writes startup
+stderr to `<socket>.log`.
+
+Detach with `Ctrl-\` by default, then reattach with the same session name:
+
+```sh
+zmux-connect work
+```
+
+Use `--detach-key ctrl-a` to choose a different chord, or
+`--detach-key none` to disable it. Detach interception is enabled only when
+stdin is a TTY, so piped input is forwarded verbatim.
+
+You can also start the daemon explicitly on a private socket:
 
 ```sh
 # Terminal 1 — daemon
@@ -143,15 +186,31 @@ zmux-connect work --socket /tmp/zmux.sock
 ```
 
 Pass `--no-create` to require an existing session, or `--command CMD` to
-override the shell command spawned in the new session.
+override the shell command spawned in the new session. Both binaries support
+`--version` / `-V`.
+
+Common management calls are available through `zmux-connect`:
+
+```sh
+zmux-connect ls --socket /tmp/zmux.sock
+zmux-connect rename work renamed --socket /tmp/zmux.sock
+zmux-connect kill renamed --socket /tmp/zmux.sock
+zmux-connect shutdown --socket /tmp/zmux.sock
+```
+
+Add `--json` to `ls`, `kill`, `rename`, or `shutdown` to print the raw
+JSON-RPC response.
 
 Drive the same daemon programmatically — every method is JSON-RPC 2.0:
 
 ```sh
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"daemon.ping"}' \
   | nc -U /tmp/zmux.sock
-# {"jsonrpc":"2.0","id":1,"result":{"version":"0.1.0"}}
+# {"jsonrpc":"2.0","id":1,"result":{"version":"0.1.0","pid":12345,"socketPath":"/tmp/zmux.sock","sessions":0,"panes":0}}
 ```
+
+The socket protocol is one JSON document per physical line, terminated by
+`\n`. Do not split one request across multiple lines.
 
 `session.create` accepts `id` (or equivalently `name`/`title`) as the
 human-readable session name; the daemon allocates a separate auto-generated
@@ -159,10 +218,39 @@ pane id and returns it in the response. `client.attach` accepts either id
 form for `paneId` — i.e. `"work"` or `"pane-1-…"`.
 
 ```sh
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"session.create",
-  "params":{"id":"work","rows":40,"cols":120,"command":"bash"}}' \
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"session.create","params":{"id":"work","rows":40,"cols":120,"command":"bash"}}' \
   | nc -U /tmp/zmux.sock
 ```
+
+## Socket & lifecycle
+
+`--socket PATH` overrides the default socket path. Without it, `zmuxd` and
+`zmux-connect` resolve the path identically:
+
+| Order | Source |
+|-------|--------|
+| 1 | `$ZMUX_SOCKET` |
+| 2 | `$SMITHERS_SESSION_SOCKET` |
+| 3 | `$XDG_RUNTIME_DIR/smithers-sessions.sock` |
+| 4 | `$HOME/.smithers/sessions.sock` |
+| 5 | `/tmp/zmux-<uid>/sessions.sock` when `HOME` is unset |
+
+The daemon writes an advisory pid file at `<socket>.pid` and uses
+`<socket>.lock` for startup locking. A second daemon started against a live
+socket exits successfully without unlinking the running daemon's socket.
+
+By default `zmuxd` self-exits after 3600 idle seconds, but only when it has
+zero live sessions. Use `--idle-seconds 0` to run until explicit shutdown.
+Sessions and PTY children die with the daemon; zmux does not persist live
+processes across daemon shutdown or operating-system reboot.
+
+`SIGTERM` and `SIGINT` request graceful shutdown. `SIGHUP` is ignored so an
+auto-spawned daemon survives the spawning client's terminal. You can also
+stop the daemon with `zmux-connect shutdown` or the `daemon.shutdown` RPC.
+
+The daemon accepts at most 256 concurrent client connections. `scrollbackBytes`
+defaults to 10 MiB and must be 64 MiB or smaller for `session.create`,
+`window.new`, and `pane.split`.
 
 ## Library use
 
@@ -186,53 +274,84 @@ Top-level modules:
 | `zmux.daemon` | `zmuxd` entry point and startup lock |
 | `zmux.mux` | Session / window / pane / client / key state |
 | `zmux.native` | PTY child spawn, fd lifecycle, event sink |
-| `zmux.pty` | Low-level `openpty(3)` / `forkpty(3)` wrappers |
+| `zmux.pty` | Low-level `openpty(3)` plus manual fork/exec PTY child spawning |
 | `zmux.protocol` | JSON-RPC framing, error codes, version |
 | `zmux.buffer` | Bounded ring buffer for scrollback |
-| `zmux.foreground` | Foreground-process detection (Linux/macOS) |
+| `zmux.foreground` | Foreground-process detection: full comm/argv on macOS, pid-only fallback elsewhere |
 | `zmux.connect` | Client implementation (raw mode, SIGWINCH) |
 
 ## Protocol
 
 `zmux` speaks JSON-RPC 2.0 over a newline-delimited UNIX-domain socket. The
-protocol version is reported by `daemon.ping` along with separate `sessions`
-and `panes` counts (see `src/protocol.zig`). `mux.snapshot` pane alerts expose
-`activity`, `bell`, `exited`, `lastActivityMs`, and `lastBellMs`.
+protocol version is reported by `daemon.ping` along with the daemon `pid`,
+`socketPath`, and separate `sessions` and `panes` counts (see
+`src/protocol.zig`). Request and response fields use camelCase. Notifications
+use snake_case params. `mux.snapshot` pane alerts expose `activity`, `bell`,
+`exited`, `lastActivityMs`, and `lastBellMs`.
 
 ### Requests
 
 ```jsonc
-{ "jsonrpc": "2.0", "id": 1, "method": "session.create",
-  "params": { "id": "work", "rows": 40, "cols": 120, "command": "bash" } }
+{ "jsonrpc": "2.0", "id": 1, "method": "session.create", "params": { "id": "work", "rows": 40, "cols": 120, "command": "bash" } }
 ```
 
 ### Notifications (server → client)
 
 ```jsonc
-{ "jsonrpc": "2.0", "method": "pane_output",
-  "params": { "session": "work", "pane": 0, "data": "...base64..." } }
+{ "jsonrpc": "2.0", "method": "pane_output", "params": { "pane_id": "pane-1", "data_base64": "...base64..." } }
 ```
 
-| Notification | Sent when |
-|--------------|-----------|
-| `pane_output` | PTY produced bytes |
-| `pane_activity` | Pane received output after being idle |
-| `pane_bell` | Pane received a `BEL` |
-| `session_exited` | Session's child process exited |
-| `foreground_changed` | Pane's foreground process changed |
+| Notification | Params | Sent when |
+|--------------|--------|-----------|
+| `pane_output` | `pane_id`, `data_base64` | PTY produced bytes |
+| `pane_activity` | `pane_id`, `last_activity_ms` | Pane received output after being idle |
+| `pane_bell` | `pane_id`, `last_bell_ms` | Pane received a `BEL` |
+| `session_exited` | `session_id`, `pid`, `exit_code`, `signal` | Pane's PTY child exited |
+| `foreground_changed` | `session_id`, `pid`, `comm`, `argv` | Pane's foreground process changed |
+
+On macOS, `foreground_changed.comm` and `argv` come from platform process
+inspection. On Linux and other platforms, `pid` is the useful value;
+`comm` is a `pid-<n>` placeholder and `argv` is empty.
 
 ### Errors
 
 JSON-RPC standard error codes plus `-32000` (`session_error`) for domain
 errors (unknown session, PTY allocation failure, etc.).
 
+`zmux-connect`'s create-vs-attach fallback treats an error payload containing
+the substring `PaneNotFound` as permission to create the session unless
+`--no-create` was passed.
+
+## Troubleshooting
+
+- `zmux-connect: no daemon at <socket>`: start `zmuxd`, pass
+  `--spawn-daemon`, or make sure daemon and client resolve the same socket
+  path.
+- `PaneNotFound`: the requested pane/session is absent. Without `--no-create`,
+  `zmux-connect <name>` creates a missing session automatically; with
+  `--no-create`, it exits instead.
+- Daemon start exits immediately with status 0: another daemon is already
+  accepting connections on that socket. This is intentional concurrent-start
+  behavior.
+- Stale socket or lock files: if no daemon is running, remove `<socket>` and
+  `<socket>.lock`. The pid file is `<socket>.pid`.
+- Auto-spawn failure: check `<socket>.log` for daemon startup stderr.
+- Daemon disappeared after inactivity: the default idle timeout is 3600
+  seconds with zero sessions. Restart it or use `--idle-seconds 0`.
+- Terminal looks stuck after an interrupted client: run `reset` or
+  `stty sane`.
+- Stop the daemon with `zmux-connect shutdown`, a `daemon.shutdown` RPC, or
+  `SIGTERM`.
+
 ## Security
 
 - Sockets are created in directories with mode `0700` and files with mode
   `0600`; the daemon never widens permissions on parent directories it did
   not create.
-- Accepted client connections are validated via SO_PEERCRED / `LOCAL_PEERPID`
-  and rejected unless the peer's UID matches the daemon's.
+- Accepted client connections are validated via `SO_PEERCRED` on Linux and
+  `getpeereid(3)` / `LOCAL_PEERCRED` on macOS, then rejected unless the
+  peer's effective UID matches the daemon's. Unsupported platforms fail
+  closed.
 - Startup is locked by `flock(2)` on a sentinel file; concurrent starters
   detect a live daemon and exit cleanly instead of unlinking the socket.
 
