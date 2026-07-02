@@ -10,6 +10,19 @@ const buffer_size: usize = 32 * 1024;
 const rpc_line_max: usize = 1024 * 1024;
 const run_loop_poll_timeout_ms: i32 = 100;
 const bootstrap_response_timeout_ms: i64 = 10_000;
+const version_handshake_timeout_ms: i64 = 2_000;
+
+// Default detach chord: Ctrl-\ (0x1C). Chosen because it maps to SIGQUIT,
+// which raw mode disables anyway, so it is rarely wanted by the attached
+// program and makes a safe single-byte escape hatch. Configurable via
+// --detach-key (ctrl-<letter> | none).
+const default_detach_key: u8 = 0x1C;
+
+// JSON-RPC ids reserved by the client. Attach/create use 1..3, resize uses 3,
+// send uses 2; keep these distinct so their responses are unambiguous.
+const ping_rpc_id: u32 = 100;
+const detach_rpc_id: u32 = 5;
+const verb_rpc_id: u32 = 1;
 
 var g_saved_termios: ?posix.termios = null;
 var g_saved_termios_fd: posix.fd_t = 0;
@@ -25,7 +38,7 @@ fn connectPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
 pub fn main() void {
     runMain() catch |err| {
         switch (err) {
-            error.InvalidArguments, error.ReadTimeout => {},
+            error.InvalidArguments, error.ReadTimeout, error.RpcError => {},
             else => {
                 var buf: [1024]u8 = undefined;
                 var w = std.fs.File.stderr().writer(&buf);
@@ -45,12 +58,22 @@ fn runMain() !void {
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
 
+    // Management verbs (`ls`, `kill`, `rename`, `shutdown`) are dispatched from
+    // the first positional token. A bare `zmux-connect <name>` still attaches,
+    // so anything that isn't a known verb falls through to the attach path.
+    if (argv.len >= 2) {
+        if (parseVerb(argv[1])) |verb| {
+            return runVerb(allocator, verb, argv[2..]);
+        }
+    }
+
     var session_id: ?[]const u8 = null;
     var explicit_socket_path: ?[]const u8 = null;
     var spawn_daemon = false;
     var auto_create = true;
     var create_command: ?[]const u8 = null;
     var show_version = false;
+    var detach_key: ?u8 = default_detach_key;
 
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -67,6 +90,10 @@ fn runMain() !void {
             i += 1;
             if (i >= argv.len) return fail("missing value for --command", .{});
             create_command = argv[i];
+        } else if (std.mem.eql(u8, a, "--detach-key")) {
+            i += 1;
+            if (i >= argv.len) return fail("missing value for --detach-key", .{});
+            detach_key = parseDetachKey(argv[i]) catch return fail("invalid --detach-key: {s}", .{argv[i]});
         } else if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "-V")) {
             show_version = true;
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
@@ -81,6 +108,11 @@ fn runMain() !void {
         }
     }
 
+    if (show_version) {
+        try printVersion();
+        return;
+    }
+
     const sid = session_id orelse return fail("session_id is required", .{});
 
     const path = if (explicit_socket_path) |value|
@@ -89,14 +121,20 @@ fn runMain() !void {
         try resolveSocketPath(allocator);
     defer allocator.free(path);
 
-    if (show_version) {
-        try printVersion();
-        return;
-    }
-
     const socket_fd = try connectWithRetry(allocator, path, spawn_daemon);
     defer posix.close(socket_fd);
     var socket_reader: LineReader = .{};
+
+    // Probe the daemon's protocol version before attaching. A version skew is
+    // only a warning: the daemon persists across upgrades by design, so we
+    // continue rather than abort. Uses its own short deadline so a hung daemon
+    // here does not eat into the attach budget below.
+    warnOnVersionMismatch(
+        allocator,
+        &socket_reader,
+        socket_fd,
+        std.time.milliTimestamp() + version_handshake_timeout_ms,
+    );
 
     const initial_size = terminalSize(0) orelse @as(TerminalSize, .{ .rows = 24, .cols = 80 });
     const attach_response = try attachOrCreate(
@@ -123,6 +161,12 @@ fn runMain() !void {
     const target_pane_id = paneIdFromAttach(allocator, attach_response) catch try allocator.dupe(u8, sid);
     defer allocator.free(target_pane_id);
 
+    // The logical clientId identifies this attachment to the daemon; we need it
+    // to send `client.detach` when the user hits the detach chord. If the
+    // response somehow omits it we detach locally without notifying the daemon.
+    const client_id: ?[]u8 = clientIdFromAttach(allocator, attach_response) catch null;
+    defer if (client_id) |cid| allocator.free(cid);
+
     const stdin_fd: posix.fd_t = 0;
     const stdout_fd: posix.fd_t = 1;
 
@@ -138,13 +182,25 @@ fn runMain() !void {
     // Send an initial resize from our terminal's current size, if known.
     sendResize(allocator, socket_fd, target_pane_id, stdout_fd) catch {};
 
-    runLoop(stdin_fd, stdout_fd, socket_fd, &socket_reader, allocator, target_pane_id) catch |err| {
+    // Detach interception is an interactive feature: only scan for the chord
+    // when stdin is a real terminal so piped input can carry the byte verbatim.
+    const active_detach_key: ?u8 = if (stdin_is_tty) detach_key else null;
+
+    const outcome = runLoop(stdin_fd, stdout_fd, socket_fd, &socket_reader, allocator, target_pane_id, .{
+        .detach_key = active_detach_key,
+        .client_id = client_id,
+    }) catch |err| {
         restoreTermios();
         if (err == error.ReadTimeout) {
             return fail("daemon at {s} is not responding; is zmuxd hung?", .{path});
         }
         return fail("{s}", .{@errorName(err)});
     };
+
+    restoreTermios();
+    if (outcome == .detached) {
+        stderrWrite("[detached]\n") catch {};
+    }
 }
 
 fn printVersion() !void {
@@ -284,6 +340,318 @@ fn paneIdFromAttach(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
     return allocator.dupe(u8, pane_id);
 }
 
+// Extract `result.clientId` (the daemon's logical attachment id) from a
+// `client.attach` response so the client can later send `client.detach`.
+fn clientIdFromAttach(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.MissingClientId;
+    const result = parsed.value.object.get("result") orelse return error.MissingClientId;
+    const client_id = jsonObjectString(result, "clientId") orelse return error.MissingClientId;
+    return allocator.dupe(u8, client_id);
+}
+
+fn parseDetachKey(spec: []const u8) !?u8 {
+    if (std.ascii.eqlIgnoreCase(spec, "none")) return null;
+    if (spec.len == 6 and std.ascii.eqlIgnoreCase(spec[0..5], "ctrl-")) {
+        return controlByte(spec[5]) orelse return error.InvalidDetachKey;
+    }
+    return error.InvalidDetachKey;
+}
+
+// Map a key name to its ASCII control byte: letters => C-a..C-z (0x01..0x1A),
+// and backslash => 0x1C so the default Ctrl-\ chord is expressible.
+fn controlByte(c: u8) ?u8 {
+    if (std.ascii.isAlphabetic(c)) return std.ascii.toUpper(c) - 'A' + 1;
+    if (c == '\\') return 0x1C;
+    return null;
+}
+
+// Best-effort protocol version probe: send daemon.ping and warn on stderr if
+// the daemon reports a different protocol version than this client compiled
+// against. Never aborts — a version skew is expected across daemon upgrades.
+fn warnOnVersionMismatch(
+    allocator: std.mem.Allocator,
+    reader: *LineReader,
+    socket_fd: posix.fd_t,
+    deadline_ms: i64,
+) void {
+    const daemon_ver = daemonVersion(allocator, reader, socket_fd, deadline_ms) catch return;
+    defer allocator.free(daemon_ver);
+    if (std.mem.eql(u8, daemon_ver, protocol.version)) return;
+
+    var buf: [256]u8 = undefined;
+    var w = std.fs.File.stderr().writer(&buf);
+    w.interface.print(
+        "zmux-connect: warning: daemon protocol {s} differs from client {s}; continuing\n",
+        .{ daemon_ver, protocol.version },
+    ) catch {};
+    w.interface.flush() catch {};
+}
+
+fn daemonVersion(
+    allocator: std.mem.Allocator,
+    reader: *LineReader,
+    socket_fd: posix.fd_t,
+    deadline_ms: i64,
+) ![]u8 {
+    const req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"daemon.ping\",\"params\":{{}}}}\n",
+        .{ping_rpc_id},
+    );
+    defer allocator.free(req);
+    try writeAll(socket_fd, req);
+
+    const response = try readRpcResponse(allocator, reader, socket_fd, ping_rpc_id, deadline_ms);
+    defer allocator.free(response);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.MissingVersion;
+    const result = parsed.value.object.get("result") orelse return error.MissingVersion;
+    const version = jsonObjectString(result, "version") orelse return error.MissingVersion;
+    return allocator.dupe(u8, version);
+}
+
+// ---------------------------------------------------------------------------
+// Management verbs: `zmux-connect ls|kill|rename|shutdown ...` map onto single
+// JSON-RPC calls, print human-readable output (or --json for the raw frame),
+// and exit non-zero with the daemon's error message on stderr.
+// ---------------------------------------------------------------------------
+
+const Verb = enum { list, kill, rename, shutdown };
+
+fn parseVerb(token: []const u8) ?Verb {
+    if (std.mem.eql(u8, token, "ls")) return .list;
+    if (std.mem.eql(u8, token, "kill")) return .kill;
+    if (std.mem.eql(u8, token, "rename")) return .rename;
+    if (std.mem.eql(u8, token, "shutdown")) return .shutdown;
+    return null;
+}
+
+fn verbName(verb: Verb) []const u8 {
+    return switch (verb) {
+        .list => "ls",
+        .kill => "kill",
+        .rename => "rename",
+        .shutdown => "shutdown",
+    };
+}
+
+fn runVerb(allocator: std.mem.Allocator, verb: Verb, rest: []const []const u8) !void {
+    var target: ?[]const u8 = null;
+    var new_name: ?[]const u8 = null;
+    var json = false;
+    var explicit_socket: ?[]const u8 = null;
+
+    const needs_target = (verb == .kill or verb == .rename);
+    const needs_new_name = (verb == .rename);
+
+    var positionals: usize = 0;
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const a = rest[i];
+        if (std.mem.eql(u8, a, "--socket")) {
+            i += 1;
+            if (i >= rest.len) return fail("missing value for --socket", .{});
+            explicit_socket = rest[i];
+        } else if (std.mem.eql(u8, a, "--json")) {
+            json = true;
+        } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+            try printUsage();
+            return;
+        } else if (a.len > 0 and a[0] == '-') {
+            return fail("unknown flag: {s}", .{a});
+        } else if (positionals == 0 and needs_target) {
+            target = a;
+            positionals += 1;
+        } else if (positionals == 1 and needs_new_name) {
+            new_name = a;
+            positionals += 1;
+        } else {
+            return fail("unexpected argument: {s}", .{a});
+        }
+    }
+
+    if (needs_target and target == null) return fail("{s} requires a session id", .{verbName(verb)});
+    if (needs_new_name and new_name == null) return fail("rename requires a new name", .{});
+
+    const path = if (explicit_socket) |value|
+        try allocator.dupe(u8, value)
+    else
+        try resolveSocketPath(allocator);
+    defer allocator.free(path);
+
+    const socket_fd = tryConnect(path) catch {
+        return verbError("no daemon reachable at {s}", .{path});
+    };
+    defer posix.close(socket_fd);
+
+    var reader: LineReader = .{};
+    try executeVerb(
+        allocator,
+        socket_fd,
+        &reader,
+        verb,
+        target,
+        new_name,
+        json,
+        1,
+        std.time.milliTimestamp() + bootstrap_response_timeout_ms,
+    );
+}
+
+fn executeVerb(
+    allocator: std.mem.Allocator,
+    socket_fd: posix.fd_t,
+    reader: *LineReader,
+    verb: Verb,
+    target: ?[]const u8,
+    new_name: ?[]const u8,
+    json: bool,
+    out_fd: posix.fd_t,
+    deadline_ms: i64,
+) !void {
+    const request = try buildVerbRequest(allocator, verb, target, new_name);
+    defer allocator.free(request);
+    try writeAll(socket_fd, request);
+
+    const response = try readRpcResponse(allocator, reader, socket_fd, verb_rpc_id, deadline_ms);
+    defer allocator.free(response);
+
+    if (rpcErrorMessage(allocator, response)) |msg| {
+        defer allocator.free(msg);
+        var buf: [1024]u8 = undefined;
+        var w = std.fs.File.stderr().writer(&buf);
+        w.interface.print("zmux-connect: {s}\n", .{msg}) catch {};
+        w.interface.flush() catch {};
+        return error.RpcError;
+    }
+
+    if (json) {
+        try writeAllFd(out_fd, response);
+        return;
+    }
+
+    const human = try formatVerbResult(allocator, verb, target, new_name, response);
+    defer allocator.free(human);
+    try writeAllFd(out_fd, human);
+}
+
+fn buildVerbRequest(
+    allocator: std.mem.Allocator,
+    verb: Verb,
+    target: ?[]const u8,
+    new_name: ?[]const u8,
+) ![]u8 {
+    return switch (verb) {
+        .list => std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"session.list\",\"params\":{{}}}}\n",
+            .{verb_rpc_id},
+        ),
+        .shutdown => std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"daemon.shutdown\",\"params\":{{}}}}\n",
+            .{verb_rpc_id},
+        ),
+        .kill => std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"session.terminate\",\"params\":{{\"sessionId\":{f}}}}}\n",
+            .{ verb_rpc_id, std.json.fmt(target.?, .{}) },
+        ),
+        .rename => std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"session.rename\",\"params\":{{\"sessionId\":{f},\"name\":{f}}}}}\n",
+            .{ verb_rpc_id, std.json.fmt(target.?, .{}), std.json.fmt(new_name.?, .{}) },
+        ),
+    };
+}
+
+fn formatVerbResult(
+    allocator: std.mem.Allocator,
+    verb: Verb,
+    target: ?[]const u8,
+    new_name: ?[]const u8,
+    response: []const u8,
+) ![]u8 {
+    return switch (verb) {
+        .list => formatSessionList(allocator, response),
+        .kill => std.fmt.allocPrint(allocator, "killed session {s}\n", .{target.?}),
+        .rename => std.fmt.allocPrint(allocator, "renamed session {s} to {s}\n", .{ target.?, new_name.? }),
+        .shutdown => allocator.dupe(u8, "daemon shutdown\n"),
+    };
+}
+
+// Render a `session.list` result array as one tab-separated line per pane:
+//   <sessionId>\t<paneId>\t<state>\tpid=<pid>\t<title>
+fn formatSessionList(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    if (parsed.value != .object) return error.InvalidResponse;
+    const result = parsed.value.object.get("result") orelse return error.InvalidResponse;
+    if (result != .array) return error.InvalidResponse;
+
+    if (result.array.items.len == 0) {
+        try out.appendSlice(allocator, "no sessions\n");
+        return out.toOwnedSlice(allocator);
+    }
+
+    for (result.array.items) |item| {
+        if (item != .object) continue;
+        const session_id = jsonObjectString(item, "sessionId") orelse "";
+        const pane_id = jsonObjectString(item, "paneId") orelse "";
+        const state = jsonObjectString(item, "state") orelse "";
+        const title = jsonObjectString(item, "title") orelse "";
+        const pid = jsonObjectInt(item, "pid");
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "{s}\t{s}\t{s}\tpid={d}\t{s}\n",
+            .{ session_id, pane_id, state, pid, title },
+        );
+        defer allocator.free(line);
+        try out.appendSlice(allocator, line);
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+// Return the daemon's `error.message` text (caller owns) when `response` is a
+// JSON-RPC error frame, or null for a success frame. Uses a real JSON parse so
+// a result payload that merely contains the word "error" is not misread.
+fn rpcErrorMessage(allocator: std.mem.Allocator, response: []const u8) ?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const err = parsed.value.object.get("error") orelse return null;
+    if (err != .object) return allocator.dupe(u8, "unknown error") catch null;
+    const message = err.object.get("message") orelse return allocator.dupe(u8, "unknown error") catch null;
+    if (message != .string) return allocator.dupe(u8, "unknown error") catch null;
+    return allocator.dupe(u8, message.string) catch null;
+}
+
+fn verbError(comptime fmt: []const u8, args: anytype) error{RpcError} {
+    var buf: [1024]u8 = undefined;
+    var w = std.fs.File.stderr().writer(&buf);
+    w.interface.print("zmux-connect: " ++ fmt ++ "\n", args) catch {};
+    w.interface.flush() catch {};
+    return error.RpcError;
+}
+
+const RunOutcome = enum { exited, detached };
+
+const RunLoopOptions = struct {
+    // Detach chord byte to intercept on stdin, or null to disable interception.
+    detach_key: ?u8 = null,
+    // Logical clientId to release via `client.detach` on detach, if known.
+    client_id: ?[]const u8 = null,
+};
+
 fn runLoop(
     stdin_fd: posix.fd_t,
     stdout_fd: posix.fd_t,
@@ -291,7 +659,8 @@ fn runLoop(
     reader: *LineReader,
     allocator: std.mem.Allocator,
     session_id: []const u8,
-) !void {
+    options: RunLoopOptions,
+) !RunOutcome {
     var buf: [buffer_size]u8 = undefined;
 
     while (true) {
@@ -310,26 +679,48 @@ fn runLoop(
         if (ready == 0) continue;
 
         if ((fds[1].revents & posix.POLL.HUP) != 0) {
-            if (try drainReadableSocket(allocator, reader, socket_fd, session_id, stdout_fd)) return;
-            return;
+            _ = try drainReadableSocket(allocator, reader, socket_fd, session_id, stdout_fd);
+            return .exited;
         }
 
         if ((fds[1].revents & posix.POLL.IN) != 0) {
-            if (try handleReadableSocket(allocator, reader, socket_fd, session_id, stdout_fd)) return;
+            if (try handleReadableSocket(allocator, reader, socket_fd, session_id, stdout_fd)) return .exited;
         }
 
-        if ((fds[1].revents & posix.POLL.ERR) != 0) return;
+        if ((fds[1].revents & posix.POLL.ERR) != 0) return .exited;
 
         if ((fds[0].revents & posix.POLL.IN) != 0) {
             switch (try readStdinChunk(stdin_fd, &buf)) {
                 .again => continue,
-                .eof => return,
-                .bytes => |bytes| try sendInput(allocator, socket_fd, session_id, bytes),
+                .eof => return .exited,
+                .bytes => |bytes| {
+                    // Intercept the detach chord before forwarding: raw mode
+                    // disables ISIG so we are scanning raw bytes. Forward any
+                    // bytes that precede the chord, then detach.
+                    if (options.detach_key) |chord| {
+                        if (std.mem.indexOfScalar(u8, bytes, chord)) |pos| {
+                            if (pos > 0) try sendInput(allocator, socket_fd, session_id, bytes[0..pos]);
+                            if (options.client_id) |cid| sendDetach(allocator, socket_fd, cid) catch {};
+                            return .detached;
+                        }
+                    }
+                    try sendInput(allocator, socket_fd, session_id, bytes);
+                },
             }
         }
 
-        if ((fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return;
+        if ((fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return .exited;
     }
+}
+
+fn sendDetach(allocator: std.mem.Allocator, socket_fd: posix.fd_t, client_id: []const u8) !void {
+    const msg = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"client.detach\",\"params\":{{\"clientId\":{f}}}}}\n",
+        .{ detach_rpc_id, std.json.fmt(client_id, .{}) },
+    );
+    defer allocator.free(msg);
+    try writeAll(socket_fd, msg);
 }
 
 const StdinReadResult = union(enum) {
@@ -680,6 +1071,15 @@ fn jsonObjectString(value: std.json.Value, key: []const u8) ?[]const u8 {
     };
 }
 
+fn jsonObjectInt(value: std.json.Value, key: []const u8) i64 {
+    if (value != .object) return 0;
+    const field = value.object.get(key) orelse return 0;
+    return switch (field) {
+        .integer => |n| n,
+        else => 0,
+    };
+}
+
 fn base64Encode(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     const encoder = std.base64.standard.Encoder;
     const out = try allocator.alloc(u8, encoder.calcSize(bytes.len));
@@ -739,18 +1139,28 @@ fn fail(comptime fmt: []const u8, args: anytype) error{InvalidArguments} {
 }
 
 fn printUsage() !void {
-    var buf: [1024]u8 = undefined;
+    var buf: [2048]u8 = undefined;
     var w = std.fs.File.stdout().writer(&buf);
     try w.interface.writeAll(
         \\Usage: zmux-connect <session_id> [--socket PATH] [--spawn-daemon]
-        \\                    [--no-create] [--command CMD]
-        \\       smithers-session-connect <session_id> [--socket PATH] [--spawn-daemon]
-        \\                                [--no-create] [--command CMD]
+        \\                    [--no-create] [--command CMD] [--detach-key KEY]
+        \\       zmux-connect <verb> [args] [--socket PATH] [--json]
+        \\       smithers-session-connect ... (same interface)
         \\
-        \\If <session_id> is not an existing pane id or session name, a new
-        \\session with that name is created and then attached. Pass --no-create
-        \\to require an existing session, or --command to override the shell
-        \\command spawned in the new session.
+        \\Attach (default): if <session_id> is not an existing pane id or session
+        \\name, a new session with that name is created and then attached.
+        \\  --socket PATH      path to the daemon's unix socket
+        \\  --spawn-daemon     start a daemon if none is running
+        \\  --no-create        require an existing session (do not create)
+        \\  --command CMD       shell command to run in a newly created session
+        \\  --detach-key KEY    detach chord: ctrl-<letter> or none to disable
+        \\                     (default: ctrl-\, i.e. Ctrl-\ then detach)
+        \\
+        \\Management verbs (single JSON-RPC call, add --json for the raw frame):
+        \\  ls                 list sessions/panes
+        \\  kill <session>     terminate a session
+        \\  rename <session> <name>   rename a session
+        \\  shutdown           stop the daemon
         \\
     );
     try w.interface.flush();
@@ -989,7 +1399,8 @@ test "runLoop drains final socket output after HUP" {
     socket_write_open = false;
 
     var reader: LineReader = .{};
-    try runLoop(stdin_fds[0], stdout_fds[1], socket_fds[0], &reader, allocator, "pane-1");
+    const outcome = try runLoop(stdin_fds[0], stdout_fds[1], socket_fds[0], &reader, allocator, "pane-1", .{});
+    try std.testing.expectEqual(RunOutcome.exited, outcome);
 
     posix.close(stdout_fds[1]);
     stdout_write_open = false;
@@ -1023,4 +1434,224 @@ fn readAllFdForTest(allocator: std.mem.Allocator, fd: posix.fd_t) ![]u8 {
         if (n == 0) return out.toOwnedSlice(allocator);
         try out.appendSlice(allocator, buf[0..n]);
     }
+}
+
+// --- A2 detach key ---------------------------------------------------------
+
+test "parseDetachKey handles ctrl chords, backslash default, and none" {
+    try std.testing.expectEqual(@as(?u8, 0x01), try parseDetachKey("ctrl-a"));
+    try std.testing.expectEqual(@as(?u8, 0x02), try parseDetachKey("Ctrl-B"));
+    try std.testing.expectEqual(@as(?u8, 0x1a), try parseDetachKey("ctrl-z"));
+    try std.testing.expectEqual(@as(?u8, default_detach_key), try parseDetachKey("ctrl-\\"));
+    try std.testing.expectEqual(@as(?u8, null), try parseDetachKey("none"));
+    try std.testing.expectEqual(@as(?u8, null), try parseDetachKey("NONE"));
+    try std.testing.expectError(error.InvalidDetachKey, parseDetachKey("ctrl-1"));
+    try std.testing.expectError(error.InvalidDetachKey, parseDetachKey("bogus"));
+    try std.testing.expectError(error.InvalidDetachKey, parseDetachKey("ctrl-"));
+}
+
+test "clientIdFromAttach extracts the logical client id" {
+    const alloc = std.testing.allocator;
+    const cid = try clientIdFromAttach(alloc, "{\"result\":{\"clientId\":\"client-3\",\"paneId\":\"pane-1\"}}\n");
+    defer alloc.free(cid);
+    try std.testing.expectEqualStrings("client-3", cid);
+    try std.testing.expectError(
+        error.MissingClientId,
+        clientIdFromAttach(alloc, "{\"result\":{\"paneId\":\"pane-1\"}}\n"),
+    );
+}
+
+test "runLoop intercepts the detach chord and sends client.detach" {
+    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
+    g_winch_flag.store(false, .seq_cst);
+
+    const allocator = std.testing.allocator;
+
+    const stdin_fds = try std.posix.pipe();
+    defer posix.close(stdin_fds[0]);
+    defer posix.close(stdin_fds[1]);
+
+    const socket_fds = try std.posix.pipe();
+    defer posix.close(socket_fds[0]);
+    defer posix.close(socket_fds[1]);
+
+    // Feed the default detach chord (Ctrl-\) as raw stdin.
+    try writeAll(stdin_fds[1], &.{default_detach_key});
+
+    var reader: LineReader = .{};
+    const outcome = try runLoop(
+        stdin_fds[0],
+        @as(posix.fd_t, -1),
+        socket_fds[1],
+        &reader,
+        allocator,
+        "pane-1",
+        .{ .detach_key = default_detach_key, .client_id = "client-9" },
+    );
+    try std.testing.expectEqual(RunOutcome.detached, outcome);
+
+    // The client.detach request must be waiting on the socket write end.
+    var buf: [256]u8 = undefined;
+    const n = try posix.read(socket_fds[0], &buf);
+    const written = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, written, "client.detach") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "client-9") != null);
+}
+
+// --- A9 management verbs ---------------------------------------------------
+
+test "parseVerb recognizes management subcommands only" {
+    try std.testing.expectEqual(Verb.list, parseVerb("ls").?);
+    try std.testing.expectEqual(Verb.kill, parseVerb("kill").?);
+    try std.testing.expectEqual(Verb.rename, parseVerb("rename").?);
+    try std.testing.expectEqual(Verb.shutdown, parseVerb("shutdown").?);
+    try std.testing.expect(parseVerb("work") == null);
+    try std.testing.expect(parseVerb("--help") == null);
+}
+
+test "buildVerbRequest emits the expected JSON-RPC methods and params" {
+    const alloc = std.testing.allocator;
+
+    const list = try buildVerbRequest(alloc, .list, null, null);
+    defer alloc.free(list);
+    try std.testing.expect(std.mem.indexOf(u8, list, "\"method\":\"session.list\"") != null);
+
+    const kill = try buildVerbRequest(alloc, .kill, "work", null);
+    defer alloc.free(kill);
+    try std.testing.expect(std.mem.indexOf(u8, kill, "\"method\":\"session.terminate\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kill, "\"sessionId\":\"work\"") != null);
+
+    const rename = try buildVerbRequest(alloc, .rename, "work", "play");
+    defer alloc.free(rename);
+    try std.testing.expect(std.mem.indexOf(u8, rename, "\"method\":\"session.rename\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rename, "\"sessionId\":\"work\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rename, "\"name\":\"play\"") != null);
+
+    const shutdown = try buildVerbRequest(alloc, .shutdown, null, null);
+    defer alloc.free(shutdown);
+    try std.testing.expect(std.mem.indexOf(u8, shutdown, "\"method\":\"daemon.shutdown\"") != null);
+}
+
+test "formatSessionList renders rows and the empty case" {
+    const alloc = std.testing.allocator;
+
+    const empty = try formatSessionList(alloc, "{\"id\":1,\"result\":[]}\n");
+    defer alloc.free(empty);
+    try std.testing.expectEqualStrings("no sessions\n", empty);
+
+    const listed = try formatSessionList(
+        alloc,
+        "{\"id\":1,\"result\":[{\"pid\":7,\"state\":\"running\",\"title\":\"work\"," ++
+            "\"sessionId\":\"work\",\"paneId\":\"pane-1\"}]}\n",
+    );
+    defer alloc.free(listed);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "pane-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "work") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "running") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "pid=7") != null);
+}
+
+test "rpcErrorMessage extracts daemon error text and ignores success frames" {
+    const alloc = std.testing.allocator;
+
+    const msg = rpcErrorMessage(alloc, "{\"id\":1,\"error\":{\"code\":-32000,\"message\":\"nope\"}}\n") orelse
+        return error.MissingMessage;
+    defer alloc.free(msg);
+    try std.testing.expectEqualStrings("nope", msg);
+
+    try std.testing.expect(rpcErrorMessage(alloc, "{\"id\":1,\"result\":{\"ok\":true}}\n") == null);
+}
+
+test "executeVerb round-trips session.list over a socket and formats output" {
+    const allocator = std.testing.allocator;
+
+    var pair: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &pair) != 0) return error.SkipZigTest;
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    const out = try std.posix.pipe();
+    defer posix.close(out[0]);
+    defer posix.close(out[1]);
+
+    const response =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":[" ++
+        "{\"id\":\"pane-1\",\"title\":\"work\",\"pid\":4242,\"state\":\"running\"," ++
+        "\"sessionId\":\"work\",\"windowId\":\"win-1\",\"paneId\":\"pane-1\"}]}\n";
+    try writeAll(pair[1], response);
+
+    var reader: LineReader = .{};
+    try executeVerb(
+        allocator,
+        pair[0],
+        &reader,
+        .list,
+        null,
+        null,
+        false,
+        out[1],
+        std.time.milliTimestamp() + 2_000,
+    );
+
+    var buf: [512]u8 = undefined;
+    const n = try posix.read(out[0], &buf);
+    const written = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, written, "pane-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "running") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "pid=4242") != null);
+}
+
+test "executeVerb surfaces a daemon RPC error as error.RpcError" {
+    const allocator = std.testing.allocator;
+
+    var pair: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &pair) != 0) return error.SkipZigTest;
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    const out = try std.posix.pipe();
+    defer posix.close(out[0]);
+    defer posix.close(out[1]);
+
+    const response =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"session not found\"}}\n";
+    try writeAll(pair[1], response);
+
+    var reader: LineReader = .{};
+    try std.testing.expectError(error.RpcError, executeVerb(
+        allocator,
+        pair[0],
+        &reader,
+        .kill,
+        "ghost",
+        null,
+        false,
+        out[1],
+        std.time.milliTimestamp() + 2_000,
+    ));
+}
+
+// --- A23 version handshake -------------------------------------------------
+
+test "daemonVersion reads the daemon-reported protocol version" {
+    const allocator = std.testing.allocator;
+
+    // daemonVersion writes the ping and reads its reply on the same fd, so the
+    // test needs a bidirectional socketpair rather than a one-way pipe.
+    var pair: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &pair) != 0) return error.SkipZigTest;
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    // A notification the ping read must skip, then the ping response itself.
+    try writeAll(
+        pair[1],
+        "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{}}\n" ++
+            "{\"jsonrpc\":\"2.0\",\"id\":100,\"result\":{\"version\":\"9.9.9\",\"pid\":1}}\n",
+    );
+
+    var reader: LineReader = .{};
+    const version = try daemonVersion(allocator, &reader, pair[0], std.time.milliTimestamp() + 2_000);
+    defer allocator.free(version);
+    try std.testing.expectEqualStrings("9.9.9", version);
 }
