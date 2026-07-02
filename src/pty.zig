@@ -23,7 +23,7 @@ pub const SpawnOptions = struct {
 
 pub const ExitObserver = struct {
     context: *anyopaque,
-    callback: *const fn (context: *anyopaque, pid: posix.pid_t, status: u32) void,
+    callback: *const fn (context: *anyopaque, pid: posix.pid_t, status: ?u32) void,
 };
 
 pub const Pty = struct {
@@ -35,16 +35,16 @@ pub const Pty = struct {
     exit_observer: ?ExitObserver = null,
 
     pub fn spawn(allocator: Allocator, opts: SpawnOptions) !Pty {
-        var wsz: posix.winsize = .{
+        const wsz: posix.winsize = .{
             .row = opts.rows,
             .col = opts.cols,
             .xpixel = 0,
             .ypixel = 0,
         };
 
-        var master_fd: posix.fd_t = undefined;
-        var slave_fd: posix.fd_t = undefined;
-        if (openpty(&master_fd, &slave_fd, null, null, &wsz) != 0) return error.OpenPtyFailed;
+        const fds = try openPty(wsz);
+        const master_fd = fds.master_fd;
+        const slave_fd = fds.slave_fd;
         errdefer posix.close(master_fd);
         errdefer posix.close(slave_fd);
 
@@ -105,15 +105,19 @@ pub const Pty = struct {
     }
 
     pub fn setExitObserver(self: *Pty, observer: ExitObserver) void {
+        var should_emit = false;
         var emit_status: ?u32 = null;
 
         self.wait_mutex.lock();
         self.exit_observer = observer;
-        if (self.reaped) emit_status = self.exit_status;
+        if (self.reaped) {
+            should_emit = true;
+            emit_status = self.exit_status;
+        }
         self.wait_mutex.unlock();
 
-        if (emit_status) |status| {
-            observer.callback(observer.context, self.child_pid, status);
+        if (should_emit) {
+            observer.callback(observer.context, self.child_pid, emit_status);
         }
     }
 
@@ -164,6 +168,7 @@ pub const Pty = struct {
 
     pub fn reapExited(self: *Pty) ?u32 {
         var observer: ?ExitObserver = null;
+        var should_emit = false;
         var status_to_emit: ?u32 = null;
 
         self.wait_mutex.lock();
@@ -173,23 +178,83 @@ pub const Pty = struct {
             return status;
         }
 
-        const result = posix.waitpid(self.child_pid, posix.W.NOHANG);
-        if (result.pid == self.child_pid) {
-            self.reaped = true;
-            self.exit_status = result.status;
-            observer = self.exit_observer;
-            status_to_emit = result.status;
+        switch (waitPidNoHang(self.child_pid)) {
+            .running => {},
+            .exited => |status| {
+                self.reaped = true;
+                self.exit_status = status;
+                observer = self.exit_observer;
+                should_emit = true;
+                status_to_emit = status;
+            },
         }
         self.wait_mutex.unlock();
 
-        if (observer) |active| {
-            active.callback(active.context, self.child_pid, status_to_emit.?);
+        if (should_emit) {
+            if (observer) |active| {
+                active.callback(active.context, self.child_pid, status_to_emit);
+            }
         }
 
         if (status_to_emit) |status| return status;
         return null;
     }
+
+    pub fn isReaped(self: *Pty) bool {
+        self.wait_mutex.lock();
+        defer self.wait_mutex.unlock();
+        return self.reaped;
+    }
 };
+
+const OpenPtyResult = struct {
+    master_fd: posix.fd_t,
+    slave_fd: posix.fd_t,
+};
+
+fn openPty(wsz: posix.winsize) !OpenPtyResult {
+    var master_fd: posix.fd_t = undefined;
+    var slave_fd: posix.fd_t = undefined;
+    if (openpty(&master_fd, &slave_fd, null, null, &wsz) != 0) return error.OpenPtyFailed;
+    errdefer posix.close(master_fd);
+    errdefer posix.close(slave_fd);
+
+    try setCloseOnExec(master_fd);
+    try setCloseOnExec(slave_fd);
+
+    return .{
+        .master_fd = master_fd,
+        .slave_fd = slave_fd,
+    };
+}
+
+fn setCloseOnExec(fd: posix.fd_t) !void {
+    var flags = try posix.fcntl(fd, posix.F.GETFD, 0);
+    flags |= @as(usize, @intCast(posix.FD_CLOEXEC));
+    _ = try posix.fcntl(fd, posix.F.SETFD, flags);
+}
+
+const WaitPidNoHangResult = union(enum) {
+    running,
+    exited: ?u32,
+};
+
+fn waitPidNoHang(pid: posix.pid_t) WaitPidNoHangResult {
+    while (true) {
+        var status: c_int = 0;
+        const rc = std.c.waitpid(pid, &status, @intCast(posix.W.NOHANG));
+        switch (posix.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return .running;
+                return .{ .exited = @bitCast(status) };
+            },
+            .INTR => continue,
+            .CHILD => return .{ .exited = null },
+            .INVAL => unreachable,
+            else => unreachable,
+        }
+    }
+}
 
 fn childExec(
     master_fd: posix.fd_t,
@@ -259,6 +324,59 @@ fn ioctlRequest(value: usize) c_int {
 
 test "default shell is absolute" {
     try std.testing.expect(std.mem.startsWith(u8, defaultShell(), "/"));
+}
+
+test "open pty marks master and slave close-on-exec" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const fds = try openPty(.{
+        .row = 24,
+        .col = 80,
+        .xpixel = 0,
+        .ypixel = 0,
+    });
+    defer posix.close(fds.master_fd);
+    defer posix.close(fds.slave_fd);
+
+    const master_flags = try posix.fcntl(fds.master_fd, posix.F.GETFD, 0);
+    const slave_flags = try posix.fcntl(fds.slave_fd, posix.F.GETFD, 0);
+    const cloexec = @as(usize, @intCast(posix.FD_CLOEXEC));
+    try std.testing.expect((master_flags & cloexec) != 0);
+    try std.testing.expect((slave_flags & cloexec) != 0);
+}
+
+test "reapExited tolerates children auto-reaped by ignored SIGCHLD" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    var old_action: posix.Sigaction = undefined;
+    posix.sigaction(std.c.SIG.CHLD, null, &old_action);
+    defer posix.sigaction(std.c.SIG.CHLD, &old_action, null);
+
+    var ignored: posix.Sigaction = undefined;
+    @memset(std.mem.asBytes(&ignored), 0);
+    ignored.handler = .{ .handler = posix.SIG.IGN };
+    ignored.mask = std.mem.zeroes(posix.sigset_t);
+    ignored.flags = 0;
+    posix.sigaction(std.c.SIG.CHLD, &ignored, null);
+
+    var child = try Pty.spawn(std.testing.allocator, .{
+        .shell = "/bin/sh",
+        .command = "exit 0",
+        .rows = 24,
+        .cols = 80,
+    });
+    defer child.close();
+    defer if (!child.isReaped()) child.kill();
+
+    var waited: u32 = 0;
+    while (waited < 50 and !child.isReaped()) : (waited += 1) {
+        _ = child.reapExited();
+        if (child.isReaped()) break;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+
+    try std.testing.expect(child.isReaped());
+    try std.testing.expect(child.exit_status == null);
 }
 
 fn cleanupPtyForTest(child: *Pty) void {

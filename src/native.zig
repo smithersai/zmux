@@ -178,10 +178,11 @@ pub const NativeSession = struct {
         var status: ?u32 = null;
         var attempts: usize = 0;
         while (attempts < 20) : (attempts += 1) {
-            if (self.handle.reapExited()) |exit_status| {
+            if (self.reapExited()) |exit_status| {
                 status = exit_status;
                 break;
             }
+            if (self.handle.isReaped()) break;
             std.Thread.sleep(10 * std.time.ns_per_ms);
         }
 
@@ -191,10 +192,11 @@ pub const NativeSession = struct {
             // Wait one more time after SIGKILL
             var kill_attempts: usize = 0;
             while (kill_attempts < 10) : (kill_attempts += 1) {
-                if (self.handle.reapExited()) |exit_status| {
+                if (self.reapExited()) |exit_status| {
                     status = exit_status;
                     break;
                 }
+                if (self.handle.isReaped()) break;
                 std.Thread.sleep(10 * std.time.ns_per_ms);
             }
         }
@@ -211,9 +213,14 @@ pub const NativeSession = struct {
     }
 
     pub fn reapExited(self: *NativeSession) ?u32 {
-        const status = self.handle.reapExited() orelse return null;
-        self.markTerminated(status);
-        return status;
+        if (self.handle.reapExited()) |status| {
+            self.markTerminated(status);
+            return status;
+        }
+        if (self.handle.isReaped()) {
+            self.markTerminated(null);
+        }
+        return null;
     }
 
     pub fn send(self: *NativeSession, text: []const u8, enter: bool) !void {
@@ -367,19 +374,20 @@ pub const NativeSession = struct {
         var attempts: usize = 0;
         while (attempts < 50) : (attempts += 1) {
             if (self.reapExited()) |status| return status;
+            if (self.handle.isReaped()) return null;
             std.Thread.sleep(10 * std.time.ns_per_ms);
         }
         return null;
     }
 
-    fn onPtyExited(context: *anyopaque, pid: std.posix.pid_t, status: u32) void {
+    fn onPtyExited(context: *anyopaque, pid: std.posix.pid_t, status: ?u32) void {
         const self: *NativeSession = @ptrCast(@alignCast(context));
         self.markTerminated(status);
         self.emitEvent(.{ .session_exited = .{
             .session_id = self.id,
             .pid = pid,
-            .exit_code = if (std.posix.W.IFEXITED(status)) std.posix.W.EXITSTATUS(status) else null,
-            .signal = if (std.posix.W.IFSIGNALED(status)) std.posix.W.TERMSIG(status) else null,
+            .exit_code = if (status) |value| if (std.posix.W.IFEXITED(value)) std.posix.W.EXITSTATUS(value) else null else null,
+            .signal = if (status) |value| if (std.posix.W.IFSIGNALED(value)) std.posix.W.TERMSIG(value) else null else null,
         } });
     }
 

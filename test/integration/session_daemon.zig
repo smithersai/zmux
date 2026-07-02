@@ -282,6 +282,57 @@ fn waitForPaneOutput(
     return error.PaneOutputTimeout;
 }
 
+fn firstPaneMasterFd(server: *server_mod.Server) !posix.fd_t {
+    server.manager.mutex.lock();
+    defer server.manager.mutex.unlock();
+
+    if (server.manager.sessions.items.len == 0) return error.MissingSession;
+    const session = server.manager.sessions.items[0];
+    if (session.windows.items.len == 0) return error.MissingWindow;
+    const window = session.windows.items[0];
+    if (window.panes.items.len == 0) return error.MissingPane;
+    return window.panes.items[0].native.handle.master_fd;
+}
+
+fn captureSessionText(
+    allocator: std.mem.Allocator,
+    socket_path: []const u8,
+    session_id: []const u8,
+) ![]u8 {
+    const req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":77,\"method\":\"session.capture\",\"params\":{{\"sessionId\":\"{s}\",\"lines\":50}}}}\n",
+        .{session_id},
+    );
+    defer allocator.free(req);
+    const line = try rpcLine(allocator, socket_path, req, 1024 * 1024);
+    defer allocator.free(line);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
+    const text_val = result_val.object.get("text") orelse return error.MissingText;
+    if (text_val != .string) return error.MissingText;
+    return allocator.dupe(u8, text_val.string);
+}
+
+fn waitForCaptureContains(
+    allocator: std.mem.Allocator,
+    socket_path: []const u8,
+    session_id: []const u8,
+    needle: []const u8,
+    timeout_ms: i64,
+) ![]u8 {
+    const deadline = std.time.milliTimestamp() + timeout_ms;
+    while (std.time.milliTimestamp() < deadline) {
+        const text = try captureSessionText(allocator, socket_path, session_id);
+        if (std.mem.indexOf(u8, text, needle) != null) return text;
+        allocator.free(text);
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+    }
+    return error.CaptureTimeout;
+}
+
 const RunServerCtx = struct {
     server: *server_mod.Server,
     run_error: ?anyerror = null,
@@ -447,6 +498,110 @@ test "natural child exit is reaped and broadcasts session_exited" {
 
     {
         const line = try rpcLine(allocator, socket_path, "{\"id\":3,\"method\":\"daemon.shutdown\",\"params\":{}}\n", 64 * 1024);
+        defer allocator.free(line);
+    }
+
+    thread.join();
+    server.deinit();
+    server_stopped = true;
+    try std.testing.expect(ctx.run_error == null);
+}
+
+test "PTY master fd does not leak into subsequently spawned pane child" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var padding = std.ArrayList(posix.fd_t).empty;
+    defer {
+        for (padding.items) |fd| posix.close(fd);
+        padding.deinit(allocator);
+    }
+    for (0..32) |_| {
+        const fd = try posix.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        try padding.append(allocator, fd);
+    }
+
+    const socket_path = try tempSocketPath(allocator);
+    defer allocator.free(socket_path);
+    std.fs.deleteFileAbsolute(socket_path) catch {};
+    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+
+    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var ctx = RunServerCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
+    var server_stopped = false;
+    errdefer {
+        if (!server_stopped) {
+            server.running.store(false, .seq_cst);
+            thread.join();
+            server.deinit();
+        }
+    }
+
+    try waitForSocket(socket_path, 2_000);
+
+    var first_id: []u8 = &.{};
+    defer if (first_id.len > 0) allocator.free(first_id);
+    {
+        const line = try rpcLine(
+            allocator,
+            socket_path,
+            "{\"id\":1,\"method\":\"session.create\",\"params\":" ++
+                "{\"shell\":\"/bin/sh\",\"command\":\"cat\",\"rows\":24,\"cols\":80}}\n",
+            64 * 1024,
+        );
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
+        first_id = try allocator.dupe(u8, (result_val.object.get("id") orelse return error.MissingSessionId).string);
+    }
+
+    const master_fd = try firstPaneMasterFd(&server);
+    for (padding.items) |fd| posix.close(fd);
+    padding.clearRetainingCapacity();
+    try std.testing.expect(master_fd > 16);
+
+    var second_id: []u8 = &.{};
+    defer if (second_id.len > 0) allocator.free(second_id);
+    {
+        const command = try std.fmt.allocPrint(
+            allocator,
+            "if [ -e /dev/fd/{} ]; then echo ZMUX_FD_LEAK_{}; else echo ZMUX_FD_ABSENT; fi",
+            .{ master_fd, master_fd },
+        );
+        defer allocator.free(command);
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":2,\"method\":\"session.create\",\"params\":{{\"shell\":\"/bin/sh\",\"command\":{f},\"rows\":24,\"cols\":80}}}}\n",
+            .{std.json.fmt(command, .{})},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
+        second_id = try allocator.dupe(u8, (result_val.object.get("id") orelse return error.MissingSessionId).string);
+    }
+
+    const captured = try waitForCaptureContains(allocator, socket_path, second_id, "ZMUX_FD_", 4_000);
+    defer allocator.free(captured);
+    try std.testing.expect(std.mem.indexOf(u8, captured, "ZMUX_FD_ABSENT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured, "ZMUX_FD_LEAK") == null);
+
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":3,\"method\":\"session.terminate\",\"params\":{{\"sessionId\":\"{s}\"}}}}\n",
+            .{first_id},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
+        defer allocator.free(line);
+    }
+    {
+        const line = try rpcLine(allocator, socket_path, "{\"id\":4,\"method\":\"daemon.shutdown\",\"params\":{}}\n", 64 * 1024);
         defer allocator.free(line);
     }
 

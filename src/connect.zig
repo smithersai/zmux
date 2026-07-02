@@ -7,10 +7,18 @@ const LineReader = rpc_line_reader.LineReader;
 
 const buffer_size: usize = 32 * 1024;
 const rpc_line_max: usize = 1024 * 1024;
+const run_loop_poll_timeout_ms: i32 = 100;
 
 var g_saved_termios: ?posix.termios = null;
 var g_saved_termios_fd: posix.fd_t = 0;
 var g_winch_flag = std.atomic.Value(bool).init(false);
+
+pub const panic = std.debug.FullPanic(connectPanic);
+
+fn connectPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    restoreTermios();
+    std.debug.defaultPanic(msg, first_trace_addr);
+}
 
 pub fn main() !void {
     var dbg: std.heap.DebugAllocator(.{}) = .init;
@@ -255,28 +263,48 @@ fn runLoop(
             .{ .fd = stdin_fd, .events = posix.POLL.IN, .revents = 0 },
             .{ .fd = socket_fd, .events = posix.POLL.IN, .revents = 0 },
         };
-        const ready = try posix.poll(&fds, 1000);
+        const ready = try posix.poll(&fds, run_loop_poll_timeout_ms);
+        if (g_winch_flag.swap(false, .seq_cst)) {
+            sendResize(allocator, socket_fd, session_id, stdout_fd) catch {};
+        }
         if (ready == 0) continue;
+
+        if ((fds[1].revents & posix.POLL.HUP) != 0) {
+            if (try drainReadableSocket(allocator, reader, socket_fd, session_id, stdout_fd)) return;
+            return;
+        }
 
         if ((fds[1].revents & posix.POLL.IN) != 0) {
             if (try handleReadableSocket(allocator, reader, socket_fd, session_id, stdout_fd)) return;
         }
 
-        if ((fds[1].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return;
+        if ((fds[1].revents & posix.POLL.ERR) != 0) return;
 
         if ((fds[0].revents & posix.POLL.IN) != 0) {
-            const n = posix.read(stdin_fd, &buf) catch |err| switch (err) {
-                error.WouldBlock => 0,
-                else => return err,
-            };
-            if (n == 0) {
-                return;
+            switch (try readStdinChunk(stdin_fd, &buf)) {
+                .again => continue,
+                .eof => return,
+                .bytes => |bytes| try sendInput(allocator, socket_fd, session_id, bytes),
             }
-            try sendInput(allocator, socket_fd, session_id, buf[0..n]);
         }
 
         if ((fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return;
     }
+}
+
+const StdinReadResult = union(enum) {
+    again,
+    eof,
+    bytes: []const u8,
+};
+
+fn readStdinChunk(fd: posix.fd_t, buf: []u8) !StdinReadResult {
+    const n = posix.read(fd, buf) catch |err| switch (err) {
+        error.WouldBlock => return .again,
+        else => return err,
+    };
+    if (n == 0) return .eof;
+    return .{ .bytes = buf[0..n] };
 }
 
 fn handleReadableSocket(
@@ -297,6 +325,22 @@ fn handleReadableSocket(
     }
 
     return false;
+}
+
+fn drainReadableSocket(
+    allocator: std.mem.Allocator,
+    reader: *LineReader,
+    socket_fd: posix.fd_t,
+    session_id: []const u8,
+    stdout_fd: posix.fd_t,
+) !bool {
+    var saw_exit = false;
+    while (try reader.readLineAllocMaybe(allocator, socket_fd, rpc_line_max)) |line| {
+        const should_exit = try handleServerLine(allocator, line, session_id, stdout_fd);
+        allocator.free(line);
+        if (should_exit) saw_exit = true;
+    }
+    return saw_exit;
 }
 
 fn connectWithRetry(allocator: std.mem.Allocator, path: []const u8, spawn_daemon: bool) !posix.fd_t {
@@ -418,9 +462,8 @@ fn installSigwinchHandler() void {
 }
 
 fn installExitRestoreHandlers() void {
-    // HUP/PIPE/QUIT: restore termios before default action takes us down.
-    // We deliberately do NOT handle INT/TERM; those bytes are forwarded to
-    // zmux as input.
+    // Raw mode disables ISIG, so interactive ^C is forwarded as input bytes.
+    // Signal-delivered INT/TERM still need to restore the local terminal.
     var act: posix.Sigaction = undefined;
     @memset(std.mem.asBytes(&act), 0);
     act.handler = .{ .handler = exitRestoreHandler };
@@ -429,6 +472,8 @@ fn installExitRestoreHandlers() void {
     posix.sigaction(std.c.SIG.HUP, &act, null);
     posix.sigaction(std.c.SIG.PIPE, &act, null);
     posix.sigaction(std.c.SIG.QUIT, &act, null);
+    posix.sigaction(std.c.SIG.INT, &act, null);
+    posix.sigaction(std.c.SIG.TERM, &act, null);
 }
 
 fn sendResize(
@@ -766,4 +811,117 @@ test "replayScrollbackFromAttach decodes replay bytes" {
     var buf: [32]u8 = undefined;
     const n = try posix.read(fds[0], &buf);
     try std.testing.expectEqualStrings("replay bytes", buf[0..n]);
+}
+
+test "exit restore handlers include external INT and TERM signals" {
+    var old_hup: posix.Sigaction = undefined;
+    var old_pipe: posix.Sigaction = undefined;
+    var old_quit: posix.Sigaction = undefined;
+    var old_int: posix.Sigaction = undefined;
+    var old_term: posix.Sigaction = undefined;
+    posix.sigaction(std.c.SIG.HUP, null, &old_hup);
+    posix.sigaction(std.c.SIG.PIPE, null, &old_pipe);
+    posix.sigaction(std.c.SIG.QUIT, null, &old_quit);
+    posix.sigaction(std.c.SIG.INT, null, &old_int);
+    posix.sigaction(std.c.SIG.TERM, null, &old_term);
+    defer posix.sigaction(std.c.SIG.HUP, &old_hup, null);
+    defer posix.sigaction(std.c.SIG.PIPE, &old_pipe, null);
+    defer posix.sigaction(std.c.SIG.QUIT, &old_quit, null);
+    defer posix.sigaction(std.c.SIG.INT, &old_int, null);
+    defer posix.sigaction(std.c.SIG.TERM, &old_term, null);
+
+    installExitRestoreHandlers();
+
+    var current_int: posix.Sigaction = undefined;
+    var current_term: posix.Sigaction = undefined;
+    posix.sigaction(std.c.SIG.INT, null, &current_int);
+    posix.sigaction(std.c.SIG.TERM, null, &current_term);
+    try std.testing.expect(current_int.handler.handler.? == exitRestoreHandler);
+    try std.testing.expect(current_term.handler.handler.? == exitRestoreHandler);
+}
+
+test "stdin WouldBlock is not treated as EOF" {
+    if (!@hasDecl(std.posix, "pipe2")) return error.SkipZigTest;
+
+    const fds = try std.posix.pipe2(.{ .NONBLOCK = true });
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var buf: [16]u8 = undefined;
+    switch (try readStdinChunk(fds[0], &buf)) {
+        .again => {},
+        .eof => return error.WouldBlockMappedToEof,
+        .bytes => return error.UnexpectedStdinBytes,
+    }
+}
+
+test "runLoop drains final socket output after HUP" {
+    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const stdin_fds = try std.posix.pipe();
+    defer posix.close(stdin_fds[0]);
+    defer posix.close(stdin_fds[1]);
+
+    const socket_fds = try std.posix.pipe();
+    defer posix.close(socket_fds[0]);
+    var socket_write_open = true;
+    defer if (socket_write_open) posix.close(socket_fds[1]);
+
+    const stdout_fds = try std.posix.pipe();
+    defer posix.close(stdout_fds[0]);
+    var stdout_write_open = true;
+    defer if (stdout_write_open) posix.close(stdout_fds[1]);
+
+    const first_line = try paneOutputLineForTest(allocator, "pane-1", "FIRST\n");
+    defer allocator.free(first_line);
+
+    var tail = try allocator.alloc(u8, 5000);
+    defer allocator.free(tail);
+    @memset(tail, 'x');
+    const marker = "TAIL_END";
+    @memcpy(tail[tail.len - marker.len ..], marker);
+    const tail_line = try paneOutputLineForTest(allocator, "pane-1", tail);
+    defer allocator.free(tail_line);
+
+    try writeAll(socket_fds[1], first_line);
+    try writeAll(socket_fds[1], tail_line);
+    posix.close(socket_fds[1]);
+    socket_write_open = false;
+
+    var reader: LineReader = .{};
+    try runLoop(stdin_fds[0], stdout_fds[1], socket_fds[0], &reader, allocator, "pane-1");
+
+    posix.close(stdout_fds[1]);
+    stdout_write_open = false;
+    const output = try readAllFdForTest(allocator, stdout_fds[0]);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "FIRST\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, marker) != null);
+}
+
+test "run loop poll timeout bounds idle SIGWINCH latency" {
+    try std.testing.expect(run_loop_poll_timeout_ms <= 100);
+}
+
+fn paneOutputLineForTest(allocator: std.mem.Allocator, pane_id: []const u8, data: []const u8) ![]u8 {
+    const encoded = try base64Encode(allocator, data);
+    defer allocator.free(encoded);
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{{\"pane_id\":{f},\"data_base64\":{f}}}}}\n",
+        .{ std.json.fmt(pane_id, .{}), std.json.fmt(encoded, .{}) },
+    );
+}
+
+fn readAllFdForTest(allocator: std.mem.Allocator, fd: posix.fd_t) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var buf: [1024]u8 = undefined;
+    while (true) {
+        const n = try posix.read(fd, &buf);
+        if (n == 0) return out.toOwnedSlice(allocator);
+        try out.appendSlice(allocator, buf[0..n]);
+    }
 }

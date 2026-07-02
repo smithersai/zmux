@@ -55,6 +55,7 @@ pub fn main() !void {
     defer allocator.free(path);
 
     detachFromControllingTerminal();
+    resetSigchldDisposition();
     installShutdownHandlers();
 
     var start_lock: ?StartLock = try acquireStartLock(allocator, path);
@@ -66,12 +67,28 @@ pub fn main() !void {
     if (socketPathExists(path) and waitForSocketAcceptsConnection(path, startup_probe_timeout_ms)) return;
 
     var server = try server_mod.Server.init(allocator, path, idle_timeout_seconds);
+    defer server.deinit();
     if (start_lock) |*lock| {
         lock.release();
         start_lock = null;
     }
-    try writePidFile(allocator);
-    defer server.deinit();
+
+    const pid_file_path = pidPath(allocator, path) catch null;
+    defer if (pid_file_path) |pid_path| allocator.free(pid_path);
+    var pid_file_written = false;
+    if (pid_file_path) |pid_path| {
+        if (writePidFile(allocator, pid_path)) {
+            pid_file_written = true;
+        } else |err| {
+            _ = @errorName(err);
+            // The pid file is advisory; failing after the socket is bound
+            // would leave a healthy daemon unavailable and a stale socket.
+        }
+    }
+    defer if (pid_file_written) {
+        if (pid_file_path) |pid_path| deletePidFile(pid_path);
+    };
+
     server.shutdown_probe = shutdownRequested;
     try server.run();
 }
@@ -90,15 +107,11 @@ pub fn socketPath(allocator: std.mem.Allocator) ![]u8 {
     return std.fs.path.join(allocator, &.{ home, ".smithers", "sessions.sock" });
 }
 
-fn pidPath(allocator: std.mem.Allocator) ![]u8 {
-    const home = std.posix.getenv("HOME") orelse "/tmp";
-    return std.fs.path.join(allocator, &.{ home, ".smithers", "session-daemon.pid" });
+fn pidPath(allocator: std.mem.Allocator, active_socket_path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}.pid", .{active_socket_path});
 }
 
-fn writePidFile(allocator: std.mem.Allocator) !void {
-    const path = try pidPath(allocator);
-    defer allocator.free(path);
-
+fn writePidFile(allocator: std.mem.Allocator, path: []const u8) !void {
     if (std.fs.path.dirname(path)) |parent| {
         std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
@@ -106,12 +119,29 @@ fn writePidFile(allocator: std.mem.Allocator) !void {
         };
     }
 
-    var file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
-    defer file.close();
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp.{}", .{ path, std.c.getpid() });
+    defer allocator.free(tmp_path);
+    errdefer std.fs.deleteFileAbsolute(tmp_path) catch {};
+
+    var file = try std.fs.createFileAbsolute(tmp_path, .{
+        .truncate = true,
+        .exclusive = true,
+        .mode = 0o600,
+    });
+    var file_open = true;
+    defer if (file_open) file.close();
 
     const text = try std.fmt.allocPrint(allocator, "{}\n", .{std.c.getpid()});
     defer allocator.free(text);
     try file.writeAll(text);
+    try file.sync();
+    file.close();
+    file_open = false;
+    try std.fs.renameAbsolute(tmp_path, path);
+}
+
+fn deletePidFile(path: []const u8) void {
+    std.fs.deleteFileAbsolute(path) catch {};
 }
 
 fn acquireStartLock(allocator: std.mem.Allocator, socket_path: []const u8) !StartLock {
@@ -188,6 +218,15 @@ fn detachFromControllingTerminal() void {
     _ = std.c.setsid();
 }
 
+fn resetSigchldDisposition() void {
+    var act: std.posix.Sigaction = undefined;
+    @memset(std.mem.asBytes(&act), 0);
+    act.handler = .{ .handler = null };
+    act.mask = std.mem.zeroes(std.posix.sigset_t);
+    act.flags = 0;
+    std.posix.sigaction(std.c.SIG.CHLD, &act, null);
+}
+
 fn installShutdownHandlers() void {
     var act: std.posix.Sigaction = undefined;
     @memset(std.mem.asBytes(&act), 0);
@@ -236,6 +275,61 @@ test "socketAcceptsConnection detects a listening unix socket" {
     try std.posix.listen(listener, 1);
 
     try std.testing.expect(socketAcceptsConnection(path));
+}
+
+test "pid path is scoped to the socket path" {
+    const path = try pidPath(std.testing.allocator, "/tmp/zmux-test.sock");
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings("/tmp/zmux-test.sock.pid", path);
+}
+
+test "pid file write is atomic and cleanly removable" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    var seed: [8]u8 = undefined;
+    std.crypto.random.bytes(&seed);
+    const nonce = std.mem.readInt(u64, &seed, .little);
+    const root = switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos, .visionos => "/private/tmp",
+        else => "/tmp",
+    };
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/zmx-pid-{x:0>16}.sock.pid", .{ root, nonce });
+    defer std.testing.allocator.free(path);
+    defer std.fs.deleteFileAbsolute(path) catch {};
+
+    try writePidFile(std.testing.allocator, path);
+    var file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const text = try file.readToEndAlloc(std.testing.allocator, 64);
+    defer std.testing.allocator.free(text);
+
+    const expected = try std.fmt.allocPrint(std.testing.allocator, "{}\n", .{std.c.getpid()});
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, text);
+
+    deletePidFile(path);
+    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(path, .{}));
+}
+
+test "resetSigchldDisposition restores default SIGCHLD handling" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    var old_action: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.c.SIG.CHLD, null, &old_action);
+    defer std.posix.sigaction(std.c.SIG.CHLD, &old_action, null);
+
+    var ignored: std.posix.Sigaction = undefined;
+    @memset(std.mem.asBytes(&ignored), 0);
+    ignored.handler = .{ .handler = std.posix.SIG.IGN };
+    ignored.mask = std.mem.zeroes(std.posix.sigset_t);
+    ignored.flags = 0;
+    std.posix.sigaction(std.c.SIG.CHLD, &ignored, null);
+
+    resetSigchldDisposition();
+
+    var current: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.c.SIG.CHLD, null, &current);
+    try std.testing.expect(current.handler.handler == null);
 }
 
 test {
