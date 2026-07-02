@@ -145,6 +145,45 @@ test "parse JSON-RPC request" {
     try std.testing.expect(req.params() != null);
 }
 
+test "parse JSON-RPC request preserves string ids and defaults missing ids to null" {
+    var string_id = try parseRequest(std.testing.allocator, "{\"id\":\"abc\",\"method\":\"session.list\"}\n");
+    defer string_id.deinit();
+    try std.testing.expectEqualStrings("\"abc\"", string_id.id_json);
+    try std.testing.expectEqualStrings("session.list", string_id.method);
+    try std.testing.expect(string_id.params() == null);
+
+    var notification_like = try parseRequest(std.testing.allocator, "{\"method\":\"pane_output\",\"params\":{}}\n");
+    defer notification_like.deinit();
+    try std.testing.expectEqualStrings("null", notification_like.id_json);
+    try std.testing.expectEqualStrings("pane_output", notification_like.method);
+}
+
+test "parse JSON-RPC request rejects missing or non-string methods" {
+    try std.testing.expectError(
+        error.InvalidRequest,
+        parseRequest(std.testing.allocator, "{\"id\":1,\"params\":{}}\n"),
+    );
+    try std.testing.expectError(
+        error.InvalidRequest,
+        parseRequest(std.testing.allocator, "{\"id\":1,\"method\":7}\n"),
+    );
+}
+
+test "format JSON-RPC result and raw result" {
+    const json = try result(std.testing.allocator, "9", .{ .ok = true, .name = "work" });
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"id\":9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"work\"") != null);
+
+    const raw = try resultRaw(std.testing.allocator, "\"abc\"", "{\"items\":[1,2]}");
+    defer std.testing.allocator.free(raw);
+    try std.testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"result\":{\"items\":[1,2]}}\n",
+        raw,
+    );
+}
+
 test "format JSON-RPC error" {
     const json = try @"error"(std.testing.allocator, "null", ErrorCode.method_not_found, "missing");
     defer std.testing.allocator.free(json);
