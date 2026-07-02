@@ -54,7 +54,45 @@ fn rpcLine(
     const client = try connectClient(socket_path);
     defer posix.close(client);
     try writeAll(client, request);
-    return readLineAlloc(allocator, client, max_len);
+    return readRpcResponseWithAnyId(allocator, client, max_len);
+}
+
+fn readRpcResponseWithAnyId(allocator: std.mem.Allocator, fd: posix.fd_t, max_len: usize) ![]u8 {
+    while (true) {
+        const line = try readLineAlloc(allocator, fd, max_len);
+        if (lineHasRpcId(allocator, line)) return line;
+        allocator.free(line);
+    }
+}
+
+fn readRpcResponseLine(
+    allocator: std.mem.Allocator,
+    fd: posix.fd_t,
+    expected_id: i64,
+    max_len: usize,
+) ![]u8 {
+    while (true) {
+        const line = try readLineAlloc(allocator, fd, max_len);
+        if (lineMatchesRpcId(allocator, line, expected_id)) return line;
+        allocator.free(line);
+    }
+}
+
+fn lineHasRpcId(allocator: std.mem.Allocator, line: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    _ = parsed.value.object.get("id") orelse return false;
+    return true;
+}
+
+fn lineMatchesRpcId(allocator: std.mem.Allocator, line: []const u8, expected_id: i64) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const id_value = parsed.value.object.get("id") orelse return false;
+    if (id_value != .integer) return false;
+    return id_value.integer == expected_id;
 }
 
 fn waitForSocket(path: []const u8, timeout_ms: i64) !void {
@@ -94,7 +132,7 @@ fn waitForClientCount(
 
         try writeAll(client, "{\"id\":99,\"method\":\"client.list\",\"params\":{}}\n");
 
-        const line = readLineAlloc(allocator, client, 64 * 1024) catch {
+        const line = readRpcResponseLine(allocator, client, 99, 64 * 1024) catch {
             std.Thread.sleep(10 * std.time.ns_per_ms);
             continue;
         };
@@ -124,6 +162,93 @@ const RunServerCtx = struct {
         };
     }
 };
+
+fn expectRpcErrorCode(allocator: std.mem.Allocator, line: []const u8, expected_code: i64) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value == .object);
+    const err_val = parsed.value.object.get("error") orelse return error.MissingError;
+    try std.testing.expect(err_val == .object);
+    const code_val = err_val.object.get("code") orelse return error.MissingErrorCode;
+    try std.testing.expect(code_val == .integer);
+    try std.testing.expectEqual(expected_code, code_val.integer);
+}
+
+test "daemon JSON-RPC errors are framed and the connection remains usable" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const socket_path = try tempSocketPath(allocator);
+    defer allocator.free(socket_path);
+    std.fs.deleteFileAbsolute(socket_path) catch {};
+    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+
+    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var ctx = RunServerCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
+
+    var server_stopped = false;
+    errdefer {
+        if (!server_stopped) {
+            server.running.store(false, .seq_cst);
+            thread.join();
+            server.deinit();
+        }
+    }
+
+    try waitForSocket(socket_path, 2_000);
+
+    const client = try connectClient(socket_path);
+    defer posix.close(client);
+
+    {
+        try writeAll(client, "not-json\n");
+        const line = try readRpcResponseWithAnyId(allocator, client, 64 * 1024);
+        defer allocator.free(line);
+        try expectRpcErrorCode(allocator, line, -32600);
+    }
+
+    {
+        try writeAll(client, "{\"id\":2,\"method\":\"missing.method\",\"params\":{}}\n");
+        const line = try readRpcResponseLine(allocator, client, 2, 64 * 1024);
+        defer allocator.free(line);
+        try expectRpcErrorCode(allocator, line, -32601);
+    }
+
+    {
+        try writeAll(client, "{\"id\":3,\"method\":\"session.info\",\"params\":{}}\n");
+        const line = try readRpcResponseLine(allocator, client, 3, 64 * 1024);
+        defer allocator.free(line);
+        try expectRpcErrorCode(allocator, line, -32602);
+    }
+
+    {
+        try writeAll(client, "{\"id\":4,\"method\":\"daemon.ping\",\"params\":{}}\n");
+        const line = try readRpcResponseLine(allocator, client, 4, 64 * 1024);
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("error") == null);
+        const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
+        try std.testing.expect(result_val.object.get("version") != null);
+    }
+
+    {
+        try writeAll(client, "{\"id\":5,\"method\":\"daemon.shutdown\",\"params\":{}}\n");
+        const line = try readRpcResponseLine(allocator, client, 5, 64 * 1024);
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("result") != null);
+    }
+
+    thread.join();
+    server.deinit();
+    server_stopped = true;
+
+    try std.testing.expect(ctx.run_error == null);
+}
 
 test "native session daemon end-to-end: ping, create, send, capture, terminate, shutdown" {
     if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
@@ -160,7 +285,7 @@ test "native session daemon end-to-end: ping, create, send, capture, terminate, 
         defer posix.close(client);
 
         try writeAll(client, "{\"id\":1,\"method\":\"daemon.ping\",\"params\":{}}\n");
-        const line = try readLineAlloc(allocator, client, 64 * 1024);
+        const line = try readRpcResponseLine(allocator, client, 1, 64 * 1024);
         defer allocator.free(line);
 
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
@@ -195,7 +320,7 @@ test "native session daemon end-to-end: ping, create, send, capture, terminate, 
                 "{\"shell\":\"/bin/sh\",\"command\":\"exec /bin/sh\",\"cwd\":\"/tmp\",\"rows\":24,\"cols\":80}}\n",
         );
 
-        const line = try readLineAlloc(allocator, client, 64 * 1024);
+        const line = try readRpcResponseLine(allocator, client, 2, 64 * 1024);
         defer allocator.free(line);
 
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
@@ -226,7 +351,7 @@ test "native session daemon end-to-end: ping, create, send, capture, terminate, 
         defer allocator.free(req);
         try writeAll(client, req);
 
-        const line = try readLineAlloc(allocator, client, 64 * 1024);
+        const line = try readRpcResponseLine(allocator, client, 3, 64 * 1024);
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
@@ -249,7 +374,7 @@ test "native session daemon end-to-end: ping, create, send, capture, terminate, 
         defer allocator.free(req);
         try writeAll(client, req);
 
-        const line = try readLineAlloc(allocator, client, 1024 * 1024);
+        const line = try readRpcResponseLine(allocator, client, 4, 1024 * 1024);
         defer allocator.free(line);
 
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
@@ -275,7 +400,7 @@ test "native session daemon end-to-end: ping, create, send, capture, terminate, 
         defer allocator.free(req);
         try writeAll(client, req);
 
-        const line = try readLineAlloc(allocator, client, 64 * 1024);
+        const line = try readRpcResponseLine(allocator, client, 5, 64 * 1024);
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
@@ -288,7 +413,7 @@ test "native session daemon end-to-end: ping, create, send, capture, terminate, 
         defer posix.close(client);
 
         try writeAll(client, "{\"id\":6,\"method\":\"daemon.shutdown\",\"params\":{}}\n");
-        const line = try readLineAlloc(allocator, client, 64 * 1024);
+        const line = try readRpcResponseLine(allocator, client, 6, 64 * 1024);
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
@@ -344,7 +469,7 @@ test "client.attach replays scrollback on reattach so reopened sessions keep the
                 "{\"shell\":\"/bin/sh\",\"command\":\"echo REOPEN_SENTINEL_ONE; cat\"," ++
                 "\"cwd\":\"/tmp\",\"rows\":24,\"cols\":80}}\n",
         );
-        const line = try readLineAlloc(allocator, client, 64 * 1024);
+        const line = try readRpcResponseLine(allocator, client, 1, 64 * 1024);
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
@@ -368,7 +493,7 @@ test "client.attach replays scrollback on reattach so reopened sessions keep the
         defer allocator.free(attach_req);
         try writeAll(client, attach_req);
 
-        const line = try readLineAlloc(allocator, client, 1024 * 1024);
+        const line = try readRpcResponseLine(allocator, client, 2, 1024 * 1024);
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
@@ -394,7 +519,7 @@ test "client.attach replays scrollback on reattach so reopened sessions keep the
         );
         defer allocator.free(send_req);
         try writeAll(client, send_req);
-        const line = try readLineAlloc(allocator, client, 64 * 1024);
+        const line = try readRpcResponseLine(allocator, client, 3, 64 * 1024);
         defer allocator.free(line);
     }
 
@@ -413,7 +538,7 @@ test "client.attach replays scrollback on reattach so reopened sessions keep the
         defer allocator.free(attach_req);
         try writeAll(client, attach_req);
 
-        const line = try readLineAlloc(allocator, client, 1024 * 1024);
+        const line = try readRpcResponseLine(allocator, client, 4, 1024 * 1024);
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
@@ -437,14 +562,14 @@ test "client.attach replays scrollback on reattach so reopened sessions keep the
         );
         defer allocator.free(req);
         try writeAll(client, req);
-        const line = try readLineAlloc(allocator, client, 64 * 1024);
+        const line = try readRpcResponseLine(allocator, client, 5, 64 * 1024);
         defer allocator.free(line);
     }
     {
         const client = try connectClient(socket_path);
         defer posix.close(client);
         try writeAll(client, "{\"id\":6,\"method\":\"daemon.shutdown\",\"params\":{}}\n");
-        const line = try readLineAlloc(allocator, client, 64 * 1024);
+        const line = try readRpcResponseLine(allocator, client, 6, 64 * 1024);
         defer allocator.free(line);
     }
 
@@ -488,7 +613,7 @@ test "logical client auto-detaches when connection closes so a reopened tab can 
                 "{\"shell\":\"/bin/sh\",\"command\":\"echo AUTO_DETACH_SENTINEL; cat\"," ++
                 "\"cwd\":\"/tmp\",\"rows\":24,\"cols\":80}}\n",
         );
-        const line = try readLineAlloc(allocator, client, 64 * 1024);
+        const line = try readRpcResponseLine(allocator, client, 1, 64 * 1024);
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
@@ -509,7 +634,7 @@ test "logical client auto-detaches when connection closes so a reopened tab can 
         defer allocator.free(attach_req);
         try writeAll(client, attach_req);
 
-        const line = try readLineAlloc(allocator, client, 1024 * 1024);
+        const line = try readRpcResponseLine(allocator, client, 2, 1024 * 1024);
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
@@ -532,7 +657,7 @@ test "logical client auto-detaches when connection closes so a reopened tab can 
         defer allocator.free(attach_req);
         try writeAll(client, attach_req);
 
-        const line = try readLineAlloc(allocator, client, 1024 * 1024);
+        const line = try readRpcResponseLine(allocator, client, 3, 1024 * 1024);
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
@@ -553,14 +678,14 @@ test "logical client auto-detaches when connection closes so a reopened tab can 
         );
         defer allocator.free(req);
         try writeAll(client, req);
-        const line = try readLineAlloc(allocator, client, 64 * 1024);
+        const line = try readRpcResponseLine(allocator, client, 4, 64 * 1024);
         defer allocator.free(line);
     }
     {
         const client = try connectClient(socket_path);
         defer posix.close(client);
         try writeAll(client, "{\"id\":5,\"method\":\"daemon.shutdown\",\"params\":{}}\n");
-        const line = try readLineAlloc(allocator, client, 64 * 1024);
+        const line = try readRpcResponseLine(allocator, client, 5, 64 * 1024);
         defer allocator.free(line);
     }
 
@@ -674,7 +799,7 @@ test "mux model API owns windows panes clients key bindings and respawn state" {
         );
         defer allocator.free(req);
         try writeAll(client, req);
-        const line = try readLineAlloc(allocator, client, 64 * 1024);
+        const line = try readRpcResponseLine(allocator, client, 5, 64 * 1024);
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
@@ -692,7 +817,7 @@ test "mux model API owns windows panes clients key bindings and respawn state" {
         );
         defer allocator.free(req);
         try writeAll(client, req);
-        const line = try readLineAlloc(allocator, client, 64 * 1024);
+        const line = try readRpcResponseLine(allocator, client, 6, 64 * 1024);
         defer allocator.free(line);
     }
     {
