@@ -20,30 +20,57 @@ jobs:
           - name: linux-x64
             runner: ubuntu-latest
             zig_target: x86_64-linux-musl
+          - name: linux-arm64
+            runner: ubuntu-latest
+            zig_target: aarch64-linux-musl
           - name: macos-arm64
             runner: macos-latest
             zig_target: aarch64-macos
+          - name: macos-x64
+            runner: macos-latest
+            zig_target: x86_64-macos
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.15.2
+
+      # Build and run the test suite natively on the host runner. The release
+      # build below cross-compiles with -Dtarget, but tests must run on the
+      # host to actually execute, so this step intentionally omits -Dtarget.
+      - name: Run tests
+        run: zig build test
 
       - name: Build (ReleaseSafe)
         run: zig build -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe
 
-      - name: Rename assets
+      # Package each binary together with the LICENSE into a .tar.gz, and emit a
+      # per-asset .sha256 sidecar. Per-asset sidecars are used (instead of one
+      # combined SHA256SUMS) because each matrix entry runs on its own runner and
+      # cannot see the other jobs' archives to build a single aggregate file.
+      - name: Package assets
         run: |
-          cp zig-out/bin/zmuxd "zmuxd-${{ matrix.name }}"
-          cp zig-out/bin/zmux-connect "zmux-connect-${{ matrix.name }}"
+          cp zig-out/bin/zmuxd zmuxd
+          cp zig-out/bin/zmux-connect zmux-connect
+          mkdir -p dist
+          tar -czf "dist/zmuxd-${{ matrix.name }}.tar.gz" zmuxd LICENSE
+          tar -czf "dist/zmux-connect-${{ matrix.name }}.tar.gz" zmux-connect LICENSE
+          cd dist
+          shasum -a 256 "zmuxd-${{ matrix.name }}.tar.gz" > "zmuxd-${{ matrix.name }}.tar.gz.sha256"
+          shasum -a 256 "zmux-connect-${{ matrix.name }}.tar.gz" > "zmux-connect-${{ matrix.name }}.tar.gz.sha256"
 
+      # Only publish on tag pushes. A manual workflow_dispatch run has no tag
+      # ref, so it performs a build + test + package dry run without releasing.
       - name: Upload release assets
-        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@aec2ec56f94eb8180ceec724245f64ef008b89f5 # v2.4.0
         with:
           files: |
-            zmuxd-${{ matrix.name }}
-            zmux-connect-${{ matrix.name }}
+            dist/zmuxd-${{ matrix.name }}.tar.gz
+            dist/zmux-connect-${{ matrix.name }}.tar.gz
+            dist/zmuxd-${{ matrix.name }}.tar.gz.sha256
+            dist/zmux-connect-${{ matrix.name }}.tar.gz.sha256
           fail_on_unmatched_files: true
