@@ -651,6 +651,9 @@ test "native session daemon end-to-end: ping, create, send, capture, terminate, 
         const sessions_val = result_val.object.get("sessions") orelse return error.MissingSessions;
         try std.testing.expect(sessions_val == .integer);
         try std.testing.expectEqual(@as(i64, 0), sessions_val.integer);
+        const panes_val = result_val.object.get("panes") orelse return error.MissingPanes;
+        try std.testing.expect(panes_val == .integer);
+        try std.testing.expectEqual(@as(i64, 0), panes_val.integer);
     }
 
     // --- session.create ---
@@ -1043,6 +1046,123 @@ test "logical client auto-detaches when connection closes so a reopened tab can 
     try std.testing.expect(ctx.run_error == null);
 }
 
+test "session RPCs resolve session names and returned session ids, and attach resizes the PTY" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const socket_path = try tempSocketPath(allocator);
+    defer allocator.free(socket_path);
+    std.fs.deleteFileAbsolute(socket_path) catch {};
+    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+
+    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var ctx = RunServerCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
+    var server_stopped = false;
+    errdefer {
+        if (!server_stopped) {
+            server.running.store(false, .seq_cst);
+            thread.join();
+            server.deinit();
+        }
+    }
+
+    try waitForSocket(socket_path, 2_000);
+
+    {
+        const line = try rpcLine(
+            allocator,
+            socket_path,
+            "{\"id\":1,\"method\":\"session.create\",\"params\":" ++
+                "{\"id\":\"work\",\"shell\":\"/bin/sh\",\"command\":\"exec /bin/sh\",\"rows\":24,\"cols\":80}}\n",
+            64 * 1024,
+        );
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("error") == null);
+    }
+
+    var returned_session_id: []u8 = &.{};
+    defer if (returned_session_id.len > 0) allocator.free(returned_session_id);
+    {
+        const line = try rpcLine(
+            allocator,
+            socket_path,
+            "{\"id\":2,\"method\":\"client.attach\",\"params\":{\"paneId\":\"work\",\"rows\":40,\"cols\":120}}\n",
+            1024 * 1024,
+        );
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("error") == null);
+        const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
+        const session_id_val = result_val.object.get("sessionId") orelse return error.MissingSessionId;
+        returned_session_id = try allocator.dupe(u8, session_id_val.string);
+        const rows_val = result_val.object.get("rows") orelse return error.MissingRows;
+        const cols_val = result_val.object.get("cols") orelse return error.MissingCols;
+        try std.testing.expectEqual(@as(i64, 40), rows_val.integer);
+        try std.testing.expectEqual(@as(i64, 120), cols_val.integer);
+    }
+
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":3,\"method\":\"session.send\",\"params\":{{\"sessionId\":\"work\",\"text\":\"printf 'NAME_SEND_OK\\\\n'; stty size\\n\"}}}}\n",
+            .{},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("error") == null);
+    }
+
+    std.Thread.sleep(600 * std.time.ns_per_ms);
+
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":4,\"method\":\"session.capture\",\"params\":{{\"sessionId\":\"{s}\",\"lines\":20}}}}\n",
+            .{returned_session_id},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 1024 * 1024);
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("error") == null);
+        const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
+        const text_val = result_val.object.get("text") orelse return error.MissingText;
+        try std.testing.expect(std.mem.indexOf(u8, text_val.string, "NAME_SEND_OK") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text_val.string, "40 120") != null);
+    }
+
+    {
+        const line = try rpcLine(
+            allocator,
+            socket_path,
+            "{\"id\":5,\"method\":\"session.terminate\",\"params\":{\"sessionId\":\"work\"}}\n",
+            64 * 1024,
+        );
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("error") == null);
+        try std.testing.expect(parsed.value.object.get("result") != null);
+    }
+    {
+        const line = try rpcLine(allocator, socket_path, "{\"id\":6,\"method\":\"daemon.shutdown\",\"params\":{}}\n", 64 * 1024);
+        defer allocator.free(line);
+    }
+
+    thread.join();
+    server.deinit();
+    server_stopped = true;
+    try std.testing.expect(ctx.run_error == null);
+}
+
 test "mux model API owns windows panes clients key bindings and respawn state" {
     if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
 
@@ -1129,6 +1249,18 @@ test "mux model API owns windows panes clients key bindings and respawn state" {
         defer allocator.free(line);
         try std.testing.expect(std.mem.indexOf(u8, line, "\"kind\":\"split\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, line, "\"axis\":\"horizontal\"") != null);
+    }
+
+    {
+        const line = try rpcLine(allocator, socket_path, "{\"id\":41,\"method\":\"daemon.ping\",\"params\":{}}\n", 64 * 1024);
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
+        const sessions_val = result_val.object.get("sessions") orelse return error.MissingSessions;
+        const panes_val = result_val.object.get("panes") orelse return error.MissingPanes;
+        try std.testing.expectEqual(@as(i64, 1), sessions_val.integer);
+        try std.testing.expectEqual(@as(i64, 3), panes_val.integer);
     }
 
     var client_one: []u8 = &.{};

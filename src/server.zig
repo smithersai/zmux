@@ -375,7 +375,8 @@ pub const Server = struct {
                 .version = protocol.version,
                 .pid = std.c.getpid(),
                 .socketPath = self.socket_path,
-                .sessions = self.manager.count(),
+                .sessions = self.manager.sessionCount(),
+                .panes = self.manager.paneCount(),
             });
             defer self.allocator.free(response);
             return connection.write(response);
@@ -604,7 +605,13 @@ pub const Server = struct {
         const key = stringParam(req.params(), "key") orelse {
             return self.writeError(connection, req.id_json, protocol.ErrorCode.invalid_params, "key is required");
         };
-        const command = try self.manager.executeBinding(stringParam(req.params(), "table") orelse "prefix", key, pane_id);
+        const command = self.manager.executeBinding(stringParam(req.params(), "table") orelse "prefix", key, pane_id) catch |err| switch (err) {
+            error.UnsupportedCommand => {
+                try self.writeError(connection, req.id_json, protocol.ErrorCode.invalid_params, @errorName(err));
+                return;
+            },
+            else => return err,
+        };
         defer if (command) |owned| self.allocator.free(owned);
         if (command == null) {
             const response = try protocol.result(self.allocator, req.id_json, .{ .handled = false });
@@ -629,7 +636,13 @@ pub const Server = struct {
         const command = firstStringParam(req.params(), &.{ "command", "line" }) orelse {
             return self.writeError(connection, req.id_json, protocol.ErrorCode.invalid_params, "command is required");
         };
-        try self.manager.executeCommandLine(command, pane_id);
+        self.manager.executeCommandLine(command, pane_id) catch |err| switch (err) {
+            error.UnsupportedCommand => {
+                try self.writeError(connection, req.id_json, protocol.ErrorCode.invalid_params, @errorName(err));
+                return;
+            },
+            else => return err,
+        };
         try self.writeSnapshotResponse(connection, req.id_json);
     }
 

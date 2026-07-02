@@ -68,8 +68,10 @@ pub const Pty = struct {
         if (opts.env) |env_entries| {
             for (env_entries) |entry| {
                 const entry_z = try allocator.dupeZ(u8, entry);
-                errdefer allocator.free(entry_z);
+                var entry_owned = true;
+                errdefer if (entry_owned) allocator.free(entry_z);
                 try env_storage.append(allocator, entry_z);
+                entry_owned = false;
                 try env_ptrs.append(allocator, entry_z.ptr);
             }
             try env_ptrs.append(allocator, null);
@@ -257,6 +259,34 @@ fn ioctlRequest(value: usize) c_int {
 
 test "default shell is absolute" {
     try std.testing.expect(std.mem.startsWith(u8, defaultShell(), "/"));
+}
+
+fn cleanupPtyForTest(child: *Pty) void {
+    child.kill();
+    var waited: u32 = 0;
+    while (waited < 50) : (waited += 1) {
+        if (child.reapExited() != null) break;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    child.close();
+}
+
+fn spawnWithEnvForFailureTest(allocator: Allocator) !void {
+    const env = [_][]const u8{ "FOO=bar", "BAZ=qux" };
+    var child = try Pty.spawn(allocator, .{
+        .shell = "/bin/sh",
+        .command = "exit 0",
+        .env = &env,
+        .rows = 24,
+        .cols = 80,
+    });
+    defer cleanupPtyForTest(&child);
+}
+
+test "spawn env allocation failures clean up env entry ownership" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, spawnWithEnvForFailureTest, .{});
 }
 
 test "spawn with bare shell (no command) exits cleanly" {

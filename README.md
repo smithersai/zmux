@@ -52,8 +52,8 @@ everything else:
 - Daemon-side startup locking so concurrent starters cannot unlink or steal a
   live daemon socket
 - `daemon.ping` / `daemon.shutdown`
-- Server-owned session, window, pane, layout, client, key binding, alert, and
-  respawn state exposed by `mux.snapshot`
+- Server-owned session, window, pane, layout, client, key binding, activity /
+  bell / exit alert, and respawn state exposed by `mux.snapshot`
 - `session.{create,info,list,terminate,resize,capture,send,sendKey,rename}`
 - `window.{new,select,rename}`
 - `pane.{split,select,rename,respawn}`
@@ -195,7 +195,9 @@ Top-level modules:
 ## Protocol
 
 `zmux` speaks JSON-RPC 2.0 over a newline-delimited UNIX-domain socket. The
-protocol version is reported by `daemon.ping` (see `src/protocol.zig`).
+protocol version is reported by `daemon.ping` along with separate `sessions`
+and `panes` counts (see `src/protocol.zig`). `mux.snapshot` pane alerts expose
+`activity`, `bell`, `exited`, `lastActivityMs`, and `lastBellMs`.
 
 ### Requests
 
