@@ -1103,3 +1103,49 @@ test "mux key binding executes tmux-like split command" {
     try std.testing.expect(command != null);
     try std.testing.expectEqual(@as(usize, 2), manager.count());
 }
+
+test "switchClient moves a logical client to another pane" {
+    var manager = Manager.init(std.testing.allocator, null);
+    defer manager.deinit();
+
+    const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "true" });
+    const first_id = try std.testing.allocator.dupe(u8, first.id);
+    defer std.testing.allocator.free(first_id);
+    const second = try manager.splitPane(first_id, .vertical, .{ .shell = "/bin/sh", .command = "true" });
+    const second_id = try std.testing.allocator.dupe(u8, second.id);
+    defer std.testing.allocator.free(second_id);
+
+    const client = try manager.attachClient(first_id, 25, 90);
+    try std.testing.expectEqualStrings(first_id, client.pane_id);
+
+    try manager.switchClient(client.id, second_id);
+    try std.testing.expectEqualStrings(second_id, client.pane_id);
+    try std.testing.expectEqual(@as(u16, 25), client.rows);
+    try std.testing.expectEqual(@as(u16, 90), client.cols);
+
+    const clients = try manager.clientsJson(std.testing.allocator);
+    defer std.testing.allocator.free(clients);
+    try std.testing.expect(std.mem.indexOf(u8, clients, second_id) != null);
+}
+
+test "terminating a split pane collapses layout and keeps the remaining pane" {
+    var manager = Manager.init(std.testing.allocator, null);
+    defer manager.deinit();
+
+    const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "true" });
+    const first_id = try std.testing.allocator.dupe(u8, first.id);
+    defer std.testing.allocator.free(first_id);
+    const second = try manager.splitPane(first_id, .horizontal, .{ .shell = "/bin/sh", .command = "true" });
+    const second_id = try std.testing.allocator.dupe(u8, second.id);
+    defer std.testing.allocator.free(second_id);
+
+    try std.testing.expectEqual(@as(usize, 2), manager.count());
+    try std.testing.expect(manager.terminate(second_id));
+    try std.testing.expectEqual(@as(usize, 1), manager.count());
+
+    const snapshot = try manager.snapshotJson(std.testing.allocator);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, first_id) != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, second_id) == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"kind\":\"split\"") == null);
+}
