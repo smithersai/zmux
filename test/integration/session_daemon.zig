@@ -11,7 +11,28 @@ fn tempSocketPath(allocator: std.mem.Allocator) ![]u8 {
     var seed: [8]u8 = undefined;
     std.crypto.random.bytes(&seed);
     const nonce = std.mem.readInt(u64, &seed, .little);
-    return std.fmt.allocPrint(allocator, "/tmp/zmx-test-{x:0>16}.sock", .{nonce});
+    const root = switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos, .visionos => "/private/tmp",
+        else => "/tmp",
+    };
+    const path = try std.fmt.allocPrint(allocator, "{s}/zmx-test-{x:0>16}.sock", .{ root, nonce });
+    errdefer allocator.free(path);
+    try requireUnixSocketBind(path);
+    return path;
+}
+
+fn requireUnixSocketBind(path: []const u8) !void {
+    const address = try std.net.Address.initUnix(path);
+    const listener = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    defer posix.close(listener);
+    posix.bind(listener, &address.any, address.getOsSockLen()) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    std.fs.deleteFileAbsolute(path) catch {};
 }
 
 fn connectClient(path: []const u8) !posix.fd_t {
@@ -34,6 +55,38 @@ fn readLineAlloc(allocator: std.mem.Allocator, fd: posix.fd_t, max_len: usize) !
     errdefer out.deinit(allocator);
     var byte: [1]u8 = undefined;
     while (true) {
+        const n = try posix.read(fd, &byte);
+        if (n == 0) {
+            if (out.items.len == 0) return error.EndOfStream;
+            return try out.toOwnedSlice(allocator);
+        }
+        if (byte[0] == '\n') return try out.toOwnedSlice(allocator);
+        try out.append(allocator, byte[0]);
+        if (out.items.len > max_len) return error.ResponseTooLarge;
+    }
+}
+
+fn readLineAllocTimeout(allocator: std.mem.Allocator, fd: posix.fd_t, max_len: usize, timeout_ms: i64) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    const deadline = std.time.milliTimestamp() + timeout_ms;
+    var byte: [1]u8 = undefined;
+    while (true) {
+        const now = std.time.milliTimestamp();
+        if (now >= deadline) return error.ReadTimeout;
+        var fds = [_]posix.pollfd{.{
+            .fd = fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        const remaining: i32 = @intCast(@min(deadline - now, std.math.maxInt(i32)));
+        const ready = try posix.poll(&fds, remaining);
+        if (ready == 0) return error.ReadTimeout;
+        if ((fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and (fds[0].revents & posix.POLL.IN) == 0) {
+            return error.EndOfStream;
+        }
+        if ((fds[0].revents & posix.POLL.IN) == 0) continue;
+
         const n = try posix.read(fd, &byte);
         if (n == 0) {
             if (out.items.len == 0) return error.EndOfStream;
@@ -73,6 +126,23 @@ fn readRpcResponseLine(
 ) ![]u8 {
     while (true) {
         const line = try readLineAlloc(allocator, fd, max_len);
+        if (lineMatchesRpcId(allocator, line, expected_id)) return line;
+        allocator.free(line);
+    }
+}
+
+fn readRpcResponseLineTimeout(
+    allocator: std.mem.Allocator,
+    fd: posix.fd_t,
+    expected_id: i64,
+    max_len: usize,
+    timeout_ms: i64,
+) ![]u8 {
+    const deadline = std.time.milliTimestamp() + timeout_ms;
+    while (true) {
+        const now = std.time.milliTimestamp();
+        if (now >= deadline) return error.ReadTimeout;
+        const line = try readLineAllocTimeout(allocator, fd, max_len, deadline - now);
         if (lineMatchesRpcId(allocator, line, expected_id)) return line;
         allocator.free(line);
     }
@@ -150,6 +220,66 @@ fn waitForClientCount(
         std.Thread.sleep(10 * std.time.ns_per_ms);
     }
     return error.ClientCountTimeout;
+}
+
+fn waitForProcessGone(pid: posix.pid_t, timeout_ms: i64) !void {
+    const deadline = std.time.milliTimestamp() + timeout_ms;
+    while (std.time.milliTimestamp() < deadline) {
+        if (std.c.kill(pid, 0) != 0) return;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    return error.ProcessStillExists;
+}
+
+fn waitForSessionExited(
+    allocator: std.mem.Allocator,
+    fd: posix.fd_t,
+    pane_id: []const u8,
+    expected_exit_code: i64,
+    timeout_ms: i64,
+) !void {
+    const deadline = std.time.milliTimestamp() + timeout_ms;
+    while (std.time.milliTimestamp() < deadline) {
+        const line = try readLineAllocTimeout(allocator, fd, 1024 * 1024, deadline - std.time.milliTimestamp());
+        defer allocator.free(line);
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+        const method = parsed.value.object.get("method") orelse continue;
+        if (method != .string or !std.mem.eql(u8, method.string, "session_exited")) continue;
+        const params = parsed.value.object.get("params") orelse continue;
+        if (params != .object) continue;
+        const session_id = params.object.get("session_id") orelse continue;
+        if (session_id != .string or !std.mem.eql(u8, session_id.string, pane_id)) continue;
+        const exit_code = params.object.get("exit_code") orelse return error.MissingExitCode;
+        try std.testing.expect(exit_code == .integer);
+        try std.testing.expectEqual(expected_exit_code, exit_code.integer);
+        return;
+    }
+    return error.SessionExitedTimeout;
+}
+
+fn waitForPaneOutput(
+    allocator: std.mem.Allocator,
+    fd: posix.fd_t,
+    pane_id: []const u8,
+    timeout_ms: i64,
+) !void {
+    const deadline = std.time.milliTimestamp() + timeout_ms;
+    while (std.time.milliTimestamp() < deadline) {
+        const line = try readLineAllocTimeout(allocator, fd, 1024 * 1024, deadline - std.time.milliTimestamp());
+        defer allocator.free(line);
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+        const method = parsed.value.object.get("method") orelse continue;
+        if (method != .string or !std.mem.eql(u8, method.string, "pane_output")) continue;
+        const params = parsed.value.object.get("params") orelse continue;
+        if (params != .object) continue;
+        const got = params.object.get("pane_id") orelse continue;
+        if (got == .string and std.mem.eql(u8, got.string, pane_id)) return;
+    }
+    return error.PaneOutputTimeout;
 }
 
 const RunServerCtx = struct {
@@ -247,6 +377,224 @@ test "daemon JSON-RPC errors are framed and the connection remains usable" {
     server.deinit();
     server_stopped = true;
 
+    try std.testing.expect(ctx.run_error == null);
+}
+
+test "natural child exit is reaped and broadcasts session_exited" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const socket_path = try tempSocketPath(allocator);
+    defer allocator.free(socket_path);
+    std.fs.deleteFileAbsolute(socket_path) catch {};
+    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+
+    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var ctx = RunServerCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
+    var server_stopped = false;
+    errdefer {
+        if (!server_stopped) {
+            server.running.store(false, .seq_cst);
+            thread.join();
+            server.deinit();
+        }
+    }
+
+    try waitForSocket(socket_path, 2_000);
+
+    const observer = try connectClient(socket_path);
+    defer posix.close(observer);
+
+    var pane_id: []u8 = &.{};
+    defer if (pane_id.len > 0) allocator.free(pane_id);
+    var child_pid: posix.pid_t = 0;
+    {
+        const line = try rpcLine(
+            allocator,
+            socket_path,
+            "{\"id\":1,\"method\":\"session.create\",\"params\":" ++
+                "{\"shell\":\"/bin/sh\",\"command\":\"exit 7\",\"rows\":24,\"cols\":80}}\n",
+            64 * 1024,
+        );
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
+        pane_id = try allocator.dupe(u8, (result_val.object.get("id") orelse return error.MissingSessionId).string);
+        child_pid = @intCast((result_val.object.get("pid") orelse return error.MissingPid).integer);
+    }
+
+    try waitForSessionExited(allocator, observer, pane_id, 7, 4_000);
+    try waitForProcessGone(child_pid, 1_000);
+
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":2,\"method\":\"session.info\",\"params\":{{\"sessionId\":\"{s}\"}}}}\n",
+            .{pane_id},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
+        const exit_status = result_val.object.get("exitStatus") orelse return error.MissingExitStatus;
+        try std.testing.expect(exit_status == .integer);
+        try std.testing.expectEqual(@as(i64, 7), exit_status.integer);
+    }
+
+    {
+        const line = try rpcLine(allocator, socket_path, "{\"id\":3,\"method\":\"daemon.shutdown\",\"params\":{}}\n", 64 * 1024);
+        defer allocator.free(line);
+    }
+
+    thread.join();
+    server.deinit();
+    server_stopped = true;
+    try std.testing.expect(ctx.run_error == null);
+}
+
+test "server shutdown waits for an idle client handler to exit" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const socket_path = try tempSocketPath(allocator);
+    defer allocator.free(socket_path);
+    std.fs.deleteFileAbsolute(socket_path) catch {};
+    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+
+    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var ctx = RunServerCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
+    var server_stopped = false;
+    errdefer {
+        if (!server_stopped) {
+            server.running.store(false, .seq_cst);
+            thread.join();
+            server.deinit();
+        }
+    }
+
+    try waitForSocket(socket_path, 2_000);
+
+    const idle = try connectClient(socket_path);
+    defer posix.close(idle);
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+
+    {
+        const line = try rpcLine(allocator, socket_path, "{\"id\":1,\"method\":\"daemon.shutdown\",\"params\":{}}\n", 64 * 1024);
+        defer allocator.free(line);
+    }
+
+    thread.join();
+    try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), server.active_writer_threads.load(.seq_cst));
+    server.deinit();
+    server_stopped = true;
+    try std.testing.expect(ctx.run_error == null);
+}
+
+test "stalled client does not block live pane output or active termination" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const socket_path = try tempSocketPath(allocator);
+    defer allocator.free(socket_path);
+    std.fs.deleteFileAbsolute(socket_path) catch {};
+    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+
+    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var ctx = RunServerCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
+    var server_stopped = false;
+    errdefer {
+        if (!server_stopped) {
+            server.running.store(false, .seq_cst);
+            thread.join();
+            server.deinit();
+        }
+    }
+
+    try waitForSocket(socket_path, 2_000);
+
+    const stalled = try connectClient(socket_path);
+    defer posix.close(stalled);
+
+    var flood_id: []u8 = &.{};
+    defer if (flood_id.len > 0) allocator.free(flood_id);
+    {
+        const line = try rpcLine(
+            allocator,
+            socket_path,
+            "{\"id\":1,\"method\":\"session.create\",\"params\":" ++
+                "{\"shell\":\"/bin/sh\",\"command\":\"yes ZMUX_FLOOD\",\"rows\":24,\"cols\":80}}\n",
+            64 * 1024,
+        );
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
+        flood_id = try allocator.dupe(u8, (result_val.object.get("id") orelse return error.MissingSessionId).string);
+    }
+
+    std.Thread.sleep(2_000 * std.time.ns_per_ms);
+
+    const live = try connectClient(socket_path);
+    defer posix.close(live);
+
+    var victim_id: []u8 = &.{};
+    defer if (victim_id.len > 0) allocator.free(victim_id);
+    {
+        const line = try rpcLine(
+            allocator,
+            socket_path,
+            "{\"id\":2,\"method\":\"session.create\",\"params\":" ++
+                "{\"shell\":\"/bin/sh\",\"command\":\"i=0; while [ $i -lt 20 ]; do echo VICTIM_$i; i=$((i+1)); sleep 0.05; done; sleep 2\",\"rows\":24,\"cols\":80}}\n",
+            64 * 1024,
+        );
+        defer allocator.free(line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
+        victim_id = try allocator.dupe(u8, (result_val.object.get("id") orelse return error.MissingSessionId).string);
+    }
+
+    try waitForPaneOutput(allocator, live, victim_id, 4_000);
+
+    {
+        const client = try connectClient(socket_path);
+        defer posix.close(client);
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":3,\"method\":\"session.terminate\",\"params\":{{\"sessionId\":\"{s}\"}}}}\n",
+            .{flood_id},
+        );
+        defer allocator.free(req);
+        try writeAll(client, req);
+        const line = try readRpcResponseLineTimeout(allocator, client, 3, 64 * 1024, 4_000);
+        defer allocator.free(line);
+    }
+
+    {
+        const req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":4,\"method\":\"session.terminate\",\"params\":{{\"sessionId\":\"{s}\"}}}}\n",
+            .{victim_id},
+        );
+        defer allocator.free(req);
+        const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
+        defer allocator.free(line);
+    }
+    {
+        const line = try rpcLine(allocator, socket_path, "{\"id\":5,\"method\":\"daemon.shutdown\",\"params\":{}}\n", 64 * 1024);
+        defer allocator.free(line);
+    }
+
+    thread.join();
+    server.deinit();
+    server_stopped = true;
     try std.testing.expect(ctx.run_error == null);
 }
 

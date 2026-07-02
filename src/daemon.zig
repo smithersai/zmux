@@ -218,14 +218,21 @@ test "socketAcceptsConnection detects a listening unix socket" {
     var seed: [8]u8 = undefined;
     std.crypto.random.bytes(&seed);
     const nonce = std.mem.readInt(u64, &seed, .little);
-    const path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/zmx-live-{x:0>16}.sock", .{nonce});
+    const root = switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos, .visionos => "/private/tmp",
+        else => "/tmp",
+    };
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/zmx-live-{x:0>16}.sock", .{ root, nonce });
     defer std.testing.allocator.free(path);
     defer std.fs.deleteFileAbsolute(path) catch {};
 
     const address = try std.net.Address.initUnix(path);
     const listener = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
     defer std.posix.close(listener);
-    try std.posix.bind(listener, &address.any, address.getOsSockLen());
+    std.posix.bind(listener, &address.any, address.getOsSockLen()) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
     try std.posix.listen(listener, 1);
 
     try std.testing.expect(socketAcceptsConnection(path));

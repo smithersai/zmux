@@ -150,10 +150,12 @@ pub const NativeSession = struct {
     fn destroyInternal(self: *NativeSession) void {
         self.reader_stop.store(true, .seq_cst);
         if (self.state() != .terminated) {
-            // Use the terminate method which properly waits and reaps
             self.terminate();
+        } else {
+            _ = self.reapExitedBriefly();
         }
         if (self.reader_thread) |thread| thread.join();
+        self.clearEventSink();
         self.handle.close();
         self.scrollback.deinit();
         self.allocator.free(self.id);
@@ -198,6 +200,20 @@ pub const NativeSession = struct {
         }
 
         self.markTerminated(status);
+    }
+
+    pub fn stopForOwnerRelease(self: *NativeSession) void {
+        if (self.state() != .terminated) {
+            self.terminate();
+        } else {
+            _ = self.reapExitedBriefly();
+        }
+    }
+
+    pub fn reapExited(self: *NativeSession) ?u32 {
+        const status = self.handle.reapExited() orelse return null;
+        self.markTerminated(status);
+        return status;
     }
 
     pub fn send(self: *NativeSession, text: []const u8, enter: bool) !void {
@@ -275,12 +291,21 @@ pub const NativeSession = struct {
             if (self.state() == .terminated) return;
             self.pollForegroundChange() catch {};
 
+            const readable = self.handle.pollReadable(100) catch {
+                const status = self.reapExitedBriefly();
+                self.markTerminated(status);
+                return;
+            };
+            if (!readable) continue;
+
             const n = self.handle.read(&read_buf) catch {
-                self.markTerminated(null);
+                const status = self.reapExitedBriefly();
+                self.markTerminated(status);
                 return;
             };
             if (n == 0) {
-                self.markTerminated(null);
+                const status = self.reapExitedBriefly();
+                self.markTerminated(status);
                 return;
             }
             self.mutex.lock();
@@ -321,12 +346,35 @@ pub const NativeSession = struct {
     }
 
     fn emitEvent(self: *NativeSession, event: Event) void {
-        const sink = self.event_sink orelse return;
-        sink.emit(sink.context, event);
+        self.mutex.lock();
+        const sink = self.event_sink;
+        self.mutex.unlock();
+        const active = sink orelse return;
+        active.emit(active.context, event);
+    }
+
+    pub fn setEventSink(self: *NativeSession, sink: ?EventSink) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.event_sink = sink;
+    }
+
+    pub fn clearEventSink(self: *NativeSession) void {
+        self.setEventSink(null);
+    }
+
+    fn reapExitedBriefly(self: *NativeSession) ?u32 {
+        var attempts: usize = 0;
+        while (attempts < 50) : (attempts += 1) {
+            if (self.reapExited()) |status| return status;
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+        return null;
     }
 
     fn onPtyExited(context: *anyopaque, pid: std.posix.pid_t, status: u32) void {
         const self: *NativeSession = @ptrCast(@alignCast(context));
+        self.markTerminated(status);
         self.emitEvent(.{ .session_exited = .{
             .session_id = self.id,
             .pid = pid,
@@ -339,9 +387,17 @@ pub const NativeSession = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.state_value = .terminated;
-        if (self.exit_status == null) self.exit_status = status;
+        if (self.exit_status == null) {
+            self.exit_status = if (status) |value| decodedExitStatus(value) else null;
+        }
     }
 };
+
+fn decodedExitStatus(status: u32) u32 {
+    if (std.posix.W.IFEXITED(status)) return std.posix.W.EXITSTATUS(status);
+    if (std.posix.W.IFSIGNALED(status)) return std.posix.W.TERMSIG(status);
+    return status;
+}
 
 fn keySequence(key: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, key, "Enter")) return "\r";
@@ -365,4 +421,8 @@ test "native session key names map to terminal sequences" {
     try std.testing.expectEqualStrings("\x1b[A", keySequence("ArrowUp").?);
     try std.testing.expectEqualStrings("\r", keySequence("Enter").?);
     try std.testing.expect(keySequence("Unknown") == null);
+}
+
+test "decoded exit status unwraps waitpid status words" {
+    try std.testing.expectEqual(@as(u32, 7), decodedExitStatus(7 << 8));
 }

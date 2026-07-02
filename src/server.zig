@@ -19,15 +19,22 @@ const max_request_bytes = 1024 * 1024;
 /// the attach payload bounded. When scrollback is larger, only the tail
 /// (most recent bytes) is replayed.
 const attach_replay_max_bytes: usize = 256 * 1024;
+const broadcast_queue_max_bytes: usize = 1024 * 1024;
+const socket_send_timeout_seconds: isize = 2;
 
 const ClientConnection = struct {
     allocator: Allocator,
     fd: posix.fd_t,
+    server: ?*Server = null,
     reader: LineReader = .{},
     write_mutex: std.Thread.Mutex = .{},
+    queue_mutex: std.Thread.Mutex = .{},
+    queue_condition: std.Thread.Condition = .{},
     attachment_mutex: std.Thread.Mutex = .{},
     ref_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
     closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    pending_writes: std.ArrayList([]u8) = .empty,
+    queued_bytes: usize = 0,
     attached_mux_clients: std.ArrayList([]u8) = .empty,
 
     fn create(allocator: Allocator, fd: posix.fd_t) !*ClientConnection {
@@ -37,6 +44,19 @@ const ClientConnection = struct {
             .fd = fd,
         };
         return connection;
+    }
+
+    fn startBroadcastWriter(self: *ClientConnection, server: *Server) !void {
+        self.server = server;
+        _ = self.retain();
+        server.addActiveWriter();
+        const thread = std.Thread.spawn(.{}, ClientConnection.writerThread, .{self}) catch |err| {
+            server.finishActiveWriter();
+            self.server = null;
+            self.release();
+            return err;
+        };
+        thread.detach();
     }
 
     fn retain(self: *ClientConnection) *ClientConnection {
@@ -56,6 +76,14 @@ const ClientConnection = struct {
             var mux_clients = self.takeMuxClients();
             for (mux_clients.items) |client_id| allocator.free(client_id);
             mux_clients.deinit(allocator);
+            self.queue_mutex.lock();
+            var pending = self.pending_writes;
+            self.pending_writes = .empty;
+            self.queued_bytes = 0;
+            self.queue_mutex.unlock();
+            for (pending.items) |owned| allocator.free(owned);
+            pending.deinit(allocator);
+            posix.close(self.fd);
             allocator.destroy(self);
         }
     }
@@ -66,7 +94,10 @@ const ClientConnection = struct {
 
     fn close(self: *ClientConnection) void {
         if (!self.closed.swap(true, .seq_cst)) {
-            posix.close(self.fd);
+            _ = std.c.shutdown(self.fd, @intCast(posix.SHUT.RDWR));
+            self.queue_mutex.lock();
+            self.queue_condition.broadcast();
+            self.queue_mutex.unlock();
         }
     }
 
@@ -79,6 +110,62 @@ const ClientConnection = struct {
             self.close();
             return err;
         };
+    }
+
+    fn enqueueBroadcast(self: *ClientConnection, bytes: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, bytes);
+        errdefer self.allocator.free(owned);
+
+        self.queue_mutex.lock();
+        if (self.isClosed()) {
+            self.queue_mutex.unlock();
+            return error.ConnectionClosed;
+        }
+        if (owned.len > broadcast_queue_max_bytes or self.queued_bytes > broadcast_queue_max_bytes - owned.len) {
+            self.queue_mutex.unlock();
+            self.close();
+            return error.ConnectionBacklogged;
+        }
+
+        self.pending_writes.append(self.allocator, owned) catch |err| {
+            self.queue_mutex.unlock();
+            return err;
+        };
+        self.queued_bytes += owned.len;
+        self.queue_condition.signal();
+        self.queue_mutex.unlock();
+    }
+
+    fn writerThread(self: *ClientConnection) void {
+        defer {
+            // Release before signalling the server: when this thread holds the
+            // last reference, release() frees the connection and its queued
+            // payloads, and waitForWorkers must not let deinit (and the test
+            // runner's leak check) proceed until that has happened. Copy the
+            // server pointer out first — `self` is invalid after release().
+            const server = self.server;
+            self.release();
+            if (server) |active| active.finishActiveWriter();
+        }
+
+        while (self.takeQueuedWrite()) |owned| {
+            defer self.allocator.free(owned);
+            self.write(owned) catch return;
+        }
+    }
+
+    fn takeQueuedWrite(self: *ClientConnection) ?[]u8 {
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
+
+        while (self.pending_writes.items.len == 0 and !self.isClosed()) {
+            self.queue_condition.wait(&self.queue_mutex);
+        }
+
+        if (self.pending_writes.items.len == 0) return null;
+        const owned = self.pending_writes.orderedRemove(0);
+        self.queued_bytes -= owned.len;
+        return owned;
     }
 
     fn trackMuxClient(self: *ClientConnection, client_id: []const u8) !void {
@@ -130,6 +217,9 @@ pub const Server = struct {
     connections: std.ArrayList(*ClientConnection) = .empty,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     active_connections: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    active_writer_threads: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    active_mutex: std.Thread.Mutex = .{},
+    active_condition: std.Thread.Condition = .{},
     last_activity_seconds: std.atomic.Value(i64),
     idle_timeout_seconds: i64,
     shutdown_probe: ?ShutdownProbe = null,
@@ -168,6 +258,7 @@ pub const Server = struct {
         self.unlinkSocketPathIfOwned();
         posix.close(self.listener_fd);
         self.closeConnections();
+        self.waitForWorkers();
         self.manager.event_sink = null;
         self.manager.deinit();
         self.connections.deinit(self.allocator);
@@ -187,6 +278,7 @@ pub const Server = struct {
             .emit = Server.handleNativeEvent,
         };
         while (!self.shouldStop()) {
+            self.manager.reapExitedPanes();
             if (self.shouldExitForIdle()) break;
 
             var fds = [_]posix.pollfd{.{
@@ -203,6 +295,7 @@ pub const Server = struct {
                 posix.close(client_fd);
                 continue;
             }
+            setSocketSendTimeout(client_fd);
             self.touch();
             _ = self.active_connections.fetchAdd(1, .seq_cst);
             const thread = std.Thread.spawn(.{}, Server.handleClientThread, .{ self, client_fd }) catch {
@@ -213,10 +306,9 @@ pub const Server = struct {
             thread.detach();
         }
 
-        var spins: usize = 0;
-        while (self.active_connections.load(.seq_cst) > 0 and spins < 100) : (spins += 1) {
-            std.Thread.sleep(10 * std.time.ns_per_ms);
-        }
+        self.manager.reapExitedPanes();
+        self.closeConnections();
+        self.waitForWorkers();
     }
 
     fn shouldExitForIdle(self: *Server) bool {
@@ -237,7 +329,7 @@ pub const Server = struct {
     }
 
     fn handleClientThread(self: *Server, client_fd: posix.fd_t) void {
-        defer _ = self.active_connections.fetchSub(1, .seq_cst);
+        defer self.finishActiveConnection();
 
         const connection = ClientConnection.create(self.allocator, client_fd) catch {
             posix.close(client_fd);
@@ -245,6 +337,8 @@ pub const Server = struct {
         };
         defer connection.release();
         defer connection.close();
+
+        connection.startBroadcastWriter(self) catch return;
 
         self.registerConnection(connection);
         defer self.unregisterConnection(connection);
@@ -334,6 +428,7 @@ pub const Server = struct {
         defer create_args.deinit();
 
         const created = try self.manager.create(create_args.opts);
+        defer created.release();
 
         const info = try created.infoJson(self.allocator);
         defer self.allocator.free(info);
@@ -428,11 +523,12 @@ pub const Server = struct {
         const pane_id = paneIdParam(req.params()) orelse {
             return self.writeError(connection, req.id_json, protocol.ErrorCode.invalid_params, "paneId is required");
         };
-        const client = try self.manager.attachClient(
+        var client = try self.manager.attachClient(
             pane_id,
             intParam(u16, req.params(), "rows", 24),
             intParam(u16, req.params(), "cols", 80),
         );
+        defer client.deinit(self.allocator);
         errdefer _ = self.manager.detachClient(client.id);
         try connection.trackMuxClient(client.id);
         errdefer _ = connection.untrackMuxClient(client.id);
@@ -694,6 +790,34 @@ pub const Server = struct {
         }
     }
 
+    fn addActiveWriter(self: *Server) void {
+        self.active_mutex.lock();
+        _ = self.active_writer_threads.fetchAdd(1, .seq_cst);
+        self.active_mutex.unlock();
+    }
+
+    fn finishActiveWriter(self: *Server) void {
+        self.active_mutex.lock();
+        _ = self.active_writer_threads.fetchSub(1, .seq_cst);
+        self.active_condition.broadcast();
+        self.active_mutex.unlock();
+    }
+
+    fn finishActiveConnection(self: *Server) void {
+        self.active_mutex.lock();
+        _ = self.active_connections.fetchSub(1, .seq_cst);
+        self.active_condition.broadcast();
+        self.active_mutex.unlock();
+    }
+
+    fn waitForWorkers(self: *Server) void {
+        self.active_mutex.lock();
+        defer self.active_mutex.unlock();
+        while (self.active_connections.load(.seq_cst) > 0 or self.active_writer_threads.load(.seq_cst) > 0) {
+            self.active_condition.wait(&self.active_mutex);
+        }
+    }
+
     fn broadcast(self: *Server, payload: []const u8) !void {
         self.mutex.lock();
         const snapshot = self.allocator.alloc(*ClientConnection, self.connections.items.len) catch |err| {
@@ -708,7 +832,7 @@ pub const Server = struct {
 
         for (snapshot) |connection| {
             defer connection.release();
-            connection.write(payload) catch {
+            connection.enqueueBroadcast(payload) catch {
                 self.unregisterConnection(connection);
             };
         }
@@ -802,7 +926,30 @@ fn setSocketPermissions(allocator: Allocator, socket_path: []const u8) !void {
 fn writeAll(fd: posix.fd_t, bytes: []const u8) !void {
     var offset: usize = 0;
     while (offset < bytes.len) {
-        offset += try posix.write(fd, bytes[offset..]);
+        const n = try posix.write(fd, bytes[offset..]);
+        if (n == 0) return error.WriteZero;
+        offset += n;
+    }
+}
+
+fn setSocketSendTimeout(fd: posix.fd_t) void {
+    switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos, .visionos => return,
+        else => {},
+    }
+
+    var timeout: std.c.timeval = .{
+        .sec = @intCast(socket_send_timeout_seconds),
+        .usec = 0,
+    };
+    if (std.c.setsockopt(
+        fd,
+        std.c.SOL.SOCKET,
+        std.c.SO.SNDTIMEO,
+        &timeout,
+        @intCast(@sizeOf(std.c.timeval)),
+    ) != 0) {
+        _ = std.c._errno().*;
     }
 }
 
@@ -1093,6 +1240,7 @@ test "existing socket parent permissions are left unchanged" {
 
     const socket_path = try std.fs.path.join(allocator, &.{ parent, "sessions.sock" });
     defer allocator.free(socket_path);
+    try requireUnixSocketBind(socket_path);
 
     var server = try Server.init(allocator, socket_path, 0);
     defer server.deinit();
@@ -1122,6 +1270,7 @@ test "server deinit does not unlink a replacement socket" {
     const socket_path = try tempPath(allocator, "zmx-replaced-socket");
     defer allocator.free(socket_path);
     defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    try requireUnixSocketBind(socket_path);
 
     var server = try Server.init(allocator, socket_path, 0);
     try std.testing.expect(socketExists(socket_path));
@@ -1141,6 +1290,7 @@ test "server deinit unlinks its owned socket" {
     const socket_path = try tempPath(allocator, "zmx-owned-socket");
     defer allocator.free(socket_path);
     defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    try requireUnixSocketBind(socket_path);
 
     var server = try Server.init(allocator, socket_path, 0);
     try std.testing.expect(socketExists(socket_path));
@@ -1153,12 +1303,14 @@ test "server connection reader keeps leftover request bytes" {
     if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
 
     const fds = try std.posix.pipe();
-    defer posix.close(fds[0]);
+    var read_fd_owned = true;
+    defer if (read_fd_owned) posix.close(fds[0]);
     defer posix.close(fds[1]);
 
     _ = try posix.write(fds[1], "{\"id\":1}\n{\"id\":2}\n");
 
     var connection = try ClientConnection.create(std.testing.allocator, fds[0]);
+    read_fd_owned = false;
     defer connection.release();
 
     const first = (try connection.reader.readLineAllocMaybe(std.testing.allocator, fds[0], 64)).?;
@@ -1170,11 +1322,59 @@ test "server connection reader keeps leftover request bytes" {
     try std.testing.expectEqualStrings("{\"id\":2}\n", second);
 }
 
+test "client connection close shuts down without releasing the fd number" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    var sockets: [2]std.c.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &sockets) != 0) return error.SkipZigTest;
+    defer posix.close(sockets[1]);
+
+    var connection = try ClientConnection.create(std.testing.allocator, sockets[0]);
+    const original_fd = connection.fd;
+    connection.close();
+
+    const devnull = try posix.open("/dev/null", .{ .ACCMODE = .RDONLY }, 0);
+    defer posix.close(devnull);
+    try std.testing.expect(devnull != original_fd);
+
+    connection.release();
+}
+
+test "server idle timeout ignores terminated panes" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const socket_path = try tempPath(allocator, "zmx-idle-terminated");
+    defer allocator.free(socket_path);
+    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    try requireUnixSocketBind(socket_path);
+
+    var server = try Server.init(allocator, socket_path, 1);
+    defer server.deinit();
+
+    _ = try server.manager.createSessionPane(.{ .shell = "/bin/sh", .command = "true" });
+
+    const deadline = std.time.milliTimestamp() + 2_000;
+    while (std.time.milliTimestamp() < deadline) {
+        server.manager.reapExitedPanes();
+        if (server.manager.count() == 0) break;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(usize, 0), server.manager.count());
+
+    server.last_activity_seconds.store(std.time.timestamp() - 2, .seq_cst);
+    try std.testing.expect(server.shouldExitForIdle());
+}
+
 fn tempPath(allocator: Allocator, prefix: []const u8) ![]u8 {
     var seed: [8]u8 = undefined;
     std.crypto.random.bytes(&seed);
     const nonce = std.mem.readInt(u64, &seed, .little);
-    return std.fmt.allocPrint(allocator, "/tmp/{s}-{x:0>16}", .{ prefix, nonce });
+    const root = switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos, .visionos => "/private/tmp",
+        else => "/tmp",
+    };
+    return std.fmt.allocPrint(allocator, "{s}/{s}-{x:0>16}", .{ root, prefix, nonce });
 }
 
 fn envContains(entries: []const []const u8, expected: []const u8) bool {
@@ -1191,6 +1391,15 @@ fn bindRawUnixListener(path: []const u8) !posix.fd_t {
     try posix.bind(listener, &address.any, address.getOsSockLen());
     try posix.listen(listener, 1);
     return listener;
+}
+
+fn requireUnixSocketBind(path: []const u8) !void {
+    const listener = bindRawUnixListener(path) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    posix.close(listener);
+    std.fs.deleteFileAbsolute(path) catch {};
 }
 
 fn socketExists(path: []const u8) bool {

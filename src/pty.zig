@@ -116,11 +116,17 @@ pub const Pty = struct {
     }
 
     pub fn terminate(self: *const Pty) void {
-        _ = std.c.kill(self.child_pid, posix.SIG.TERM);
+        const pgid: posix.pid_t = -self.child_pid;
+        if (std.c.kill(pgid, posix.SIG.TERM) != 0) {
+            _ = std.c.kill(self.child_pid, posix.SIG.TERM);
+        }
     }
 
     pub fn kill(self: *const Pty) void {
-        _ = std.c.kill(self.child_pid, posix.SIG.KILL);
+        const pgid: posix.pid_t = -self.child_pid;
+        if (std.c.kill(pgid, posix.SIG.KILL) != 0) {
+            _ = std.c.kill(self.child_pid, posix.SIG.KILL);
+        }
     }
 
     pub fn pollReadable(self: *const Pty, timeout_ms: i32) !bool {

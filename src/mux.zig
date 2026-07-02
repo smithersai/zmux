@@ -152,6 +152,36 @@ pub const LayoutNode = union(enum) {
         }
     }
 
+    pub fn replaceLeafWithSplitOwned(
+        self: *LayoutNode,
+        allocator: Allocator,
+        target_pane_id: []const u8,
+        axis: Axis,
+        split_id: []u8,
+        first: *LayoutNode,
+        second: *LayoutNode,
+    ) bool {
+        switch (self.*) {
+            .leaf => |existing| {
+                if (!std.mem.eql(u8, existing, target_pane_id)) return false;
+                allocator.free(existing);
+                self.* = .{ .split = .{
+                    .id = split_id,
+                    .axis = axis,
+                    .first = first,
+                    .second = second,
+                } };
+                return true;
+            },
+            .split => |split| {
+                if (split.first.replaceLeafWithSplitOwned(allocator, target_pane_id, axis, split_id, first, second)) {
+                    return true;
+                }
+                return split.second.replaceLeafWithSplitOwned(allocator, target_pane_id, axis, split_id, first, second);
+            },
+        }
+    }
+
     pub fn removeLeaf(self: *LayoutNode, allocator: Allocator, pane_id: []const u8) bool {
         switch (self.*) {
             .leaf => |existing| return std.mem.eql(u8, existing, pane_id),
@@ -219,7 +249,7 @@ pub const Pane = struct {
     alerts: AlertState = .{},
 
     pub fn deinit(self: *Pane, allocator: Allocator) void {
-        self.native.event_sink = null;
+        self.native.stopForOwnerRelease();
         self.native.destroy();
         self.spawn.deinit(allocator);
         allocator.free(self.id);
@@ -288,6 +318,42 @@ pub const Client = struct {
     }
 };
 
+pub const ClientSnapshot = struct {
+    id: []u8,
+    session_id: []u8,
+    window_id: []u8,
+    pane_id: []u8,
+    rows: u16,
+    cols: u16,
+
+    pub fn fromClient(allocator: Allocator, client: *const Client) !ClientSnapshot {
+        const id = try allocator.dupe(u8, client.id);
+        errdefer allocator.free(id);
+        const session_id = try allocator.dupe(u8, client.session_id);
+        errdefer allocator.free(session_id);
+        const window_id = try allocator.dupe(u8, client.window_id);
+        errdefer allocator.free(window_id);
+        const pane_id = try allocator.dupe(u8, client.pane_id);
+        errdefer allocator.free(pane_id);
+        return .{
+            .id = id,
+            .session_id = session_id,
+            .window_id = window_id,
+            .pane_id = pane_id,
+            .rows = client.rows,
+            .cols = client.cols,
+        };
+    }
+
+    pub fn deinit(self: *ClientSnapshot, allocator: Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.session_id);
+        allocator.free(self.window_id);
+        allocator.free(self.pane_id);
+        self.* = undefined;
+    }
+};
+
 pub const KeyBinding = struct {
     table: []u8,
     key: []u8,
@@ -298,6 +364,18 @@ pub const KeyBinding = struct {
         allocator.free(self.table);
         allocator.free(self.key);
         allocator.free(self.command);
+    }
+};
+
+const RemovedItems = struct {
+    session: ?*Session = null,
+    window: ?*Window = null,
+    pane: ?*Pane = null,
+
+    fn deinit(self: RemovedItems, allocator: Allocator) void {
+        if (self.pane) |pane| pane.deinit(allocator);
+        if (self.window) |window| window.deinit(allocator);
+        if (self.session) |session| session.deinit(allocator);
     }
 };
 
@@ -331,13 +409,19 @@ pub const Manager = struct {
         defer self.mutex.unlock();
         var total: usize = 0;
         for (self.sessions.items) |session| {
-            for (session.windows.items) |window| total += window.panes.items.len;
+            for (session.windows.items) |window| {
+                for (window.panes.items) |pane| {
+                    if (pane.native.state() != .terminated) total += 1;
+                }
+            }
         }
         return total;
     }
 
+    /// Returns a retained native session. Caller owns one release().
     pub fn create(self: *Manager, opts: CreateOptions) !*NativeSession {
         const pane = try self.createSessionPane(opts);
+        pane.native.retain();
         return pane.native;
     }
 
@@ -356,39 +440,49 @@ pub const Manager = struct {
         errdefer self.allocator.free(session_name);
         const window_name = try self.allocator.dupe(u8, opts.title orelse "1");
         errdefer self.allocator.free(window_name);
+        const session_active_window_id = try self.allocator.dupe(u8, window_id);
+        errdefer self.allocator.free(session_active_window_id);
 
         var session = try self.allocator.create(Session);
         errdefer self.allocator.destroy(session);
         session.* = .{
             .id = session_id,
             .name = session_name,
-            .active_window_id = try self.allocator.dupe(u8, window_id),
+            .active_window_id = session_active_window_id,
         };
-        errdefer self.allocator.free(session.active_window_id);
+
+        const window_owned_id = try self.allocator.dupe(u8, window_id);
+        errdefer self.allocator.free(window_owned_id);
+        const window_session_id = try self.allocator.dupe(u8, session_id);
+        errdefer self.allocator.free(window_session_id);
+        const window_active_pane_id = try self.allocator.dupe(u8, pane_id);
+        errdefer self.allocator.free(window_active_pane_id);
+        const window_layout = try LayoutNode.leafNode(self.allocator, pane_id);
+        errdefer {
+            window_layout.deinit(self.allocator);
+            self.allocator.destroy(window_layout);
+        }
 
         var window = try self.allocator.create(Window);
         errdefer self.allocator.destroy(window);
         window.* = .{
-            .id = try self.allocator.dupe(u8, window_id),
-            .session_id = try self.allocator.dupe(u8, session_id),
+            .id = window_owned_id,
+            .session_id = window_session_id,
             .index = 0,
             .name = window_name,
-            .active_pane_id = try self.allocator.dupe(u8, pane_id),
-            .layout = try LayoutNode.leafNode(self.allocator, pane_id),
+            .active_pane_id = window_active_pane_id,
+            .layout = window_layout,
         };
-        errdefer {
-            window.layout.deinit(self.allocator);
-            self.allocator.destroy(window.layout);
-            self.allocator.free(window.id);
-            self.allocator.free(window.session_id);
-            self.allocator.free(window.active_pane_id);
-        }
 
+        try window.panes.ensureUnusedCapacity(self.allocator, 1);
+        errdefer window.panes.deinit(self.allocator);
+        try session.windows.ensureUnusedCapacity(self.allocator, 1);
+        errdefer session.windows.deinit(self.allocator);
+        try self.sessions.ensureUnusedCapacity(self.allocator, 1);
         const pane = try self.createPaneLocked(session, window, pane_id, opts);
-        errdefer pane.deinit(self.allocator);
-        try window.panes.append(self.allocator, pane);
-        try session.windows.append(self.allocator, window);
-        try self.sessions.append(self.allocator, session);
+        window.panes.appendAssumeCapacity(pane);
+        session.windows.appendAssumeCapacity(window);
+        self.sessions.appendAssumeCapacity(session);
         return pane;
     }
 
@@ -404,32 +498,42 @@ pub const Manager = struct {
 
         const window_name = try self.allocator.dupe(u8, opts.title orelse "window");
         errdefer self.allocator.free(window_name);
+        const window_owned_id = try self.allocator.dupe(u8, window_id);
+        errdefer self.allocator.free(window_owned_id);
+        const window_session_id = try self.allocator.dupe(u8, session.id);
+        errdefer self.allocator.free(window_session_id);
+        const window_active_pane_id = try self.allocator.dupe(u8, pane_id);
+        errdefer self.allocator.free(window_active_pane_id);
+        const window_layout = try LayoutNode.leafNode(self.allocator, pane_id);
+        errdefer {
+            window_layout.deinit(self.allocator);
+            self.allocator.destroy(window_layout);
+        }
 
         const window = try self.allocator.create(Window);
         errdefer self.allocator.destroy(window);
         window.* = .{
-            .id = try self.allocator.dupe(u8, window_id),
-            .session_id = try self.allocator.dupe(u8, session.id),
+            .id = window_owned_id,
+            .session_id = window_session_id,
             .index = session.next_window_index + 1,
             .name = window_name,
-            .active_pane_id = try self.allocator.dupe(u8, pane_id),
-            .layout = try LayoutNode.leafNode(self.allocator, pane_id),
+            .active_pane_id = window_active_pane_id,
+            .layout = window_layout,
         };
-        errdefer {
-            window.layout.deinit(self.allocator);
-            self.allocator.destroy(window.layout);
-            self.allocator.free(window.id);
-            self.allocator.free(window.session_id);
-            self.allocator.free(window.active_pane_id);
-        }
+
+        try window.panes.ensureUnusedCapacity(self.allocator, 1);
+        errdefer window.panes.deinit(self.allocator);
+        try session.windows.ensureUnusedCapacity(self.allocator, 1);
+        const active_window_id = try self.allocator.dupe(u8, window.id);
+        errdefer self.allocator.free(active_window_id);
 
         const pane = try self.createPaneLocked(session, window, pane_id, opts);
-        errdefer pane.deinit(self.allocator);
-        try window.panes.append(self.allocator, pane);
-        try session.windows.append(self.allocator, window);
+        window.panes.appendAssumeCapacity(pane);
+        session.windows.appendAssumeCapacity(window);
 
         session.next_window_index += 1;
-        try replaceOwnedString(self.allocator, &session.active_window_id, window.id);
+        self.allocator.free(session.active_window_id);
+        session.active_window_id = active_window_id;
         return pane;
     }
 
@@ -441,15 +545,31 @@ pub const Manager = struct {
         const pane_id = try self.nextIdLocked("pane", &self.next_pane_id);
         defer self.allocator.free(pane_id);
         const split_id = try self.nextIdLocked("split", &self.next_split_id);
-        defer self.allocator.free(split_id);
+        var split_id_owned = true;
+        errdefer if (split_id_owned) self.allocator.free(split_id);
+
+        const first = try LayoutNode.leafNode(self.allocator, target_pane_id);
+        errdefer {
+            first.deinit(self.allocator);
+            self.allocator.destroy(first);
+        }
+        const second = try LayoutNode.leafNode(self.allocator, pane_id);
+        errdefer {
+            second.deinit(self.allocator);
+            self.allocator.destroy(second);
+        }
+        try found.window.panes.ensureUnusedCapacity(self.allocator, 1);
+        const active_pane_id = try self.allocator.dupe(u8, pane_id);
+        errdefer self.allocator.free(active_pane_id);
 
         const pane = try self.createPaneLocked(found.session, found.window, pane_id, opts);
-        errdefer pane.deinit(self.allocator);
-        if (!try found.window.layout.replaceLeafWithSplit(self.allocator, target_pane_id, axis, pane.id, split_id)) {
-            return error.LayoutTargetMissing;
+        if (!found.window.layout.replaceLeafWithSplitOwned(self.allocator, target_pane_id, axis, split_id, first, second)) {
+            unreachable;
         }
-        try found.window.panes.append(self.allocator, pane);
-        try replaceOwnedString(self.allocator, &found.window.active_pane_id, pane.id);
+        split_id_owned = false;
+        found.window.panes.appendAssumeCapacity(pane);
+        self.allocator.free(found.window.active_pane_id);
+        found.window.active_pane_id = active_pane_id;
         return pane;
     }
 
@@ -493,39 +613,109 @@ pub const Manager = struct {
     }
 
     pub fn respawnPane(self: *Manager, pane_id: []const u8) !*NativeSession {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        var old_native: *NativeSession = undefined;
+        var new_native: *NativeSession = undefined;
 
-        const pane = self.findPaneLocked(pane_id) orelse return error.PaneNotFound;
-        pane.native.event_sink = null;
-        pane.native.terminate();
-        pane.native.destroy();
-        pane.native = try NativeSession.create(self.allocator, pane.spawn.nativeOptions(pane.id, self.event_sink));
-        pane.alerts.exited = false;
-        pane.native.retain();
-        return pane.native;
+        self.mutex.lock();
+        {
+            const pane = self.findPaneLocked(pane_id) orelse {
+                self.mutex.unlock();
+                return error.PaneNotFound;
+            };
+            new_native = NativeSession.create(self.allocator, pane.spawn.nativeOptions(pane.id, self.event_sink)) catch |err| {
+                self.mutex.unlock();
+                return err;
+            };
+            old_native = pane.native;
+            pane.native = new_native;
+            pane.alerts.exited = false;
+            new_native.retain();
+        }
+        self.mutex.unlock();
+
+        old_native.stopForOwnerRelease();
+        old_native.destroy();
+        self.mutex.lock();
+        if (self.findPaneLocked(pane_id)) |pane| {
+            if (pane.native == new_native) pane.alerts.exited = false;
+        }
+        self.mutex.unlock();
+        return new_native;
     }
 
-    pub fn attachClient(self: *Manager, target_pane_id: []const u8, rows: u16, cols: u16) !*Client {
+    pub fn attachClient(self: *Manager, target_pane_id: []const u8, rows: u16, cols: u16) !ClientSnapshot {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         const found = self.resolveTargetPaneLocked(target_pane_id) orelse return error.PaneNotFound;
         const client_id = try self.nextIdLocked("client", &self.next_client_id);
-        errdefer self.allocator.free(client_id);
+        var client_id_owned = true;
+        errdefer if (client_id_owned) self.allocator.free(client_id);
+        const session_id = try self.allocator.dupe(u8, found.session.id);
+        var session_id_owned = true;
+        errdefer if (session_id_owned) self.allocator.free(session_id);
+        const window_id = try self.allocator.dupe(u8, found.window.id);
+        var window_id_owned = true;
+        errdefer if (window_id_owned) self.allocator.free(window_id);
+        const owned_pane_id = try self.allocator.dupe(u8, found.pane.id);
+        var pane_id_owned = true;
+        errdefer if (pane_id_owned) self.allocator.free(owned_pane_id);
 
         const client = try self.allocator.create(Client);
-        errdefer self.allocator.destroy(client);
+        var raw_client_owned = true;
+        errdefer if (raw_client_owned) self.allocator.destroy(client);
         client.* = .{
             .id = client_id,
-            .session_id = try self.allocator.dupe(u8, found.session.id),
-            .window_id = try self.allocator.dupe(u8, found.window.id),
-            .pane_id = try self.allocator.dupe(u8, found.pane.id),
+            .session_id = session_id,
+            .window_id = window_id,
+            .pane_id = owned_pane_id,
             .rows = rows,
             .cols = cols,
         };
+        client_id_owned = false;
+        session_id_owned = false;
+        window_id_owned = false;
+        pane_id_owned = false;
+        var client_owned = true;
+        errdefer if (client_owned) client.deinit(self.allocator);
+        raw_client_owned = false;
+
         try self.clients.append(self.allocator, client);
-        return client;
+        var appended = true;
+        client_owned = false;
+        errdefer if (appended) {
+            const removed = self.clients.swapRemove(self.clients.items.len - 1);
+            removed.deinit(self.allocator);
+        };
+
+        const snapshot = try ClientSnapshot.fromClient(self.allocator, client);
+        appended = false;
+        return snapshot;
+    }
+
+    pub fn reapExitedPanes(self: *Manager) void {
+        self.mutex.lock();
+        const natives = self.allocator.alloc(*NativeSession, self.paneSlotCountLocked()) catch {
+            self.mutex.unlock();
+            return;
+        };
+        var count_used: usize = 0;
+        for (self.sessions.items) |session| {
+            for (session.windows.items) |window| {
+                for (window.panes.items) |pane| {
+                    pane.native.retain();
+                    natives[count_used] = pane.native;
+                    count_used += 1;
+                }
+            }
+        }
+        self.mutex.unlock();
+        defer self.allocator.free(natives);
+
+        for (natives[0..count_used]) |native| {
+            _ = native.reapExited();
+            native.release();
+        }
     }
 
     pub fn paneScrollbackSnapshot(self: *Manager, allocator: Allocator, pane_id: []const u8) ![]u8 {
@@ -670,13 +860,18 @@ pub const Manager = struct {
 
     pub fn terminate(self: *Manager, id: []const u8) bool {
         self.mutex.lock();
-        defer self.mutex.unlock();
+        const found = self.findPaneWithParentsLocked(id) orelse {
+            self.mutex.unlock();
+            return false;
+        };
+        const removed = if (found.window.panes.items.len == 1 and found.session.windows.items.len == 1)
+            self.takeSessionLocked(found.session.id)
+        else
+            self.takePaneLocked(found.session, found.window, id);
+        self.mutex.unlock();
 
-        const found = self.findPaneWithParentsLocked(id) orelse return false;
-        if (found.window.panes.items.len == 1 and found.session.windows.items.len == 1) {
-            return self.removeSessionLocked(found.session.id);
-        }
-        return self.removePaneLocked(found.session, found.window, id);
+        removed.deinit(self.allocator);
+        return true;
     }
 
     pub fn terminateAll(self: *Manager) void {
@@ -763,13 +958,19 @@ pub const Manager = struct {
         errdefer self.allocator.destroy(pane);
         const title = try self.allocator.dupe(u8, opts.title orelse pane_id);
         errdefer self.allocator.free(title);
+        const owned_pane_id = try self.allocator.dupe(u8, pane_id);
+        errdefer self.allocator.free(owned_pane_id);
+        const owned_window_id = try self.allocator.dupe(u8, window.id);
+        errdefer self.allocator.free(owned_window_id);
+        const owned_session_id = try self.allocator.dupe(u8, session.id);
+        errdefer self.allocator.free(owned_session_id);
+
         const native = try NativeSession.create(self.allocator, spawn.nativeOptions(pane_id, self.event_sink));
-        errdefer native.destroy();
 
         pane.* = .{
-            .id = try self.allocator.dupe(u8, pane_id),
-            .window_id = try self.allocator.dupe(u8, window.id),
-            .session_id = try self.allocator.dupe(u8, session.id),
+            .id = owned_pane_id,
+            .window_id = owned_window_id,
+            .session_id = owned_session_id,
             .index = session.next_pane_index,
             .title = title,
             .spawn = spawn,
@@ -848,47 +1049,55 @@ pub const Manager = struct {
         return null;
     }
 
-    fn removeSessionLocked(self: *Manager, id: []const u8) bool {
+    fn paneSlotCountLocked(self: *Manager) usize {
+        var total: usize = 0;
+        for (self.sessions.items) |session| {
+            for (session.windows.items) |window| total += window.panes.items.len;
+        }
+        return total;
+    }
+
+    fn takeSessionLocked(self: *Manager, id: []const u8) RemovedItems {
         for (self.sessions.items, 0..) |session, index| {
             if (std.mem.eql(u8, session.id, id)) {
                 const removed = self.sessions.swapRemove(index);
-                removed.deinit(self.allocator);
-                return true;
+                return .{ .session = removed };
             }
         }
-        return false;
+        return .{};
     }
 
-    fn removePaneLocked(self: *Manager, session: *Session, window: *Window, pane_id: []const u8) bool {
+    fn takePaneLocked(self: *Manager, session: *Session, window: *Window, pane_id: []const u8) RemovedItems {
         for (window.panes.items, 0..) |pane, index| {
             if (std.mem.eql(u8, pane.id, pane_id)) {
                 const removed = window.panes.swapRemove(index);
                 _ = window.layout.removeLeaf(self.allocator, pane_id);
-                removed.deinit(self.allocator);
                 if (std.mem.eql(u8, window.active_pane_id, pane_id) and window.panes.items.len > 0) {
                     replaceOwnedString(self.allocator, &window.active_pane_id, window.panes.items[0].id) catch {};
                 }
                 if (window.panes.items.len == 0 and session.windows.items.len > 1) {
-                    _ = self.removeWindowLocked(session, window.id);
+                    return .{
+                        .window = self.takeWindowLocked(session, window.id),
+                        .pane = removed,
+                    };
                 }
-                return true;
+                return .{ .pane = removed };
             }
         }
-        return false;
+        return .{};
     }
 
-    fn removeWindowLocked(self: *Manager, session: *Session, window_id: []const u8) bool {
+    fn takeWindowLocked(self: *Manager, session: *Session, window_id: []const u8) ?*Window {
         for (session.windows.items, 0..) |window, index| {
             if (std.mem.eql(u8, window.id, window_id)) {
                 const removed = session.windows.swapRemove(index);
-                removed.deinit(self.allocator);
                 if (std.mem.eql(u8, session.active_window_id, window_id) and session.windows.items.len > 0) {
                     replaceOwnedString(self.allocator, &session.active_window_id, session.windows.items[0].id) catch {};
                 }
-                return true;
+                return removed;
             }
         }
-        return false;
+        return null;
     }
 
     fn writeSessionJsonLocked(self: *Manager, writer: *std.Io.Writer, session: *Session) !void {
@@ -1015,11 +1224,25 @@ fn replaceOwnedString(allocator: Allocator, slot: *[]u8, value: []const u8) !voi
     slot.* = replacement;
 }
 
+fn createNewWindowAndSplitForFailureTest(allocator: Allocator) !void {
+    var manager = Manager.init(allocator, null);
+    defer manager.deinit();
+
+    const opts: CreateOptions = .{
+        .shell = "/bin/sh",
+        .command = "cat",
+        .scrollback_bytes = 4096,
+    };
+    const first = try manager.createSessionPane(opts);
+    _ = try manager.newWindow(first.session_id, opts);
+    _ = try manager.splitPane(first.id, .horizontal, opts);
+}
+
 test "mux manager creates session window and pane state" {
     var manager = Manager.init(std.testing.allocator, null);
     defer manager.deinit();
 
-    const pane = try manager.createSessionPane(.{ .title = "one", .shell = "/bin/sh", .command = "true" });
+    const pane = try manager.createSessionPane(.{ .title = "one", .shell = "/bin/sh", .command = "cat" });
     try std.testing.expect(std.mem.startsWith(u8, pane.session_id, "sess-"));
     try std.testing.expect(std.mem.startsWith(u8, pane.window_id, "win-"));
     try std.testing.expect(std.mem.startsWith(u8, pane.id, "pane-"));
@@ -1034,10 +1257,10 @@ test "mux manager splits panes and records layout" {
     var manager = Manager.init(std.testing.allocator, null);
     defer manager.deinit();
 
-    const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "true" });
+    const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
     const first_id = try std.testing.allocator.dupe(u8, first.id);
     defer std.testing.allocator.free(first_id);
-    const second = try manager.splitPane(first_id, .horizontal, .{ .shell = "/bin/sh", .command = "true" });
+    const second = try manager.splitPane(first_id, .horizontal, .{ .shell = "/bin/sh", .command = "cat" });
     try std.testing.expect(!std.mem.eql(u8, first_id, second.id));
 
     const snapshot = try manager.snapshotJson(std.testing.allocator);
@@ -1053,12 +1276,13 @@ test "attachClient resolves a session name to its active pane" {
     const pane = try manager.createSessionPane(.{
         .title = "work",
         .shell = "/bin/sh",
-        .command = "true",
+        .command = "cat",
     });
     const expected_pane_id = try std.testing.allocator.dupe(u8, pane.id);
     defer std.testing.allocator.free(expected_pane_id);
 
-    const client = try manager.attachClient("work", 24, 80);
+    var client = try manager.attachClient("work", 24, 80);
+    defer client.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(expected_pane_id, client.pane_id);
 }
 
@@ -1069,12 +1293,13 @@ test "attachClient still resolves an explicit pane id" {
     const pane = try manager.createSessionPane(.{
         .title = "work",
         .shell = "/bin/sh",
-        .command = "true",
+        .command = "cat",
     });
     const pane_id = try std.testing.allocator.dupe(u8, pane.id);
     defer std.testing.allocator.free(pane_id);
 
-    const client = try manager.attachClient(pane_id, 24, 80);
+    var client = try manager.attachClient(pane_id, 24, 80);
+    defer client.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(pane_id, client.pane_id);
 }
 
@@ -1085,7 +1310,7 @@ test "attachClient on an unknown name returns PaneNotFound" {
     _ = try manager.createSessionPane(.{
         .title = "work",
         .shell = "/bin/sh",
-        .command = "true",
+        .command = "cat",
     });
     try std.testing.expectError(error.PaneNotFound, manager.attachClient("ghost", 24, 80));
 }
@@ -1094,7 +1319,7 @@ test "mux key binding executes tmux-like split command" {
     var manager = Manager.init(std.testing.allocator, null);
     defer manager.deinit();
 
-    const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "true" });
+    const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
     const first_id = try std.testing.allocator.dupe(u8, first.id);
     defer std.testing.allocator.free(first_id);
     try manager.bindKey("prefix", "%", "split-window -h", false);
@@ -1108,18 +1333,18 @@ test "switchClient moves a logical client to another pane" {
     var manager = Manager.init(std.testing.allocator, null);
     defer manager.deinit();
 
-    const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "true" });
+    const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
     const first_id = try std.testing.allocator.dupe(u8, first.id);
     defer std.testing.allocator.free(first_id);
-    const second = try manager.splitPane(first_id, .vertical, .{ .shell = "/bin/sh", .command = "true" });
+    const second = try manager.splitPane(first_id, .vertical, .{ .shell = "/bin/sh", .command = "cat" });
     const second_id = try std.testing.allocator.dupe(u8, second.id);
     defer std.testing.allocator.free(second_id);
 
-    const client = try manager.attachClient(first_id, 25, 90);
+    var client = try manager.attachClient(first_id, 25, 90);
+    defer client.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(first_id, client.pane_id);
 
     try manager.switchClient(client.id, second_id);
-    try std.testing.expectEqualStrings(second_id, client.pane_id);
     try std.testing.expectEqual(@as(u16, 25), client.rows);
     try std.testing.expectEqual(@as(u16, 90), client.cols);
 
@@ -1132,10 +1357,10 @@ test "terminating a split pane collapses layout and keeps the remaining pane" {
     var manager = Manager.init(std.testing.allocator, null);
     defer manager.deinit();
 
-    const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "true" });
+    const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
     const first_id = try std.testing.allocator.dupe(u8, first.id);
     defer std.testing.allocator.free(first_id);
-    const second = try manager.splitPane(first_id, .horizontal, .{ .shell = "/bin/sh", .command = "true" });
+    const second = try manager.splitPane(first_id, .horizontal, .{ .shell = "/bin/sh", .command = "cat" });
     const second_id = try std.testing.allocator.dupe(u8, second.id);
     defer std.testing.allocator.free(second_id);
 
@@ -1148,4 +1373,53 @@ test "terminating a split pane collapses layout and keeps the remaining pane" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot, first_id) != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, second_id) == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"kind\":\"split\"") == null);
+}
+
+test "manager create returns a retained native that survives concurrent removal" {
+    var manager = Manager.init(std.testing.allocator, null);
+    defer manager.deinit();
+
+    const native = try manager.create(.{ .shell = "/bin/sh", .command = "cat" });
+    defer native.release();
+    const id = try std.testing.allocator.dupe(u8, native.id);
+    defer std.testing.allocator.free(id);
+
+    try std.testing.expect(manager.terminate(id));
+
+    const info = try native.infoJson(std.testing.allocator);
+    defer std.testing.allocator.free(info);
+    try std.testing.expect(std.mem.indexOf(u8, info, "\"state\":\"terminated\"") != null);
+}
+
+test "attachClient returns an owned snapshot that survives detach" {
+    var manager = Manager.init(std.testing.allocator, null);
+    defer manager.deinit();
+
+    const pane = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
+    const pane_id = try std.testing.allocator.dupe(u8, pane.id);
+    defer std.testing.allocator.free(pane_id);
+
+    var client = try manager.attachClient(pane_id, 24, 80);
+    defer client.deinit(std.testing.allocator);
+    try std.testing.expect(manager.detachClient(client.id));
+    try std.testing.expectEqualStrings(pane_id, client.pane_id);
+}
+
+test "manager count ignores terminated panes for idle accounting" {
+    var manager = Manager.init(std.testing.allocator, null);
+    defer manager.deinit();
+
+    _ = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "true" });
+
+    const deadline = std.time.milliTimestamp() + 2_000;
+    while (std.time.milliTimestamp() < deadline) {
+        manager.reapExitedPanes();
+        if (manager.count() == 0) return;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    return error.PaneStillCountedAsLive;
+}
+
+test "manager pane creation allocation failures clean up without native teardown under lock" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, createNewWindowAndSplitForFailureTest, .{});
 }
