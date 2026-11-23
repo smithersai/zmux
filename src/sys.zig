@@ -234,6 +234,16 @@ fn setNoSigPipe(fd: fd_t) void {
     _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.NOSIGPIPE, &one, @sizeOf(c_int));
 }
 
+/// Raise `SO_SNDBUF` and `SO_RCVBUF` on local UNIX stream sockets (best effort).
+/// macOS defaults `AF_UNIX` buffers to 8 KiB, forcing dozens of blocking thread
+/// wakeups on 64–256 KiB scrollback replays and PTY output bursts; 256 KiB lets
+/// typical frames complete in 1–2 syscalls.
+pub fn tuneUnixSocketBuffers(fd: fd_t) void {
+    const size: c_int = 256 * 1024;
+    _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.SNDBUF, &size, @sizeOf(c_int));
+    _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.RCVBUF, &size, @sizeOf(c_int));
+}
+
 pub const BindError = error{
     AccessDenied,
     AddressInUse,
@@ -352,6 +362,7 @@ pub fn connectUnix(path: []const u8) (SocketError || ConnectError || error{NameT
     const fd = try unixStreamSocket();
     errdefer close(fd);
     try connect(fd, &address);
+    tuneUnixSocketBuffers(fd);
     return fd;
 }
 

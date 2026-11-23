@@ -196,7 +196,7 @@ fn fuzzClientConnectionBackpressure(_: void, smith: *std.testing.Smith) !void {
             },
         }
         try std.testing.expectEqual(ref_queued_bytes, conn.queued_bytes);
-        try std.testing.expectEqual(ref_queue.items.len, conn.pending_writes.items.len);
+        try std.testing.expectEqual(ref_queue.items.len, conn.pendingWriteCount());
     }
 
     // Take remaining mux clients and check exact match with reference set.

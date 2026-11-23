@@ -1,7 +1,8 @@
 const std = @import("std");
 const bench = @import("bench");
-const rpc_line_reader = @import("rpc_line_reader");
-const sys = @import("sys");
+const zmux = @import("zmux");
+const rpc_line_reader = zmux.internal.rpc_line_reader;
+const sys = zmux.sys;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;

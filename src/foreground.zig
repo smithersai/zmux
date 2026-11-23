@@ -209,16 +209,45 @@ fn procPath(pid: posix.pid_t, buffer: []u8) []const u8 {
     return path_slice[0..nul_index];
 }
 
-fn procArgsDarwin(allocator: Allocator, pid: posix.pid_t, fallback_path: []const u8) ![][]u8 {
+var cached_darwin_argmax = std.atomic.Value(usize).init(0);
+
+fn darwinArgMax() !usize {
+    const cached = cached_darwin_argmax.load(.acquire);
+    if (cached != 0) return cached;
+
     var argmax: c_int = 0;
     var argmax_len: usize = @sizeOf(c_int);
     try posix.sysctl(&.{ ctl_kern, kern_argmax }, &argmax, &argmax_len, null, 0);
-    if (argmax <= 0) return fallbackArgv(allocator, fallback_path);
+    if (argmax <= 0) return 0;
+    const size: usize = @intCast(argmax);
+    cached_darwin_argmax.store(size, .release);
+    return size;
+}
 
-    const buffer = try allocator.alloc(u8, @intCast(argmax));
+fn procArgsDarwin(allocator: Allocator, pid: posix.pid_t, fallback_path: []const u8) ![][]u8 {
+    // Most processes fit well within 64 KiB of procargs2 (exec path + argv + env).
+    // Probing a stack buffer first avoids a 1 MiB (ARG_MAX) heap allocation on
+    // every foreground transition; if the buffer is too small (macOS returns
+    // EINVAL/ENOMEM), fall back to the full cached KERN_ARGMAX buffer.
+    var stack_buf: [64 * 1024]u8 = undefined;
+    var procargs_len: usize = stack_buf.len;
+    if (posix.sysctl(
+        &.{ ctl_kern, kern_procargs2, @as(c_int, @intCast(pid)) },
+        &stack_buf,
+        &procargs_len,
+        null,
+        0,
+    )) {
+        return try parseProcArgsBuffer(allocator, stack_buf[0..procargs_len], fallback_path);
+    } else |_| {}
+
+    const argmax = try darwinArgMax();
+    if (argmax == 0) return fallbackArgv(allocator, fallback_path);
+
+    const buffer = try allocator.alloc(u8, argmax);
     defer allocator.free(buffer);
 
-    var procargs_len: usize = buffer.len;
+    procargs_len = buffer.len;
     try posix.sysctl(
         &.{ ctl_kern, kern_procargs2, @as(c_int, @intCast(pid)) },
         buffer.ptr,
@@ -246,6 +275,7 @@ pub fn parseProcArgsBuffer(allocator: Allocator, buffer: []const u8, fallback_pa
         for (argv.items) |arg| allocator.free(arg);
         argv.deinit(allocator);
     }
+    try argv.ensureTotalCapacity(allocator, @min(argc, 64));
 
     var remaining = argc;
     while (offset < buffer.len and remaining > 0) {

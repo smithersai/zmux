@@ -372,12 +372,138 @@ fn readRpcResponse(
 }
 
 fn matchesRpcId(allocator: std.mem.Allocator, line: []const u8, expected_id: u32) bool {
+    // Fast reject: without `"id"` (or a `\u` unicode escape that could spell
+    // `"id"`), a valid JSON object cannot have an `"id"` member.
+    if (!containsSubstrSimd(line, "\"id\"") and !containsSubstrSimd(line, "\\u")) {
+        return false;
+    }
+
+    var scanner = std.json.Scanner.initCompleteInput(allocator, line);
+    defer scanner.deinit();
+
+    const first = scanner.next() catch return false;
+    if (first != .object_begin) return false;
+
+    var matched = false;
+    while (true) {
+        const key_tok = scanner.next() catch return false;
+        switch (key_tok) {
+            .object_end => break,
+            .string => |key| {
+                if (std.mem.eql(u8, key, "id")) {
+                    const val_tok = scanner.next() catch return false;
+                    switch (val_tok) {
+                        .number => |num| {
+                            if (std.fmt.parseInt(i64, num, 10)) |id_int| {
+                                matched = (id_int == @as(i64, expected_id));
+                            } else |_| {
+                                matched = false;
+                            }
+                        },
+                        .object_begin, .array_begin => {
+                            matched = false;
+                            skipComposite(&scanner) catch return false;
+                        },
+                        .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => {
+                            matched = false;
+                            skipRestOfString(&scanner) catch return false;
+                        },
+                        .partial_number => {
+                            matched = false;
+                            skipRestOfNumber(&scanner) catch return false;
+                        },
+                        else => matched = false,
+                    }
+                } else {
+                    scanner.skipValue() catch return false;
+                }
+            },
+            else => return matchesRpcIdFallback(allocator, line, expected_id),
+        }
+    }
+    const end_tok = scanner.next() catch return false;
+    return end_tok == .end_of_document and matched;
+}
+
+fn matchesRpcIdFallback(allocator: std.mem.Allocator, line: []const u8, expected_id: u32) bool {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return false;
     defer parsed.deinit();
     if (parsed.value != .object) return false;
     const id_value = parsed.value.object.get("id") orelse return false;
     if (id_value != .integer) return false;
     return id_value.integer == @as(i64, expected_id);
+}
+
+fn skipComposite(scanner: *std.json.Scanner) !void {
+    var depth: usize = 1;
+    while (depth > 0) {
+        const tok = try scanner.next();
+        switch (tok) {
+            .object_begin, .array_begin => depth += 1,
+            .object_end, .array_end => depth -= 1,
+            .end_of_document => return error.UnexpectedEndOfInput,
+            else => {},
+        }
+    }
+}
+
+fn skipRestOfString(scanner: *std.json.Scanner) !void {
+    while (true) {
+        const tok = try scanner.next();
+        switch (tok) {
+            .string => return,
+            .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => {},
+            else => return error.SyntaxError,
+        }
+    }
+}
+
+fn skipRestOfNumber(scanner: *std.json.Scanner) !void {
+    while (true) {
+        const tok = try scanner.next();
+        switch (tok) {
+            .number => return,
+            .partial_number => {},
+            else => return error.SyntaxError,
+        }
+    }
+}
+
+fn isPlainJsonAscii(bytes: []const u8) bool {
+    const Vec = @Vector(16, u8);
+    const low: Vec = @splat(0x20);
+    const high: Vec = @splat(0x7f);
+    const quote: Vec = @splat('"');
+    const backslash: Vec = @splat('\\');
+
+    var i: usize = 0;
+    while (i + 16 <= bytes.len) : (i += 16) {
+        const chunk: Vec = bytes[i..][0..16].*;
+        const bad = (chunk < low) | (chunk >= high) | (chunk == quote) | (chunk == backslash);
+        if (@reduce(.Or, bad)) return false;
+    }
+    while (i < bytes.len) : (i += 1) {
+        const b = bytes[i];
+        if (b < 0x20 or b >= 0x7f or b == '"' or b == '\\') return false;
+    }
+    return true;
+}
+
+/// SIMD-accelerated substring check: uses `std.mem.indexOfScalarPos` (which
+/// uses 16-byte SIMD vectors) to scan for `needle[0]`, making searches for
+/// rare delimiters like `"` or `\` over multi-kilobyte base64 payloads >20x
+/// faster than scalar `std.mem.indexOf`.
+fn containsSubstrSimd(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+    const last_start = haystack.len - needle.len;
+    var pos: usize = 0;
+    while (pos <= last_start) {
+        const hit = std.mem.indexOfScalarPos(u8, haystack[0 .. last_start + 1], pos, needle[0]) orelse return false;
+        if (std.mem.eql(u8, haystack[hit .. hit + needle.len], needle)) return true;
+        pos = hit + 1;
+    }
+    return false;
 }
 
 fn sendCreate(
@@ -722,19 +848,151 @@ fn formatVerbResult(
 // Render a `session.list` result array as one tab-separated line per pane:
 //   <sessionId>\t<paneId>\t<state>\tpid=<pid>\t<title>
 fn formatSessionList(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
+    return formatSessionListFast(allocator, response) catch |err| switch (err) {
+        error.FallbackToDom => formatSessionListFallback(allocator, response),
+        else => return err,
+    };
+}
+
+fn formatSessionListFast(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
+    var scanner = std.json.Scanner.initCompleteInput(allocator, response);
+    defer scanner.deinit();
+
+    if ((try scanner.next()) != .object_begin) return error.InvalidResponse;
+
+    var out: std.Io.Writer.Allocating = try .initCapacity(allocator, 512);
+    errdefer out.deinit();
+    var found_result = false;
+    var item_count: usize = 0;
+
+    while (true) {
+        const key_tok = try scanner.next();
+        switch (key_tok) {
+            .object_end => break,
+            .string => |key| {
+                if (std.mem.eql(u8, key, "result")) {
+                    found_result = true;
+                    if ((try scanner.next()) != .array_begin) return error.InvalidResponse;
+                    while (true) {
+                        const elem = try scanner.next();
+                        switch (elem) {
+                            .array_end => break,
+                            .object_begin => {
+                                item_count += 1;
+                                var session_id: []const u8 = "";
+                                var pane_id: []const u8 = "";
+                                var state: []const u8 = "";
+                                var title: []const u8 = "";
+                                var pid: i64 = 0;
+                                while (true) {
+                                    const fk = try scanner.next();
+                                    switch (fk) {
+                                        .object_end => break,
+                                        .string => |field| {
+                                            if (std.mem.eql(u8, field, "sessionId")) {
+                                                const v = try scanner.next();
+                                                switch (v) {
+                                                    .string => |s| session_id = s,
+                                                    .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => return error.FallbackToDom,
+                                                    .object_begin, .array_begin => try skipComposite(&scanner),
+                                                    .partial_number => try skipRestOfNumber(&scanner),
+                                                    else => {},
+                                                }
+                                            } else if (std.mem.eql(u8, field, "paneId")) {
+                                                const v = try scanner.next();
+                                                switch (v) {
+                                                    .string => |s| pane_id = s,
+                                                    .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => return error.FallbackToDom,
+                                                    .object_begin, .array_begin => try skipComposite(&scanner),
+                                                    .partial_number => try skipRestOfNumber(&scanner),
+                                                    else => {},
+                                                }
+                                            } else if (std.mem.eql(u8, field, "state")) {
+                                                const v = try scanner.next();
+                                                switch (v) {
+                                                    .string => |s| state = s,
+                                                    .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => return error.FallbackToDom,
+                                                    .object_begin, .array_begin => try skipComposite(&scanner),
+                                                    .partial_number => try skipRestOfNumber(&scanner),
+                                                    else => {},
+                                                }
+                                            } else if (std.mem.eql(u8, field, "title")) {
+                                                const v = try scanner.next();
+                                                switch (v) {
+                                                    .string => |s| title = s,
+                                                    .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => return error.FallbackToDom,
+                                                    .object_begin, .array_begin => try skipComposite(&scanner),
+                                                    .partial_number => try skipRestOfNumber(&scanner),
+                                                    else => {},
+                                                }
+                                            } else if (std.mem.eql(u8, field, "pid")) {
+                                                const v = try scanner.next();
+                                                switch (v) {
+                                                    .number => |n| pid = std.fmt.parseInt(i64, n, 10) catch 0,
+                                                    .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => try skipRestOfString(&scanner),
+                                                    .object_begin, .array_begin => try skipComposite(&scanner),
+                                                    .partial_number => try skipRestOfNumber(&scanner),
+                                                    else => {},
+                                                }
+                                            } else {
+                                                try scanner.skipValue();
+                                            }
+                                        },
+                                        else => return error.FallbackToDom,
+                                    }
+                                }
+                                try out.writer.print("{s}\t{s}\t{s}\tpid={d}\t{s}\n", .{
+                                    session_id,
+                                    pane_id,
+                                    state,
+                                    pid,
+                                    title,
+                                });
+                            },
+                            .array_begin => {
+                                item_count += 1;
+                                try skipComposite(&scanner);
+                            },
+                            .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => {
+                                item_count += 1;
+                                try skipRestOfString(&scanner);
+                            },
+                            .partial_number => {
+                                item_count += 1;
+                                try skipRestOfNumber(&scanner);
+                            },
+                            else => item_count += 1,
+                        }
+                    }
+                } else {
+                    try scanner.skipValue();
+                }
+            },
+            else => return error.FallbackToDom,
+        }
+    }
+    if ((try scanner.next()) != .end_of_document) return error.SyntaxError;
+    if (!found_result) return error.InvalidResponse;
+    if (item_count == 0) {
+        try out.writer.writeAll("no sessions\n");
+    }
+    return out.toOwnedSlice();
+}
+
+fn formatSessionListFallback(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
     defer parsed.deinit();
 
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
+    var out: std.Io.Writer.Allocating = try .initCapacity(allocator, 256);
+    errdefer out.deinit();
 
     if (parsed.value != .object) return error.InvalidResponse;
     const result = parsed.value.object.get("result") orelse return error.InvalidResponse;
     if (result != .array) return error.InvalidResponse;
 
     if (result.array.items.len == 0) {
-        try out.appendSlice(allocator, "no sessions\n");
-        return out.toOwnedSlice(allocator);
+        try out.writer.writeAll("no sessions\n");
+        return out.toOwnedSlice();
     }
 
     for (result.array.items) |item| {
@@ -744,16 +1002,13 @@ fn formatSessionList(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
         const state = jsonObjectString(item, "state") orelse "";
         const title = jsonObjectString(item, "title") orelse "";
         const pid = jsonObjectInt(item, "pid");
-        const line = try std.fmt.allocPrint(
-            allocator,
+        try out.writer.print(
             "{s}\t{s}\t{s}\tpid={d}\t{s}\n",
             .{ session_id, pane_id, state, pid, title },
         );
-        defer allocator.free(line);
-        try out.appendSlice(allocator, line);
     }
 
-    return out.toOwnedSlice(allocator);
+    return out.toOwnedSlice();
 }
 
 // Return the daemon's `error.message` text (caller owns) when `response` is a
@@ -952,6 +1207,7 @@ fn tryConnect(path: []const u8) !posix.fd_t {
     const fd = try sys.unixStreamSocket();
     errdefer sys.close(fd);
     try sys.connect(fd, &address);
+    sys.tuneUnixSocketBuffers(fd);
     return fd;
 }
 
@@ -1190,6 +1446,246 @@ fn handleServerLine(
     pane_id: []const u8,
     stdout_fd: posix.fd_t,
 ) !bool {
+    // Ultra-fast canonical path for the wire format emitted by `zmuxd`:
+    //   {"jsonrpc":"2.0","method":"pane_output","params":{"pane_id":"<id>","data_base64":"<b64>"}}\n
+    // Base64 decoding strictly rejects `"`, `\`, and all control/non-ASCII bytes,
+    // so a successful match + decode is 100% equivalent to full JSON parsing while
+    // avoiding a byte-by-byte UTF-8 JSON scan over multi-kilobyte base64 payloads.
+    const canonical_prefix = "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{\"pane_id\":\"";
+    const canonical_mid = "\",\"data_base64\":\"";
+    if (std.mem.startsWith(u8, line, canonical_prefix)) blk: {
+        const id_start = canonical_prefix.len;
+        const id_end = std.mem.indexOfScalarPos(u8, line, id_start, '"') orelse break :blk;
+        const wire_pane_id = line[id_start..id_end];
+        if (!isPlainJsonAscii(wire_pane_id)) break :blk;
+        if (!std.mem.startsWith(u8, line[id_end..], canonical_mid)) break :blk;
+
+        const b64_start = id_end + canonical_mid.len;
+        const trimmed = std.mem.trimEnd(u8, line, "\r\n");
+        if (!std.mem.endsWith(u8, trimmed, "\"}}")) break :blk;
+        if (trimmed.len < b64_start + 3) break :blk;
+        const encoded = trimmed[b64_start .. trimmed.len - 3];
+
+        if (!std.mem.eql(u8, wire_pane_id, pane_id)) {
+            // Confirm `encoded` has no unescaped quotes/backslashes/control chars
+            // so we know the JSON frame ends cleanly right after `data_base64`.
+            if (isPlainJsonAscii(encoded)) return false;
+            break :blk;
+        }
+
+        // For matching pane_id, decode directly; any malformed quote/escape or
+        // invalid base64 falls through to the general parser so error semantics
+        // match `handleServerLineFallback` identically.
+        const decoder = std.base64.standard.Decoder;
+        const decoded_len = decoder.calcSizeForSlice(encoded) catch break :blk;
+        var stack_buf: [64 * 1024]u8 = undefined;
+        if (decoded_len <= stack_buf.len) {
+            decoder.decode(stack_buf[0..decoded_len], encoded) catch break :blk;
+            try writeAllFd(stdout_fd, stack_buf[0..decoded_len]);
+        } else {
+            const decoded = try allocator.alloc(u8, decoded_len);
+            defer allocator.free(decoded);
+            decoder.decode(decoded, encoded) catch break :blk;
+            try writeAllFd(stdout_fd, decoded);
+        }
+        return false;
+    }
+
+    // Fast reject: only `pane_output` and `session_exited` notifications ever
+    // write output or signal exit. Without either method name (or `\u`), skip
+    // JSON parsing completely.
+    const has_unicode_escape = containsSubstrSimd(line, "\\u");
+    if (!has_unicode_escape) {
+        if (!containsSubstrSimd(line, "pane_output") and
+            !containsSubstrSimd(line, "session_exited"))
+        {
+            return false;
+        }
+        // Notifications for another pane cannot match `pane_id` unless the raw
+        // `pane_id` bytes appear somewhere in `line` (when plain ASCII).
+        if (isPlainJsonAscii(pane_id) and !containsSubstrSimd(line, pane_id)) {
+            return false;
+        }
+    }
+
+    return handleServerLineFast(allocator, line, pane_id, stdout_fd) catch |err| switch (err) {
+        error.FallbackToDom => handleServerLineFallback(allocator, line, pane_id, stdout_fd),
+        else => return err,
+    };
+}
+
+fn handleServerLineFast(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    pane_id: []const u8,
+    stdout_fd: posix.fd_t,
+) !bool {
+    var scanner = std.json.Scanner.initCompleteInput(allocator, line);
+    defer scanner.deinit();
+
+    const first = scanner.next() catch return false;
+    if (first != .object_begin) return false;
+
+    const MethodKind = enum { none, pane_output, session_exited, other };
+    var method_kind: MethodKind = .none;
+    var has_params = false;
+    var param_pane_id: ?[]const u8 = null;
+    var param_pane_id_camel: ?[]const u8 = null;
+    var param_session_id: ?[]const u8 = null;
+    var param_session_id_camel: ?[]const u8 = null;
+    var param_data_b64: ?[]const u8 = null;
+    var param_data_b64_camel: ?[]const u8 = null;
+
+    while (true) {
+        const key_tok = scanner.next() catch return false;
+        switch (key_tok) {
+            .object_end => break,
+            .string => |key| {
+                if (std.mem.eql(u8, key, "method")) {
+                    const val = scanner.next() catch return false;
+                    switch (val) {
+                        .string => |s| {
+                            if (std.mem.eql(u8, s, "pane_output")) {
+                                method_kind = .pane_output;
+                            } else if (std.mem.eql(u8, s, "session_exited")) {
+                                method_kind = .session_exited;
+                            } else {
+                                method_kind = .other;
+                            }
+                        },
+                        .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => return error.FallbackToDom,
+                        .object_begin, .array_begin => {
+                            method_kind = .other;
+                            skipComposite(&scanner) catch return false;
+                        },
+                        .partial_number => {
+                            method_kind = .other;
+                            skipRestOfNumber(&scanner) catch return false;
+                        },
+                        else => method_kind = .other,
+                    }
+                } else if (std.mem.eql(u8, key, "params")) {
+                    const val = scanner.next() catch return false;
+                    if (val != .object_begin) {
+                        switch (val) {
+                            .array_begin => skipComposite(&scanner) catch return false,
+                            .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => skipRestOfString(&scanner) catch return false,
+                            .partial_number => skipRestOfNumber(&scanner) catch return false,
+                            else => {},
+                        }
+                        continue;
+                    }
+                    has_params = true;
+                    while (true) {
+                        const pk = scanner.next() catch return false;
+                        switch (pk) {
+                            .object_end => break,
+                            .string => |pfield| {
+                                if (std.mem.eql(u8, pfield, "pane_id")) {
+                                    const pv = scanner.next() catch return false;
+                                    switch (pv) {
+                                        .string => |s| param_pane_id = s,
+                                        .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => return error.FallbackToDom,
+                                        .object_begin, .array_begin => skipComposite(&scanner) catch return false,
+                                        .partial_number => skipRestOfNumber(&scanner) catch return false,
+                                        else => param_pane_id = null,
+                                    }
+                                } else if (std.mem.eql(u8, pfield, "paneId")) {
+                                    const pv = scanner.next() catch return false;
+                                    switch (pv) {
+                                        .string => |s| param_pane_id_camel = s,
+                                        .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => return error.FallbackToDom,
+                                        .object_begin, .array_begin => skipComposite(&scanner) catch return false,
+                                        .partial_number => skipRestOfNumber(&scanner) catch return false,
+                                        else => param_pane_id_camel = null,
+                                    }
+                                } else if (std.mem.eql(u8, pfield, "data_base64")) {
+                                    const pv = scanner.next() catch return false;
+                                    switch (pv) {
+                                        .string => |s| param_data_b64 = s,
+                                        .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => return error.FallbackToDom,
+                                        .object_begin, .array_begin => skipComposite(&scanner) catch return false,
+                                        .partial_number => skipRestOfNumber(&scanner) catch return false,
+                                        else => param_data_b64 = null,
+                                    }
+                                } else if (std.mem.eql(u8, pfield, "dataBase64")) {
+                                    const pv = scanner.next() catch return false;
+                                    switch (pv) {
+                                        .string => |s| param_data_b64_camel = s,
+                                        .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => return error.FallbackToDom,
+                                        .object_begin, .array_begin => skipComposite(&scanner) catch return false,
+                                        .partial_number => skipRestOfNumber(&scanner) catch return false,
+                                        else => param_data_b64_camel = null,
+                                    }
+                                } else if (std.mem.eql(u8, pfield, "session_id")) {
+                                    const pv = scanner.next() catch return false;
+                                    switch (pv) {
+                                        .string => |s| param_session_id = s,
+                                        .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => return error.FallbackToDom,
+                                        .object_begin, .array_begin => skipComposite(&scanner) catch return false,
+                                        .partial_number => skipRestOfNumber(&scanner) catch return false,
+                                        else => param_session_id = null,
+                                    }
+                                } else if (std.mem.eql(u8, pfield, "sessionId")) {
+                                    const pv = scanner.next() catch return false;
+                                    switch (pv) {
+                                        .string => |s| param_session_id_camel = s,
+                                        .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => return error.FallbackToDom,
+                                        .object_begin, .array_begin => skipComposite(&scanner) catch return false,
+                                        .partial_number => skipRestOfNumber(&scanner) catch return false,
+                                        else => param_session_id_camel = null,
+                                    }
+                                } else {
+                                    scanner.skipValue() catch return false;
+                                }
+                            },
+                            else => return error.FallbackToDom,
+                        }
+                    }
+                } else {
+                    scanner.skipValue() catch return false;
+                }
+            },
+            else => return error.FallbackToDom,
+        }
+    }
+
+    const end_tok = scanner.next() catch return false;
+    if (end_tok != .end_of_document or !has_params) return false;
+
+    switch (method_kind) {
+        .pane_output => {
+            const actual_pane_id = param_pane_id_camel orelse param_pane_id orelse return false;
+            if (!std.mem.eql(u8, actual_pane_id, pane_id)) return false;
+            const encoded = param_data_b64_camel orelse param_data_b64 orelse return false;
+            const decoder = std.base64.standard.Decoder;
+            const decoded_len = try decoder.calcSizeForSlice(encoded);
+            var stack_buf: [64 * 1024]u8 = undefined;
+            if (decoded_len <= stack_buf.len) {
+                try decoder.decode(stack_buf[0..decoded_len], encoded);
+                try writeAllFd(stdout_fd, stack_buf[0..decoded_len]);
+            } else {
+                const decoded = try allocator.alloc(u8, decoded_len);
+                defer allocator.free(decoded);
+                try decoder.decode(decoded, encoded);
+                try writeAllFd(stdout_fd, decoded);
+            }
+            return false;
+        },
+        .session_exited => {
+            const actual_sid = param_session_id_camel orelse param_session_id orelse return false;
+            return std.mem.eql(u8, actual_sid, pane_id);
+        },
+        else => return false,
+    }
+}
+
+fn handleServerLineFallback(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    pane_id: []const u8,
+    stdout_fd: posix.fd_t,
+) !bool {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return false;
     defer parsed.deinit();
     if (parsed.value != .object) return false;
@@ -1221,12 +1717,49 @@ fn sendInput(
     session_id: []const u8,
     bytes: []const u8,
 ) !void {
+    if (isPlainJsonAscii(session_id)) {
+        const prefix = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session.send\",\"params\":{\"sessionId\":\"";
+        const mid = "\",\"dataBase64\":\"";
+        const suffix = "\"}}\n";
+        const b64_len = std.base64.standard.Encoder.calcSize(bytes.len);
+        const total = prefix.len + session_id.len + mid.len + b64_len + suffix.len;
+
+        var stack_buf: [8192]u8 = undefined;
+        if (total <= stack_buf.len) {
+            var pos: usize = 0;
+            @memcpy(stack_buf[pos..][0..prefix.len], prefix);
+            pos += prefix.len;
+            @memcpy(stack_buf[pos..][0..session_id.len], session_id);
+            pos += session_id.len;
+            @memcpy(stack_buf[pos..][0..mid.len], mid);
+            pos += mid.len;
+            _ = std.base64.standard.Encoder.encode(stack_buf[pos..][0..b64_len], bytes);
+            pos += b64_len;
+            @memcpy(stack_buf[pos..][0..suffix.len], suffix);
+            return writeAll(socket_fd, stack_buf[0..total]);
+        }
+
+        const msg = try allocator.alloc(u8, total);
+        defer allocator.free(msg);
+        var pos: usize = 0;
+        @memcpy(msg[pos..][0..prefix.len], prefix);
+        pos += prefix.len;
+        @memcpy(msg[pos..][0..session_id.len], session_id);
+        pos += session_id.len;
+        @memcpy(msg[pos..][0..mid.len], mid);
+        pos += mid.len;
+        _ = std.base64.standard.Encoder.encode(msg[pos..][0..b64_len], bytes);
+        pos += b64_len;
+        @memcpy(msg[pos..][0..suffix.len], suffix);
+        return writeAll(socket_fd, msg);
+    }
+
     const encoded = try base64Encode(allocator, bytes);
     defer allocator.free(encoded);
     const msg = try std.fmt.allocPrint(
         allocator,
-        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session.send\",\"params\":{{\"sessionId\":{f},\"dataBase64\":{f}}}}}\n",
-        .{ std.json.fmt(session_id, .{}), std.json.fmt(encoded, .{}) },
+        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session.send\",\"params\":{{\"sessionId\":{f},\"dataBase64\":\"{s}\"}}}}\n",
+        .{ std.json.fmt(session_id, .{}), encoded },
     );
     defer allocator.free(msg);
     try writeAll(socket_fd, msg);

@@ -5,7 +5,7 @@ const foreground = @import("foreground.zig");
 const pty = @import("pty.zig");
 const protocol = @import("protocol.zig");
 
-pub const NativeSessionState = enum {
+pub const NativeSessionState = enum(u8) {
     creating,
     running,
     terminated,
@@ -83,7 +83,7 @@ pub const NativeSession = struct {
     cwd_value: ?[]u8,
     handle: pty.Pty,
     scrollback: buffer.ScrollbackBuffer,
-    state_value: NativeSessionState = .creating,
+    state_value: std.atomic.Value(NativeSessionState) = std.atomic.Value(NativeSessionState).init(.creating),
     exit_status: ?u32 = null,
     event_sink: ?EventSink = null,
     foreground_tracker: foreground.Tracker,
@@ -131,7 +131,7 @@ pub const NativeSession = struct {
             .scrollback = scrollback,
             .event_sink = opts.event_sink,
             .foreground_tracker = foreground.Tracker.init(handle.child_pid),
-            .state_value = .running,
+            .state_value = std.atomic.Value(NativeSessionState).init(.running),
         };
         native.handle.setExitObserver(.{
             .context = native,
@@ -176,9 +176,7 @@ pub const NativeSession = struct {
     }
 
     pub fn state(self: *NativeSession) NativeSessionState {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        return self.state_value;
+        return self.state_value.load(.acquire);
     }
 
     pub fn terminate(self: *NativeSession) void {
@@ -263,52 +261,66 @@ pub const NativeSession = struct {
         return self.scrollback.snapshot(allocator);
     }
 
+    pub fn scrollbackTail(self: *NativeSession, allocator: std.mem.Allocator, max_bytes: usize) ![]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.scrollback.snapshotTail(allocator, max_bytes);
+    }
+
     pub fn writeInput(self: *NativeSession, bytes: []const u8) !void {
         try self.handle.write(bytes);
     }
 
-    pub fn infoJson(self: *NativeSession, allocator: std.mem.Allocator) ![]u8 {
+    /// Write the opening `{` and all `NativeSession` JSON fields without the
+    /// closing `}`, allowing callers such as `mux.Manager.listJson` to append
+    /// additional fields directly into one output buffer with zero intermediate
+    /// allocations.
+    pub fn writeInfoJsonFields(self: *NativeSession, writer: *std.Io.Writer) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        var out: std.Io.Writer.Allocating = .init(allocator);
-        errdefer out.deinit();
-        try out.writer.print(
+        try writer.print(
             "{{\"id\":{f},\"title\":{f},\"pid\":{},\"state\":{f},\"cwd\":",
             .{
                 std.json.fmt(self.id, .{}),
                 std.json.fmt(self.title_value, .{}),
                 self.handle.child_pid,
-                std.json.fmt(self.state_value.label(), .{}),
+                std.json.fmt(self.state_value.load(.monotonic).label(), .{}),
             },
         );
         if (self.cwd_value) |cwd| {
-            try out.writer.print("{f}", .{std.json.fmt(cwd, .{})});
+            try writer.print("{f}", .{std.json.fmt(cwd, .{})});
         } else {
-            try out.writer.writeAll("null");
+            try writer.writeAll("null");
         }
-        try out.writer.writeAll(",\"shell\":");
+        try writer.writeAll(",\"shell\":");
         if (self.shell_value) |shell| {
-            try out.writer.print("{f}", .{std.json.fmt(shell, .{})});
+            try writer.print("{f}", .{std.json.fmt(shell, .{})});
         } else {
-            try out.writer.writeAll("null");
+            try writer.writeAll("null");
         }
-        try out.writer.print(
+        try writer.print(
             ",\"scrollbackBytes\":{},\"exitStatus\":",
             .{self.scrollback.len},
         );
         if (self.exit_status) |status| {
-            try out.writer.print("{}", .{status});
+            try writer.print("{}", .{status});
         } else {
-            try out.writer.writeAll("null");
+            try writer.writeAll("null");
         }
-        try out.writer.writeAll("}");
+    }
+
+    pub fn infoJson(self: *NativeSession, allocator: std.mem.Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = try .initCapacity(allocator, 256);
+        errdefer out.deinit();
+        try self.writeInfoJsonFields(&out.writer);
+        try out.writer.writeByte('}');
         return out.toOwnedSlice();
     }
 
     fn readerLoop(self: *NativeSession) void {
-        var read_buf: [8192]u8 = undefined;
-        while (!self.reader_stop.load(.seq_cst)) {
+        var read_buf: [32 * 1024]u8 = undefined;
+        while (!self.reader_stop.load(.acquire)) {
             if (self.state() == .terminated) return;
             self.pollForegroundChange() catch {};
 
@@ -329,23 +341,28 @@ pub const NativeSession = struct {
                 self.markTerminated(status);
                 return;
             }
+            const chunk = read_buf[0..n];
             self.mutex.lockUncancelable(self.io);
-            self.scrollback.append(read_buf[0..n]);
+            self.scrollback.append(chunk);
+            const sink = self.event_sink;
             self.mutex.unlock(self.io);
-            self.emitEvent(.{ .pane_output = .{
-                .pane_id = self.id,
-                .data = read_buf[0..n],
-            } });
-            const now_ms = self.nowMs();
-            self.emitEvent(.{ .pane_activity = .{
-                .pane_id = self.id,
-                .last_activity_ms = now_ms,
-            } });
-            if (std.mem.indexOfScalar(u8, read_buf[0..n], 0x07) != null) {
-                self.emitEvent(.{ .pane_bell = .{
+
+            if (sink) |active| {
+                active.emit(active.context, .{ .pane_output = .{
                     .pane_id = self.id,
-                    .last_bell_ms = now_ms,
+                    .data = chunk,
                 } });
+                const now_ms = self.nowMs();
+                active.emit(active.context, .{ .pane_activity = .{
+                    .pane_id = self.id,
+                    .last_activity_ms = now_ms,
+                } });
+                if (std.mem.indexOfScalar(u8, chunk, 0x07) != null) {
+                    active.emit(active.context, .{ .pane_bell = .{
+                        .pane_id = self.id,
+                        .last_bell_ms = now_ms,
+                    } });
+                }
             }
         }
     }
@@ -424,7 +441,7 @@ pub const NativeSession = struct {
     fn markTerminated(self: *NativeSession, status: ?u32) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.state_value = .terminated;
+        self.state_value.store(.terminated, .release);
         if (self.exit_status == null) {
             self.exit_status = if (status) |value| decodedExitStatus(value) else null;
         }

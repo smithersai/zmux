@@ -27,10 +27,15 @@ jobs:
           version: 0.17.1
 
       - name: Check formatting
-        run: zig fmt --check src test build.zig build.zig.zon
+        run: zig fmt --check src test bench build.zig build.zig.zon
 
       - name: Run tests
         run: zig build test --summary all
+
+      - name: Verify benchmarks compile and smoke-check
+        run: |
+          zig build bench-check --summary all
+          zig build bench-buffer bench-protocol -- --quick
 
   fuzz:
     name: Fuzz (Ubuntu)

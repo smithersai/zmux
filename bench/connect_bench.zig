@@ -1,7 +1,8 @@
 const std = @import("std");
 const bench = @import("bench");
-const connect = @import("connect");
-const sys = @import("sys");
+const zmux = @import("zmux");
+const connect = zmux.connect;
+const sys = zmux.sys;
 
 const hooks = connect.fuzz_hooks;
 

@@ -1,10 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const bench = @import("bench");
-const buffer = @import("buffer");
-const rpc_line_reader = @import("rpc_line_reader");
-const server_mod = @import("server");
-const sys = @import("sys");
+const zmux = @import("zmux");
+const buffer = zmux.buffer;
+const rpc_line_reader = zmux.internal.rpc_line_reader;
+const server_mod = zmux.server;
+const sys = zmux.sys;
 
 const hooks = server_mod.fuzz_hooks;
 
@@ -77,8 +78,8 @@ pub fn main(init: std.process.Init) !void {
         }
 
         // Wait until listener accepts connections.
-        const client_fd = try connectWithWait(io, socket_path);
-        defer sys.close(client_fd);
+        var client_fd: ?sys.fd_t = try connectWithWait(io, socket_path);
+        defer if (client_fd) |fd| sys.close(fd);
         var reader: rpc_line_reader.LineReader = .{};
 
         // 2a. daemon.ping round-trip latency over persistent UNIX socket.
@@ -89,7 +90,7 @@ pub fn main(init: std.process.Init) !void {
         };
         try runner.run("rpc_daemon_ping_roundtrip", .{}, PingCtx{
             .allocator = allocator,
-            .fd = client_fd,
+            .fd = client_fd.?,
             .reader = &reader,
         }, struct {
             fn f(ctx: PingCtx) !void {
@@ -103,8 +104,8 @@ pub fn main(init: std.process.Init) !void {
         // Create a live session with a full 10 MiB scrollback buffer for capture, attach, send, snapshot benchmarks.
         const create_req =
             "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"session.create\",\"params\":{\"id\":\"bench\",\"shell\":\"/bin/sh\",\"command\":\"exec sleep 60\",\"rows\":40,\"cols\":120}}\n";
-        try sys.sendAll(client_fd, create_req);
-        const create_resp = try readResponseById(allocator, &reader, client_fd, 10);
+        try sys.sendAll(client_fd.?, create_req);
+        const create_resp = try readResponseById(allocator, &reader, client_fd.?, 10);
         defer allocator.free(create_resp);
         const pane_id = try extractStringField(allocator, create_resp, "id");
         defer allocator.free(pane_id);
@@ -125,7 +126,7 @@ pub fn main(init: std.process.Init) !void {
         // 2b. mux.snapshot over UNIX socket.
         try runner.run("rpc_mux_snapshot_roundtrip", .{}, PingCtx{
             .allocator = allocator,
-            .fd = client_fd,
+            .fd = client_fd.?,
             .reader = &reader,
         }, struct {
             fn f(ctx: PingCtx) !void {
@@ -156,7 +157,7 @@ pub fn main(init: std.process.Init) !void {
             .min_sample_ns = 30 * std.time.ns_per_ms,
         }, RpcReqCtx{
             .allocator = allocator,
-            .fd = client_fd,
+            .fd = client_fd.?,
             .reader = &reader,
             .req = cap_req,
             .id = 12,
@@ -182,7 +183,7 @@ pub fn main(init: std.process.Init) !void {
             .min_sample_ns = 30 * std.time.ns_per_ms,
         }, RpcReqCtx{
             .allocator = allocator,
-            .fd = client_fd,
+            .fd = client_fd.?,
             .reader = &reader,
             .req = attach_req,
             .id = 13,
@@ -215,7 +216,7 @@ pub fn main(init: std.process.Init) !void {
         defer allocator.free(send_req);
         try runner.run("rpc_session_send_keystroke_roundtrip", .{}, RpcReqCtx{
             .allocator = allocator,
-            .fd = client_fd,
+            .fd = client_fd.?,
             .reader = &reader,
             .req = send_req,
             .id = 15,
@@ -228,16 +229,19 @@ pub fn main(init: std.process.Init) !void {
             }
         }.f);
 
-        // Terminate the idle sleep session before running broadcast throughput test.
+        // Terminate the idle sleep session and close the idle RPC client before
+        // running the broadcast fanout benchmark so it does not sit unread.
         const term_req = try std.fmt.allocPrint(
             allocator,
             "{{\"jsonrpc\":\"2.0\",\"id\":16,\"method\":\"session.terminate\",\"params\":{{\"sessionId\":\"{s}\"}}}}\n",
             .{pane_id},
         );
         defer allocator.free(term_req);
-        try sys.sendAll(client_fd, term_req);
-        const term_resp = try readResponseById(allocator, &reader, client_fd, 16);
+        try sys.sendAll(client_fd.?, term_req);
+        const term_resp = try readResponseById(allocator, &reader, client_fd.?, 16);
         allocator.free(term_resp);
+        sys.close(client_fd.?);
+        client_fd = null;
 
         // 2f. End-to-end PTY output -> daemon -> JSON-RPC pane_output fanout to 4 concurrent clients (2 MiB raw PTY output).
         const FanoutCtx = struct {
@@ -304,16 +308,19 @@ pub fn main(init: std.process.Init) !void {
                     for (0..ctx.clients) |i| sys.close(fds[i]);
                 }
 
-                // Trigger a 2 MiB producer on the server.
-                const ctrl = try connectWithWait(ctx.io, ctx.socket_path);
-                defer sys.close(ctrl);
-                var ctrl_reader: rpc_line_reader.LineReader = .{};
-                try sys.sendAll(
-                    ctrl,
-                    "{\"jsonrpc\":\"2.0\",\"id\":200,\"method\":\"session.create\",\"params\":{\"id\":\"fanout\",\"shell\":\"/bin/sh\",\"command\":\"dd if=/dev/zero bs=65536 count=32 2>/dev/null\",\"scrollbackBytes\":65536}}\n",
-                );
-                const resp = try readResponseById(ctx.allocator, &ctrl_reader, ctrl, 200);
-                defer ctx.allocator.free(resp);
+                // Trigger a 2 MiB producer on the server, then close the control
+                // socket immediately so it does not accumulate unread broadcasts.
+                {
+                    const ctrl = try connectWithWait(ctx.io, ctx.socket_path);
+                    defer sys.close(ctrl);
+                    var ctrl_reader: rpc_line_reader.LineReader = .{};
+                    try sys.sendAll(
+                        ctrl,
+                        "{\"jsonrpc\":\"2.0\",\"id\":200,\"method\":\"session.create\",\"params\":{\"id\":\"fanout\",\"shell\":\"/bin/sh\",\"command\":\"dd if=/dev/zero bs=65536 count=32 2>/dev/null\",\"scrollbackBytes\":65536}}\n",
+                    );
+                    const resp = try readResponseById(ctx.allocator, &ctrl_reader, ctrl, 200);
+                    ctx.allocator.free(resp);
+                }
 
                 for (0..ctx.clients) |i| threads[i].join();
                 var total: usize = 0;

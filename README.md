@@ -429,6 +429,42 @@ zig build fuzz-live --fuzz=150 --summary all
 deterministically without `--fuzz`. CI runs bounded coverage-guided campaigns
 for both `fuzz` and `fuzz-live` on Ubuntu on every push and pull request.
 
+### Performance benchmarks & incremental Smithers workflow
+
+`zmux` includes 85 `ReleaseFast` benchmarks across all 12 modules (`bench/`),
+paired with a committed baseline ([`bench/baseline.json`](bench/baseline.json))
+and incremental Smithers target declarations ([`.smithers/WORKSPACE.ts`](.smithers/WORKSPACE.ts),
+[`PACKAGE.ts`](PACKAGE.ts)).
+
+Each per-module test and benchmark target declares its exact Zig source
+dependency closure, and every benchmark runs in Smithers' `exclusive` tier with
+cached `.benchmarks/<module>.json` outputs so unchanged modules hit cache and
+only affected benchmarks re-run on any change:
+
+```sh
+# Run only affected unit/fuzz/integration tests and benchmarks for your changes
+smithers-build affected test //... --include-exclusive
+
+# Run benchmarks incrementally (cache-hitting unchanged modules) and print the
+# full Markdown comparison table against bench/baseline.json
+smithers-build run //:bench
+
+# Refresh bench/baseline.json from the latest cached/fresh benchmark results
+smithers-build run //:benchUpdateBaseline
+
+# Run all non-exclusive unit, fuzz, format, and integration tests
+smithers-build test //...
+```
+
+You can also invoke individual suites directly with Zig:
+
+```sh
+zig build bench-buffer                     # single module suite (ReleaseFast)
+zig build bench-server -- --quick          # faster sampling for quick iteration
+zig build bench-check                      # compile all benchmark binaries
+zig build bench                            # run all 12 benchmark suites
+```
+
 ## Acknowledgements
 
 `zmux` borrows tmux's architecture wholesale. The reference points used while

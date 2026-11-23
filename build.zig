@@ -212,62 +212,57 @@ pub fn build(b: *std.Build) void {
     });
 
     const bench_step = b.step("bench", "Run all zmux performance benchmark suites");
+    const bench_check_step = b.step("bench-check", "Compile all benchmark executables and report tool without running them");
 
     // Helper modules scoped strictly to each benchmark's dependencies.
+    // Benchmarks that touch multiple internal files import `mod_zmux` so no
+    // source file is owned by more than one Zig module (Zig lazy-analyzes
+    // `src/main.zig` so unreferenced sibling files are not compiled).
+    const mod_zmux = createRootModule(b, target, bench_optimize, "src/main.zig");
     const mod_buffer = createRootModule(b, target, bench_optimize, "src/buffer.zig");
     const mod_protocol = createRootModule(b, target, bench_optimize, "src/protocol.zig");
-    const mod_rpc_line_reader = createRootModule(b, target, bench_optimize, "src/rpc_line_reader.zig");
     const mod_log = createRootModule(b, target, bench_optimize, "src/log.zig");
     const mod_foreground = createRootModule(b, target, bench_optimize, "src/foreground.zig");
     const mod_sys = createRootModule(b, target, bench_optimize, "src/sys.zig");
     const mod_pty = createRootModule(b, target, bench_optimize, "src/pty.zig");
-    const mod_native = createRootModule(b, target, bench_optimize, "src/native.zig");
     const mod_mux = createRootModule(b, target, bench_optimize, "src/mux.zig");
-    const mod_connect = createRootModule(b, target, bench_optimize, "src/connect.zig");
     const mod_daemon = createRootModule(b, target, bench_optimize, "src/daemon.zig");
-    const mod_server = createRootModule(b, target, bench_optimize, "src/server.zig");
 
-    addBenchStep(b, bench_step, target, bench_optimize, bench_harness_mod, "buffer", "bench/buffer_bench.zig", &.{
+    addBenchStep(b, bench_step, bench_check_step, target, bench_optimize, bench_harness_mod, "buffer", "bench/buffer_bench.zig", &.{
         .{ .name = "buffer", .module = mod_buffer },
     });
-    addBenchStep(b, bench_step, target, bench_optimize, bench_harness_mod, "protocol", "bench/protocol_bench.zig", &.{
+    addBenchStep(b, bench_step, bench_check_step, target, bench_optimize, bench_harness_mod, "protocol", "bench/protocol_bench.zig", &.{
         .{ .name = "protocol", .module = mod_protocol },
     });
-    addBenchStep(b, bench_step, target, bench_optimize, bench_harness_mod, "rpc-line-reader", "bench/rpc_line_reader_bench.zig", &.{
-        .{ .name = "rpc_line_reader", .module = mod_rpc_line_reader },
-        .{ .name = "sys", .module = mod_sys },
+    addBenchStep(b, bench_step, bench_check_step, target, bench_optimize, bench_harness_mod, "rpc-line-reader", "bench/rpc_line_reader_bench.zig", &.{
+        .{ .name = "zmux", .module = mod_zmux },
     });
-    addBenchStep(b, bench_step, target, bench_optimize, bench_harness_mod, "log", "bench/log_bench.zig", &.{
+    addBenchStep(b, bench_step, bench_check_step, target, bench_optimize, bench_harness_mod, "log", "bench/log_bench.zig", &.{
         .{ .name = "log", .module = mod_log },
     });
-    addBenchStep(b, bench_step, target, bench_optimize, bench_harness_mod, "foreground", "bench/foreground_bench.zig", &.{
+    addBenchStep(b, bench_step, bench_check_step, target, bench_optimize, bench_harness_mod, "foreground", "bench/foreground_bench.zig", &.{
         .{ .name = "foreground", .module = mod_foreground },
     });
-    addBenchStep(b, bench_step, target, bench_optimize, bench_harness_mod, "sys", "bench/sys_bench.zig", &.{
+    addBenchStep(b, bench_step, bench_check_step, target, bench_optimize, bench_harness_mod, "sys", "bench/sys_bench.zig", &.{
         .{ .name = "sys", .module = mod_sys },
     });
-    addBenchStep(b, bench_step, target, bench_optimize, bench_harness_mod, "pty", "bench/pty_bench.zig", &.{
+    addBenchStep(b, bench_step, bench_check_step, target, bench_optimize, bench_harness_mod, "pty", "bench/pty_bench.zig", &.{
         .{ .name = "pty", .module = mod_pty },
     });
-    addBenchStep(b, bench_step, target, bench_optimize, bench_harness_mod, "native", "bench/native_bench.zig", &.{
-        .{ .name = "buffer", .module = mod_buffer },
-        .{ .name = "native", .module = mod_native },
+    addBenchStep(b, bench_step, bench_check_step, target, bench_optimize, bench_harness_mod, "native", "bench/native_bench.zig", &.{
+        .{ .name = "zmux", .module = mod_zmux },
     });
-    addBenchStep(b, bench_step, target, bench_optimize, bench_harness_mod, "mux", "bench/mux_bench.zig", &.{
+    addBenchStep(b, bench_step, bench_check_step, target, bench_optimize, bench_harness_mod, "mux", "bench/mux_bench.zig", &.{
         .{ .name = "mux", .module = mod_mux },
     });
-    addBenchStep(b, bench_step, target, bench_optimize, bench_harness_mod, "connect", "bench/connect_bench.zig", &.{
-        .{ .name = "connect", .module = mod_connect },
-        .{ .name = "sys", .module = mod_sys },
+    addBenchStep(b, bench_step, bench_check_step, target, bench_optimize, bench_harness_mod, "connect", "bench/connect_bench.zig", &.{
+        .{ .name = "zmux", .module = mod_zmux },
     });
-    addBenchStep(b, bench_step, target, bench_optimize, bench_harness_mod, "daemon", "bench/daemon_bench.zig", &.{
+    addBenchStep(b, bench_step, bench_check_step, target, bench_optimize, bench_harness_mod, "daemon", "bench/daemon_bench.zig", &.{
         .{ .name = "daemon", .module = mod_daemon },
     });
-    addBenchStep(b, bench_step, target, bench_optimize, bench_harness_mod, "server", "bench/server_bench.zig", &.{
-        .{ .name = "buffer", .module = mod_buffer },
-        .{ .name = "rpc_line_reader", .module = mod_rpc_line_reader },
-        .{ .name = "server", .module = mod_server },
-        .{ .name = "sys", .module = mod_sys },
+    addBenchStep(b, bench_step, bench_check_step, target, bench_optimize, bench_harness_mod, "server", "bench/server_bench.zig", &.{
+        .{ .name = "zmux", .module = mod_zmux },
     });
 
     const report_mod = b.createModule(.{
@@ -279,6 +274,7 @@ pub fn build(b: *std.Build) void {
         .name = "zmux-bench-report",
         .root_module = report_mod,
     });
+    bench_check_step.dependOn(&report_exe.step);
     const run_report = b.addRunArtifact(report_exe);
     run_report.addPassthruArgs();
     const report_step = b.step("bench-report", "Aggregate benchmark JSON outputs and compare against baseline");
@@ -303,6 +299,7 @@ fn addUnitTestStep(
 fn addBenchStep(
     b: *std.Build,
     all_bench_step: *std.Build.Step,
+    bench_check_step: *std.Build.Step,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     bench_harness_mod: *std.Build.Module,
@@ -324,6 +321,7 @@ fn addBenchStep(
         .name = "bench-" ++ name,
         .root_module = mod,
     });
+    bench_check_step.dependOn(&exe.step);
     const run = b.addRunArtifact(exe);
     run.addPassthruArgs();
 

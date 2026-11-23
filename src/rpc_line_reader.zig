@@ -11,7 +11,7 @@ const sys = @import("sys.zig");
 /// share a socket with a concurrent writer thread. Only the timeout variants
 /// need an `std.Io`, to read the monotonic clock.
 pub const LineReader = struct {
-    buffer: [4096]u8 = undefined,
+    buffer: [32 * 1024]u8 = undefined,
     start: usize = 0,
     end: usize = 0,
 
@@ -95,26 +95,26 @@ pub const LineReader = struct {
             if (try self.appendBufferedLine(allocator, &out, max_len)) |line| return line;
             if (self.bufferedLen() != 0) try self.appendBufferedBytes(allocator, &out, max_len);
 
-            const poll_timeout_ms: i32 = if (deadline) |d| blk: {
+            if (deadline) |d| {
                 const remaining_ms = d.remainingMs();
                 if (remaining_ms <= 0) return error.ReadTimeout;
-                break :blk @intCast(@min(remaining_ms, std.math.maxInt(i32)));
-            } else -1;
+                const poll_timeout_ms: i32 = @intCast(@min(remaining_ms, std.math.maxInt(i32)));
 
-            var fds = [_]posix.pollfd{.{
-                .fd = fd,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            }};
-            const ready = try posix.poll(&fds, poll_timeout_ms);
-            if (ready == 0) return error.ReadTimeout;
+                var fds = [_]posix.pollfd{.{
+                    .fd = fd,
+                    .events = posix.POLL.IN,
+                    .revents = 0,
+                }};
+                const ready = try posix.poll(&fds, poll_timeout_ms);
+                if (ready == 0) return error.ReadTimeout;
 
-            if ((fds[0].revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0 and
-                (fds[0].revents & posix.POLL.IN) == 0)
-            {
-                return error.ConnectionClosed;
+                if ((fds[0].revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0 and
+                    (fds[0].revents & posix.POLL.IN) == 0)
+                {
+                    return error.ConnectionClosed;
+                }
+                if ((fds[0].revents & (posix.POLL.IN | posix.POLL.HUP)) == 0) continue;
             }
-            if ((fds[0].revents & (posix.POLL.IN | posix.POLL.HUP)) == 0) continue;
 
             const n = posix.read(fd, self.buffer[0..]) catch |err| switch (err) {
                 error.WouldBlock => continue,
@@ -145,6 +145,12 @@ pub const LineReader = struct {
         const newline_index = std.mem.indexOfScalar(u8, pending, '\n') orelse return null;
         const line_len = newline_index + 1;
         if (out.items.len + line_len > max_len) return error.MessageTooLarge;
+        if (out.items.len == 0) {
+            const line = try allocator.dupe(u8, pending[0..line_len]);
+            self.start += line_len;
+            self.compact();
+            return line;
+        }
         try out.appendSlice(allocator, pending[0..line_len]);
         self.start += line_len;
         self.compact();

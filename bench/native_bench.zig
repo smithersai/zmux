@@ -1,7 +1,8 @@
 const std = @import("std");
 const bench = @import("bench");
-const buffer = @import("buffer");
-const native = @import("native");
+const zmux = @import("zmux");
+const buffer = zmux.buffer;
+const native = zmux.native;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;

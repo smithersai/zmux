@@ -183,9 +183,29 @@ const Line = struct {
     }
 
     fn string(self: *Line, bytes: []const u8) void {
+        if (self.overflow) return;
+        // Every input byte emits at least 1 output byte (escaping only expands),
+        // plus 2 bytes for the surrounding quotes. Reject guaranteed overflows
+        // in O(1) without scanning the input.
+        if (self.buf.len - self.len < bytes.len + 2) {
+            self.overflow = true;
+            return;
+        }
         self.raw("\"");
         var i: usize = 0;
-        while (i < bytes.len) {
+        while (i < bytes.len and !self.overflow) {
+            // Fast path: batch-copy contiguous runs of plain printable ASCII.
+            const run_start = i;
+            while (i < bytes.len) {
+                const c = bytes[i];
+                if (c < 0x20 or c >= 0x7f or c == '"' or c == '\\') break;
+                i += 1;
+            }
+            if (i > run_start) {
+                self.raw(bytes[run_start..i]);
+                if (i >= bytes.len or self.overflow) break;
+            }
+
             const byte = bytes[i];
             switch (byte) {
                 '"' => {
@@ -228,10 +248,7 @@ const Line = struct {
                         i += 1;
                     }
                 },
-                else => {
-                    self.raw(&.{byte});
-                    i += 1;
-                },
+                else => unreachable,
             }
         }
         self.raw("\"");

@@ -38,6 +38,97 @@ const staging_dir_random_hex_max = 8;
 const staging_dir_random_hex_min = 4;
 const staging_dir_attempts = 16;
 
+const BroadcastPayload = struct {
+    allocator: Allocator,
+    ref_count: std.atomic.Value(u32),
+    data: []u8,
+
+    fn createOwned(allocator: Allocator, owned_data: []u8) !*BroadcastPayload {
+        const self = try allocator.create(BroadcastPayload);
+        self.* = .{
+            .allocator = allocator,
+            .ref_count = std.atomic.Value(u32).init(1),
+            .data = owned_data,
+        };
+        return self;
+    }
+
+    fn createCopy(allocator: Allocator, bytes: []const u8) !*BroadcastPayload {
+        const owned = try allocator.dupe(u8, bytes);
+        errdefer allocator.free(owned);
+        return createOwned(allocator, owned);
+    }
+
+    fn retain(self: *BroadcastPayload) *BroadcastPayload {
+        _ = self.ref_count.fetchAdd(1, .monotonic);
+        return self;
+    }
+
+    fn release(self: *BroadcastPayload) void {
+        if (self.ref_count.fetchSub(1, .acq_rel) == 1) {
+            const allocator = self.allocator;
+            allocator.free(self.data);
+            allocator.destroy(self);
+        }
+    }
+
+    /// Consume one reference and return an allocator-owned slice. When this
+    /// reference is the last owner, transfers `self.data` directly with zero copy.
+    fn intoOwnedBytes(self: *BroadcastPayload) Allocator.Error![]u8 {
+        if (self.ref_count.load(.acquire) == 1) {
+            const allocator = self.allocator;
+            const data = self.data;
+            allocator.destroy(self);
+            return data;
+        }
+        const duped = try self.allocator.dupe(u8, self.data);
+        self.release();
+        return duped;
+    }
+};
+
+/// O(1) power-of-two ring queue of ref-counted broadcast frames.
+const BroadcastQueue = struct {
+    items: []*BroadcastPayload = &.{},
+    head: usize = 0,
+    len: usize = 0,
+
+    fn push(self: *BroadcastQueue, allocator: Allocator, payload: *BroadcastPayload) !void {
+        if (self.len == self.items.len) {
+            const new_cap: usize = if (self.items.len == 0) 16 else self.items.len * 2;
+            const new_items = try allocator.alloc(*BroadcastPayload, new_cap);
+            if (self.len > 0) {
+                const first_len = @min(self.len, self.items.len - self.head);
+                @memcpy(new_items[0..first_len], self.items[self.head .. self.head + first_len]);
+                if (first_len < self.len) {
+                    @memcpy(new_items[first_len..self.len], self.items[0 .. self.len - first_len]);
+                }
+            }
+            if (self.items.len > 0) allocator.free(self.items);
+            self.items = new_items;
+            self.head = 0;
+        }
+        const mask = self.items.len - 1;
+        self.items[(self.head + self.len) & mask] = payload;
+        self.len += 1;
+    }
+
+    fn pop(self: *BroadcastQueue) ?*BroadcastPayload {
+        if (self.len == 0) return null;
+        const mask = self.items.len - 1;
+        const payload = self.items[self.head];
+        self.head = (self.head + 1) & mask;
+        self.len -= 1;
+        return payload;
+    }
+
+    fn deinit(self: *BroadcastQueue, allocator: Allocator) void {
+        while (self.pop()) |payload| payload.release();
+        if (self.items.len > 0) allocator.free(self.items);
+        self.* = .{};
+    }
+};
+
 const ClientConnection = struct {
     allocator: Allocator,
     io: std.Io,
@@ -50,7 +141,7 @@ const ClientConnection = struct {
     attachment_mutex: std.Io.Mutex = .init,
     ref_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
     closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    pending_writes: std.ArrayList([]u8) = .empty,
+    pending_writes: BroadcastQueue = .{},
     queued_bytes: usize = 0,
     attached_mux_clients: std.ArrayList([]u8) = .empty,
 
@@ -86,7 +177,7 @@ const ClientConnection = struct {
         const prev = self.ref_count.fetchSub(1, .seq_cst);
         if (prev == 1) {
             // Copy the allocator out of `self` before any destroy: the
-            // ArrayList's deinit + the destroy(self) below both need the
+            // queue's deinit + the destroy(self) below both need the
             // allocator, but reading `self.allocator` after `destroy(self)`
             // is a use-after-free that the testing allocator's poisoning
             // turns into a segfault.
@@ -96,10 +187,9 @@ const ClientConnection = struct {
             mux_clients.deinit(allocator);
             self.queue_mutex.lockUncancelable(self.io);
             var pending = self.pending_writes;
-            self.pending_writes = .empty;
+            self.pending_writes = .{};
             self.queued_bytes = 0;
             self.queue_mutex.unlock(self.io);
-            for (pending.items) |owned| allocator.free(owned);
             pending.deinit(allocator);
             sys.close(self.fd);
             allocator.destroy(self);
@@ -108,6 +198,10 @@ const ClientConnection = struct {
 
     fn isClosed(self: *const ClientConnection) bool {
         return self.closed.load(.seq_cst);
+    }
+
+    pub fn pendingWriteCount(self: *const ClientConnection) usize {
+        return self.pending_writes.len;
     }
 
     fn close(self: *ClientConnection) void {
@@ -130,35 +224,69 @@ const ClientConnection = struct {
         };
     }
 
-    fn enqueueBroadcast(self: *ClientConnection, bytes: []const u8) !void {
-        const owned = try self.allocator.dupe(u8, bytes);
-        errdefer self.allocator.free(owned);
+    fn writeBatch(self: *ClientConnection, batch: []*BroadcastPayload) !void {
+        if (batch.len == 1) return self.write(batch[0].data);
 
+        var total: usize = 0;
+        for (batch) |item| total += item.data.len;
+
+        // Coalesce small/medium queued frames into one syscall under one lock.
+        if (total <= 64 * 1024) {
+            var coalesce_buf: [64 * 1024]u8 = undefined;
+            var pos: usize = 0;
+            for (batch) |item| {
+                @memcpy(coalesce_buf[pos..][0..item.data.len], item.data);
+                pos += item.data.len;
+            }
+            return self.write(coalesce_buf[0..pos]);
+        }
+
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
+        if (self.isClosed()) return error.ConnectionClosed;
+        for (batch) |item| {
+            writeAll(self.fd, item.data) catch |err| {
+                self.close();
+                return err;
+            };
+        }
+    }
+
+    fn enqueueBroadcastPayload(self: *ClientConnection, payload: *BroadcastPayload) !void {
+        const len = payload.data.len;
         self.queue_mutex.lockUncancelable(self.io);
         if (self.isClosed()) {
             self.queue_mutex.unlock(self.io);
             return error.ConnectionClosed;
         }
-        if (owned.len > broadcast_queue_max_bytes or self.queued_bytes > broadcast_queue_max_bytes - owned.len) {
+        if (len > broadcast_queue_max_bytes or self.queued_bytes > broadcast_queue_max_bytes - len) {
             const queued_bytes = self.queued_bytes;
             self.queue_mutex.unlock(self.io);
             // Sizes only: the queued bytes are PTY output and are never logged.
             log.warn("client_backlogged", .{
                 .queued_bytes = queued_bytes,
-                .rejected_bytes = owned.len,
+                .rejected_bytes = len,
                 .max_queued_bytes = broadcast_queue_max_bytes,
             });
             self.close();
             return error.ConnectionBacklogged;
         }
 
-        self.pending_writes.append(self.allocator, owned) catch |err| {
+        const retained = payload.retain();
+        self.pending_writes.push(self.allocator, retained) catch |err| {
             self.queue_mutex.unlock(self.io);
+            retained.release();
             return err;
         };
-        self.queued_bytes += owned.len;
+        self.queued_bytes += len;
         self.queue_condition.signal(self.io);
         self.queue_mutex.unlock(self.io);
+    }
+
+    fn enqueueBroadcast(self: *ClientConnection, bytes: []const u8) !void {
+        const payload = try BroadcastPayload.createCopy(self.allocator, bytes);
+        defer payload.release();
+        try self.enqueueBroadcastPayload(payload);
     }
 
     fn writerThread(self: *ClientConnection) void {
@@ -173,24 +301,52 @@ const ClientConnection = struct {
             if (server) |active| active.finishActiveWriter();
         }
 
-        while (self.takeQueuedWrite()) |owned| {
-            defer self.allocator.free(owned);
-            self.write(owned) catch return;
+        var batch: [16]*BroadcastPayload = undefined;
+        while (true) {
+            const n = self.takeQueuedBatch(&batch);
+            if (n == 0) return;
+            defer {
+                for (batch[0..n]) |payload| payload.release();
+            }
+            self.writeBatch(batch[0..n]) catch return;
         }
+    }
+
+    fn takeQueuedBatch(self: *ClientConnection, out: []*BroadcastPayload) usize {
+        self.queue_mutex.lockUncancelable(self.io);
+        defer self.queue_mutex.unlock(self.io);
+
+        while (self.pending_writes.len == 0 and !self.isClosed()) {
+            self.queue_condition.waitUncancelable(self.io, &self.queue_mutex);
+        }
+
+        var count: usize = 0;
+        while (count < out.len) {
+            const payload = self.pending_writes.pop() orelse break;
+            self.queued_bytes -= payload.data.len;
+            out[count] = payload;
+            count += 1;
+        }
+        return count;
     }
 
     fn takeQueuedWrite(self: *ClientConnection) ?[]u8 {
         self.queue_mutex.lockUncancelable(self.io);
-        defer self.queue_mutex.unlock(self.io);
-
-        while (self.pending_writes.items.len == 0 and !self.isClosed()) {
+        while (self.pending_writes.len == 0 and !self.isClosed()) {
             self.queue_condition.waitUncancelable(self.io, &self.queue_mutex);
         }
 
-        if (self.pending_writes.items.len == 0) return null;
-        const owned = self.pending_writes.orderedRemove(0);
-        self.queued_bytes -= owned.len;
-        return owned;
+        const payload = self.pending_writes.pop() orelse {
+            self.queue_mutex.unlock(self.io);
+            return null;
+        };
+        self.queued_bytes -= payload.data.len;
+        self.queue_mutex.unlock(self.io);
+
+        return payload.intoOwnedBytes() catch {
+            payload.release();
+            return null;
+        };
     }
 
     fn trackMuxClient(self: *ClientConnection, client_id: []const u8) !void {
@@ -249,6 +405,7 @@ pub const Server = struct {
     listener_fd: posix.fd_t,
     manager: mux.Manager,
     connections: std.ArrayList(*ClientConnection) = .empty,
+    connected_clients: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     active_connections: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     active_writer_threads: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
@@ -377,6 +534,7 @@ pub const Server = struct {
                 continue;
             }
             setSocketSendTimeout(client_fd);
+            sys.tuneUnixSocketBuffers(client_fd);
             self.touch();
             const previous_connections = self.active_connections.fetchAdd(1, .seq_cst);
             if (previous_connections >= max_client_connections) {
@@ -654,20 +812,19 @@ pub const Server = struct {
         errdefer _ = self.manager.detachClient(client.id);
         try connection.trackMuxClient(client.id);
         errdefer _ = connection.untrackMuxClient(client.id);
-        const scrollback = try self.manager.paneScrollbackSnapshot(self.allocator, client.pane_id);
-        defer self.allocator.free(scrollback);
-        const replay_bytes = truncatedReplay(scrollback, attach_replay_max_bytes);
-        const replay_b64 = try base64Encode(self.allocator, replay_bytes);
-        defer self.allocator.free(replay_b64);
-        const response = try protocol.result(self.allocator, req.id_json, .{
-            .clientId = client.id,
-            .sessionId = client.session_id,
-            .windowId = client.window_id,
-            .paneId = client.pane_id,
-            .rows = client.rows,
-            .cols = client.cols,
-            .replayBase64 = replay_b64,
-        });
+        const replay_bytes = try self.manager.paneScrollbackTail(self.allocator, client.pane_id, attach_replay_max_bytes);
+        defer self.allocator.free(replay_bytes);
+        const response = try protocol.attachResult(
+            self.allocator,
+            req.id_json,
+            client.id,
+            client.session_id,
+            client.window_id,
+            client.pane_id,
+            client.rows,
+            client.cols,
+            replay_bytes,
+        );
         defer self.allocator.free(response);
         try connection.write(response);
     }
@@ -894,7 +1051,9 @@ pub const Server = struct {
         self.connections.append(self.allocator, connection.retain()) catch {
             connection.close();
             connection.release();
+            return;
         };
+        self.connected_clients.store(self.connections.items.len, .release);
     }
 
     fn unregisterConnection(self: *Server, connection: *ClientConnection) void {
@@ -905,6 +1064,7 @@ pub const Server = struct {
         for (self.connections.items, 0..) |active, index| {
             if (active == connection) {
                 const removed = self.connections.swapRemove(index);
+                self.connected_clients.store(self.connections.items.len, .release);
                 removed.release();
                 break;
             }
@@ -924,6 +1084,7 @@ pub const Server = struct {
         self.mutex.lockUncancelable(self.io);
         var connections = self.connections;
         self.connections = .empty;
+        self.connected_clients.store(0, .release);
         self.mutex.unlock(self.io);
 
         defer connections.deinit(self.allocator);
@@ -961,21 +1122,44 @@ pub const Server = struct {
         }
     }
 
-    fn broadcast(self: *Server, payload: []const u8) !void {
+    fn broadcastOwned(self: *Server, owned_payload: []u8) void {
+        var stack_snapshot: [max_client_connections]*ClientConnection = undefined;
+        var heap_snapshot: ?[]*ClientConnection = null;
+
         self.mutex.lockUncancelable(self.io);
-        const snapshot = self.allocator.alloc(*ClientConnection, self.connections.items.len) catch |err| {
+        const count = self.connections.items.len;
+        if (count == 0) {
             self.mutex.unlock(self.io);
-            return err;
+            self.allocator.free(owned_payload);
+            return;
+        }
+        const snapshot: []*ClientConnection = if (count <= stack_snapshot.len)
+            stack_snapshot[0..count]
+        else blk: {
+            const allocated = self.allocator.alloc(*ClientConnection, count) catch {
+                self.mutex.unlock(self.io);
+                self.allocator.free(owned_payload);
+                return;
+            };
+            heap_snapshot = allocated;
+            break :blk allocated;
         };
         for (self.connections.items, 0..) |connection, index| {
             snapshot[index] = connection.retain();
         }
         self.mutex.unlock(self.io);
-        defer self.allocator.free(snapshot);
+        defer if (heap_snapshot) |buf| self.allocator.free(buf);
+
+        const shared = BroadcastPayload.createOwned(self.allocator, owned_payload) catch {
+            self.allocator.free(owned_payload);
+            for (snapshot) |connection| connection.release();
+            return;
+        };
+        defer shared.release();
 
         for (snapshot) |connection| {
             defer connection.release();
-            connection.enqueueBroadcast(payload) catch {
+            connection.enqueueBroadcastPayload(shared) catch {
                 self.unregisterConnection(connection);
             };
         }
@@ -983,59 +1167,53 @@ pub const Server = struct {
 
     fn handleNativeEvent(context: *anyopaque, event: native_mod.Event) void {
         const self: *Server = @ptrCast(@alignCast(context));
+        switch (event) {
+            .session_exited => |params| self.manager.markExited(params.session_id),
+            .pane_output => |params| self.manager.markActivity(params.pane_id),
+            .pane_activity => |params| self.manager.markActivityAt(params.pane_id, params.last_activity_ms),
+            .pane_bell => |params| self.manager.markBellAt(params.pane_id, params.last_bell_ms),
+            .foreground_changed => {},
+        }
+
+        // Skip base64 encoding and JSON serialization entirely when no clients
+        // are connected to receive broadcasts.
+        if (self.connected_clients.load(.acquire) == 0) return;
+
         const payload = switch (event) {
             .foreground_changed => |params| protocol.notification(
                 self.allocator,
                 protocol.foreground_changed_method,
                 params,
             ),
-            .session_exited => |params| blk: {
-                self.manager.markExited(params.session_id);
-                break :blk protocol.notification(
-                    self.allocator,
-                    protocol.session_exited_method,
-                    params,
-                );
-            },
-            .pane_output => |params| blk: {
-                self.manager.markActivity(params.pane_id);
-                const encoded = base64Encode(self.allocator, params.data) catch return;
-                defer self.allocator.free(encoded);
-                break :blk protocol.notification(
-                    self.allocator,
-                    protocol.pane_output_method,
-                    protocol.PaneOutputParams{
-                        .pane_id = params.pane_id,
-                        .data_base64 = encoded,
-                    },
-                );
-            },
-            .pane_activity => |params| blk: {
-                self.manager.markActivity(params.pane_id);
-                break :blk protocol.notification(
-                    self.allocator,
-                    protocol.pane_activity_method,
-                    protocol.PaneActivityParams{
-                        .pane_id = params.pane_id,
-                        .last_activity_ms = params.last_activity_ms,
-                    },
-                );
-            },
-            .pane_bell => |params| blk: {
-                self.manager.markBell(params.pane_id);
-                break :blk protocol.notification(
-                    self.allocator,
-                    protocol.pane_bell_method,
-                    protocol.PaneBellParams{
-                        .pane_id = params.pane_id,
-                        .last_bell_ms = params.last_bell_ms,
-                    },
-                );
-            },
+            .session_exited => |params| protocol.notification(
+                self.allocator,
+                protocol.session_exited_method,
+                params,
+            ),
+            .pane_output => |params| protocol.paneOutputNotification(
+                self.allocator,
+                params.pane_id,
+                params.data,
+            ),
+            .pane_activity => |params| protocol.notification(
+                self.allocator,
+                protocol.pane_activity_method,
+                protocol.PaneActivityParams{
+                    .pane_id = params.pane_id,
+                    .last_activity_ms = params.last_activity_ms,
+                },
+            ),
+            .pane_bell => |params| protocol.notification(
+                self.allocator,
+                protocol.pane_bell_method,
+                protocol.PaneBellParams{
+                    .pane_id = params.pane_id,
+                    .last_bell_ms = params.last_bell_ms,
+                },
+            ),
         } catch return;
 
-        defer self.allocator.free(payload);
-        self.broadcast(payload) catch {};
+        self.broadcastOwned(payload);
     }
 };
 
