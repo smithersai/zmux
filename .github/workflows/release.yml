@@ -24,10 +24,11 @@ jobs:
             runner: ubuntu-latest
             zig_target: aarch64-linux-musl
           - name: macos-arm64
-            runner: macos-latest
+            # Zig 0.15.2 cannot link against the newer macOS SDK.
+            runner: macos-15
             zig_target: aarch64-macos
           - name: macos-x64
-            runner: macos-latest
+            runner: macos-15
             zig_target: x86_64-macos
     steps:
       - name: Checkout
