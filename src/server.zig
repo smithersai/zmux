@@ -6,6 +6,7 @@ const mux = @import("mux.zig");
 const native_mod = @import("native.zig");
 const protocol = @import("protocol.zig");
 const rpc_line_reader = @import("rpc_line_reader.zig");
+const sys = @import("sys.zig");
 
 const Allocator = std.mem.Allocator;
 const NativeSession = native_mod.NativeSession;
@@ -27,7 +28,7 @@ const accept_backoff_ms: i64 = 50;
 
 /// Longest socket path `bind(2)` accepts: `sun_path` minus its NUL terminator
 /// (103 bytes on macOS, 107 on Linux).
-pub const max_socket_path_len: usize = @field(@as(posix.sockaddr.un, undefined), "path").len - 1;
+pub const max_socket_path_len: usize = sys.max_unix_path_len;
 
 /// Name of the socket inside its private staging directory. Kept to one byte so
 /// the staging path fits in `sun_path` for nearly every valid socket path.
@@ -39,23 +40,25 @@ const staging_dir_attempts = 16;
 
 const ClientConnection = struct {
     allocator: Allocator,
+    io: std.Io,
     fd: posix.fd_t,
     server: ?*Server = null,
     reader: LineReader = .{},
-    write_mutex: std.Thread.Mutex = .{},
-    queue_mutex: std.Thread.Mutex = .{},
-    queue_condition: std.Thread.Condition = .{},
-    attachment_mutex: std.Thread.Mutex = .{},
+    write_mutex: std.Io.Mutex = .init,
+    queue_mutex: std.Io.Mutex = .init,
+    queue_condition: std.Io.Condition = .init,
+    attachment_mutex: std.Io.Mutex = .init,
     ref_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
     closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     pending_writes: std.ArrayList([]u8) = .empty,
     queued_bytes: usize = 0,
     attached_mux_clients: std.ArrayList([]u8) = .empty,
 
-    fn create(allocator: Allocator, fd: posix.fd_t) !*ClientConnection {
+    fn create(allocator: Allocator, io: std.Io, fd: posix.fd_t) !*ClientConnection {
         const connection = try allocator.create(ClientConnection);
         connection.* = .{
             .allocator = allocator,
+            .io = io,
             .fd = fd,
         };
         return connection;
@@ -91,14 +94,14 @@ const ClientConnection = struct {
             var mux_clients = self.takeMuxClients();
             for (mux_clients.items) |client_id| allocator.free(client_id);
             mux_clients.deinit(allocator);
-            self.queue_mutex.lock();
+            self.queue_mutex.lockUncancelable(self.io);
             var pending = self.pending_writes;
             self.pending_writes = .empty;
             self.queued_bytes = 0;
-            self.queue_mutex.unlock();
+            self.queue_mutex.unlock(self.io);
             for (pending.items) |owned| allocator.free(owned);
             pending.deinit(allocator);
-            posix.close(self.fd);
+            sys.close(self.fd);
             allocator.destroy(self);
         }
     }
@@ -110,15 +113,15 @@ const ClientConnection = struct {
     fn close(self: *ClientConnection) void {
         if (!self.closed.swap(true, .seq_cst)) {
             _ = std.c.shutdown(self.fd, @intCast(posix.SHUT.RDWR));
-            self.queue_mutex.lock();
-            self.queue_condition.broadcast();
-            self.queue_mutex.unlock();
+            self.queue_mutex.lockUncancelable(self.io);
+            self.queue_condition.broadcast(self.io);
+            self.queue_mutex.unlock(self.io);
         }
     }
 
     fn write(self: *ClientConnection, bytes: []const u8) !void {
-        self.write_mutex.lock();
-        defer self.write_mutex.unlock();
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
 
         if (self.isClosed()) return error.ConnectionClosed;
         writeAll(self.fd, bytes) catch |err| {
@@ -131,14 +134,14 @@ const ClientConnection = struct {
         const owned = try self.allocator.dupe(u8, bytes);
         errdefer self.allocator.free(owned);
 
-        self.queue_mutex.lock();
+        self.queue_mutex.lockUncancelable(self.io);
         if (self.isClosed()) {
-            self.queue_mutex.unlock();
+            self.queue_mutex.unlock(self.io);
             return error.ConnectionClosed;
         }
         if (owned.len > broadcast_queue_max_bytes or self.queued_bytes > broadcast_queue_max_bytes - owned.len) {
             const queued_bytes = self.queued_bytes;
-            self.queue_mutex.unlock();
+            self.queue_mutex.unlock(self.io);
             // Sizes only: the queued bytes are PTY output and are never logged.
             log.warn("client_backlogged", .{
                 .queued_bytes = queued_bytes,
@@ -150,12 +153,12 @@ const ClientConnection = struct {
         }
 
         self.pending_writes.append(self.allocator, owned) catch |err| {
-            self.queue_mutex.unlock();
+            self.queue_mutex.unlock(self.io);
             return err;
         };
         self.queued_bytes += owned.len;
-        self.queue_condition.signal();
-        self.queue_mutex.unlock();
+        self.queue_condition.signal(self.io);
+        self.queue_mutex.unlock(self.io);
     }
 
     fn writerThread(self: *ClientConnection) void {
@@ -177,11 +180,11 @@ const ClientConnection = struct {
     }
 
     fn takeQueuedWrite(self: *ClientConnection) ?[]u8 {
-        self.queue_mutex.lock();
-        defer self.queue_mutex.unlock();
+        self.queue_mutex.lockUncancelable(self.io);
+        defer self.queue_mutex.unlock(self.io);
 
         while (self.pending_writes.items.len == 0 and !self.isClosed()) {
-            self.queue_condition.wait(&self.queue_mutex);
+            self.queue_condition.waitUncancelable(self.io, &self.queue_mutex);
         }
 
         if (self.pending_writes.items.len == 0) return null;
@@ -191,8 +194,8 @@ const ClientConnection = struct {
     }
 
     fn trackMuxClient(self: *ClientConnection, client_id: []const u8) !void {
-        self.attachment_mutex.lock();
-        defer self.attachment_mutex.unlock();
+        self.attachment_mutex.lockUncancelable(self.io);
+        defer self.attachment_mutex.unlock(self.io);
 
         for (self.attached_mux_clients.items) |active| {
             if (std.mem.eql(u8, active, client_id)) return;
@@ -204,8 +207,8 @@ const ClientConnection = struct {
     }
 
     fn untrackMuxClient(self: *ClientConnection, client_id: []const u8) bool {
-        self.attachment_mutex.lock();
-        defer self.attachment_mutex.unlock();
+        self.attachment_mutex.lockUncancelable(self.io);
+        defer self.attachment_mutex.unlock(self.io);
 
         for (self.attached_mux_clients.items, 0..) |active, index| {
             if (std.mem.eql(u8, active, client_id)) {
@@ -218,8 +221,8 @@ const ClientConnection = struct {
     }
 
     fn takeMuxClients(self: *ClientConnection) std.ArrayList([]u8) {
-        self.attachment_mutex.lock();
-        defer self.attachment_mutex.unlock();
+        self.attachment_mutex.lockUncancelable(self.io);
+        defer self.attachment_mutex.unlock(self.io);
 
         const attached = self.attached_mux_clients;
         self.attached_mux_clients = .empty;
@@ -227,50 +230,66 @@ const ClientConnection = struct {
     }
 };
 
+/// JSON-RPC daemon over a private (0600) UNIX socket.
+///
+/// `init` binds the socket, `run` accepts connections until `daemon.shutdown`,
+/// the idle timeout, or the shutdown probe stops it, and `deinit` releases
+/// everything. Each connection gets a reader thread and a broadcast writer
+/// thread (`std.Thread`); `io` supplies their mutexes and condition variables,
+/// the clocks, sleeps, randomness, and filesystem access. Pass a thread-safe
+/// implementation such as `std.Io.Threaded` (`std.process.Init.io` in `main`).
 pub const Server = struct {
     pub const ShutdownProbe = *const fn () bool;
 
     allocator: Allocator,
-    mutex: std.Thread.Mutex = .{},
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
     socket_path: []u8,
-    socket_stat: posix.Stat,
+    socket_stat: sys.Stat,
     listener_fd: posix.fd_t,
     manager: mux.Manager,
     connections: std.ArrayList(*ClientConnection) = .empty,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     active_connections: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     active_writer_threads: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    active_mutex: std.Thread.Mutex = .{},
-    active_condition: std.Thread.Condition = .{},
+    active_mutex: std.Io.Mutex = .init,
+    active_condition: std.Io.Condition = .init,
+    /// Monotonic (`.awake` clock) seconds of the last client activity.
     last_activity_seconds: std.atomic.Value(i64),
     idle_timeout_seconds: i64,
     shutdown_probe: ?ShutdownProbe = null,
 
-    pub fn init(allocator: Allocator, socket_path: []const u8, idle_timeout_seconds: i64) !Server {
+    /// Bind `socket_path` (absolute) and prepare to serve. A server with no
+    /// live panes exits from `run` after `idle_timeout_seconds` without
+    /// client activity; 0 or less disables the timeout.
+    ///
+    /// Fails with `error.SocketPathTooLong` before touching the filesystem when
+    /// the path exceeds `max_socket_path_len`.
+    pub fn init(allocator: Allocator, io: std.Io, socket_path: []const u8, idle_timeout_seconds: i64) !Server {
         // Reject before touching the filesystem: an over-long path can never
         // be bound, and must not leave a parent directory or lock behind.
         if (socket_path.len > max_socket_path_len) return error.SocketPathTooLong;
 
         try ensureSocketParent(socket_path);
-        std.fs.deleteFileAbsolute(socket_path) catch |err| switch (err) {
+        std.Io.Dir.deleteFileAbsolute(io, socket_path) catch |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
         };
 
-        const listener = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-        errdefer posix.close(listener);
+        const listener = try sys.unixStreamSocket();
+        errdefer sys.close(listener);
 
         // Bind owner-only (0600) without touching the process-wide umask; see
         // bindPrivateSocket for why the socket is never visible with a wider
         // mode.
-        try bindPrivateSocket(listener, socket_path);
-        errdefer std.fs.deleteFileAbsolute(socket_path) catch {};
+        try bindPrivateSocket(io, listener, socket_path);
+        errdefer std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
 
         // Size the accept backlog to the connection cap so a burst of clients
         // (e.g. a fleader spawning many attachers at once) is queued rather
         // than refused while the accept loop drains it. The kernel silently
         // clamps to somaxconn.
-        try posix.listen(listener, @intCast(max_client_connections));
+        try sys.listen(listener, @intCast(max_client_connections));
         const socket_stat = try socketPathStat(socket_path);
         const owned_socket_path = try allocator.dupe(u8, socket_path);
 
@@ -282,11 +301,12 @@ pub const Server = struct {
 
         return .{
             .allocator = allocator,
+            .io = io,
             .socket_path = owned_socket_path,
             .socket_stat = socket_stat,
             .listener_fd = listener,
-            .manager = mux.Manager.init(allocator, null),
-            .last_activity_seconds = std.atomic.Value(i64).init(std.time.timestamp()),
+            .manager = mux.Manager.init(allocator, io, null),
+            .last_activity_seconds = std.atomic.Value(i64).init(monotonicSeconds(io)),
             .idle_timeout_seconds = idle_timeout_seconds,
         };
     }
@@ -294,7 +314,7 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         self.running.store(false, .seq_cst);
         self.unlinkSocketPathIfOwned();
-        posix.close(self.listener_fd);
+        sys.close(self.listener_fd);
         self.closeConnections();
         self.waitForWorkers();
         self.manager.event_sink = null;
@@ -306,7 +326,7 @@ pub const Server = struct {
     fn unlinkSocketPathIfOwned(self: *Server) void {
         const path_stat = socketPathStat(self.socket_path) catch return;
         if (self.socket_stat.dev == path_stat.dev and self.socket_stat.ino == path_stat.ino) {
-            std.fs.deleteFileAbsolute(self.socket_path) catch {};
+            std.Io.Dir.deleteFileAbsolute(self.io, self.socket_path) catch {};
         }
     }
 
@@ -320,7 +340,7 @@ pub const Server = struct {
             if (self.shouldExitForIdle()) {
                 log.info("server_idle_exit", .{
                     .idle_timeout_seconds = self.idle_timeout_seconds,
-                    .idle_seconds = std.time.timestamp() - self.last_activity_seconds.load(.seq_cst),
+                    .idle_seconds = monotonicSeconds(self.io) - self.last_activity_seconds.load(.seq_cst),
                 });
                 break;
             }
@@ -335,7 +355,7 @@ pub const Server = struct {
             if ((fds[0].revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) return;
             if ((fds[0].revents & posix.POLL.IN) == 0) continue;
 
-            const client_fd = posix.accept(self.listener_fd, null, null, posix.SOCK.CLOEXEC) catch |err| {
+            const client_fd = sys.accept(self.listener_fd) catch |err| {
                 log.warn("accept_error", .{
                     .err = err,
                     .active_connections = self.active_connections.load(.seq_cst),
@@ -343,17 +363,17 @@ pub const Server = struct {
                 // Fd exhaustion and every other listener-level fault get the
                 // same backoff: it keeps a failing accept from spinning at
                 // 100% CPU while still letting the server recover.
-                std.Thread.sleep(accept_backoff_ms * std.time.ns_per_ms);
+                self.io.sleep(.fromMilliseconds(accept_backoff_ms), .awake) catch {};
                 continue;
             };
             const peer_euid = peerEuid(client_fd);
-            if (peer_euid == null or peer_euid.? != posix.geteuid()) {
+            if (peer_euid == null or peer_euid.? != sys.geteuid()) {
                 log.warn("peer_cred_rejected", .{
                     .peer_euid = peer_euid,
-                    .euid = posix.geteuid(),
+                    .euid = sys.geteuid(),
                     .socket_path = self.socket_path,
                 });
-                posix.close(client_fd);
+                sys.close(client_fd);
                 continue;
             }
             setSocketSendTimeout(client_fd);
@@ -366,12 +386,12 @@ pub const Server = struct {
                     .max_connections = max_client_connections,
                 });
                 writeConnectionLimitError(client_fd);
-                posix.close(client_fd);
+                sys.close(client_fd);
                 continue;
             }
             const thread = std.Thread.spawn(.{}, Server.handleClientThread, .{ self, client_fd }) catch {
                 _ = self.active_connections.fetchSub(1, .seq_cst);
-                posix.close(client_fd);
+                sys.close(client_fd);
                 continue;
             };
             thread.detach();
@@ -391,7 +411,7 @@ pub const Server = struct {
     fn shouldExitForIdle(self: *Server) bool {
         if (self.idle_timeout_seconds <= 0) return false;
         if (self.manager.count() > 0) return false;
-        const idle_for = std.time.timestamp() - self.last_activity_seconds.load(.seq_cst);
+        const idle_for = monotonicSeconds(self.io) - self.last_activity_seconds.load(.seq_cst);
         return idle_for >= self.idle_timeout_seconds;
     }
 
@@ -402,14 +422,14 @@ pub const Server = struct {
     }
 
     fn touch(self: *Server) void {
-        self.last_activity_seconds.store(std.time.timestamp(), .seq_cst);
+        self.last_activity_seconds.store(monotonicSeconds(self.io), .seq_cst);
     }
 
     fn handleClientThread(self: *Server, client_fd: posix.fd_t) void {
         defer self.finishActiveConnection();
 
-        const connection = ClientConnection.create(self.allocator, client_fd) catch {
-            posix.close(client_fd);
+        const connection = ClientConnection.create(self.allocator, self.io, client_fd) catch {
+            sys.close(client_fd);
             return;
         };
         defer connection.release();
@@ -869,8 +889,8 @@ pub const Server = struct {
     }
 
     fn registerConnection(self: *Server, connection: *ClientConnection) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.connections.append(self.allocator, connection.retain()) catch {
             connection.close();
             connection.release();
@@ -880,8 +900,8 @@ pub const Server = struct {
     fn unregisterConnection(self: *Server, connection: *ClientConnection) void {
         self.detachConnectionClients(connection);
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         for (self.connections.items, 0..) |active, index| {
             if (active == connection) {
                 const removed = self.connections.swapRemove(index);
@@ -901,10 +921,10 @@ pub const Server = struct {
     }
 
     fn closeConnections(self: *Server) void {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         var connections = self.connections;
         self.connections = .empty;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
 
         defer connections.deinit(self.allocator);
         for (connections.items) |connection| {
@@ -914,43 +934,43 @@ pub const Server = struct {
     }
 
     fn addActiveWriter(self: *Server) void {
-        self.active_mutex.lock();
+        self.active_mutex.lockUncancelable(self.io);
         _ = self.active_writer_threads.fetchAdd(1, .seq_cst);
-        self.active_mutex.unlock();
+        self.active_mutex.unlock(self.io);
     }
 
     fn finishActiveWriter(self: *Server) void {
-        self.active_mutex.lock();
+        self.active_mutex.lockUncancelable(self.io);
         _ = self.active_writer_threads.fetchSub(1, .seq_cst);
-        self.active_condition.broadcast();
-        self.active_mutex.unlock();
+        self.active_condition.broadcast(self.io);
+        self.active_mutex.unlock(self.io);
     }
 
     fn finishActiveConnection(self: *Server) void {
-        self.active_mutex.lock();
+        self.active_mutex.lockUncancelable(self.io);
         _ = self.active_connections.fetchSub(1, .seq_cst);
-        self.active_condition.broadcast();
-        self.active_mutex.unlock();
+        self.active_condition.broadcast(self.io);
+        self.active_mutex.unlock(self.io);
     }
 
     fn waitForWorkers(self: *Server) void {
-        self.active_mutex.lock();
-        defer self.active_mutex.unlock();
+        self.active_mutex.lockUncancelable(self.io);
+        defer self.active_mutex.unlock(self.io);
         while (self.active_connections.load(.seq_cst) > 0 or self.active_writer_threads.load(.seq_cst) > 0) {
-            self.active_condition.wait(&self.active_mutex);
+            self.active_condition.waitUncancelable(self.io, &self.active_mutex);
         }
     }
 
     fn broadcast(self: *Server, payload: []const u8) !void {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         const snapshot = self.allocator.alloc(*ClientConnection, self.connections.items.len) catch |err| {
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             return err;
         };
         for (self.connections.items, 0..) |connection, index| {
             snapshot[index] = connection.retain();
         }
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
         defer self.allocator.free(snapshot);
 
         for (snapshot) |connection| {
@@ -1019,9 +1039,13 @@ pub const Server = struct {
     }
 };
 
+fn monotonicSeconds(io: std.Io) i64 {
+    return std.Io.Clock.awake.now(io).toSeconds();
+}
+
 fn ensureSocketParent(socket_path: []const u8) !void {
     const parent = std.fs.path.dirname(socket_path) orelse return;
-    _ = posix.fstatat(posix.AT.FDCWD, parent, posix.AT.SYMLINK_NOFOLLOW) catch |err| switch (err) {
+    _ = sys.statAt(sys.cwd_fd, parent, false) catch |err| switch (err) {
         // A missing parent is one zmux owns (the uid-scoped fallback such as
         // /tmp/zmux-<uid> or ~/.smithers): create it private and validate that
         // it really is a self-owned 0700 directory before binding there.
@@ -1039,21 +1063,27 @@ fn ensureSocketParent(socket_path: []const u8) !void {
 /// (0700), self-owned, non-symlink directory. Only used for the fallback paths
 /// zmux itself creates.
 fn createPrivateSocketParent(parent: []const u8) !void {
-    std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+    sys.mkdir(parent, 0o700) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
 
-    {
-        var dir = try std.fs.openDirAbsolute(parent, .{});
-        defer dir.close();
-        _ = std.c.fchmod(dir.fd, 0o700);
-    }
+    // Open with O_RDONLY | O_DIRECTORY | O_NOFOLLOW (never O_PATH): Linux
+    // rejects fchmod(2) with EBADF on O_PATH handles returned by non-iterable
+    // std.Io.Dir.openDirAbsolute.
+    const dir_fd = try sys.openDirNoFollow(parent);
+    defer sys.close(dir_fd);
 
-    const stat = try posix.fstatat(posix.AT.FDCWD, parent, posix.AT.SYMLINK_NOFOLLOW);
-    if ((stat.mode & std.posix.S.IFMT) != std.posix.S.IFDIR) return error.NotDir;
-    if (stat.uid != posix.geteuid()) return error.PermissionDenied;
-    if ((stat.mode & 0o7777) != 0o700) return error.PermissionDenied;
+    const opened = try sys.fstat(dir_fd);
+    if (!opened.isDir()) return error.NotDir;
+    if (opened.uid != sys.geteuid()) return error.PermissionDenied;
+    try sys.fchmod(dir_fd, 0o700);
+
+    const stat = try sys.statAt(sys.cwd_fd, parent, false);
+    if (!stat.isDir()) return error.NotDir;
+    if (!stat.sameFile(opened)) return error.PermissionDenied;
+    if (stat.uid != sys.geteuid()) return error.PermissionDenied;
+    if (stat.permissions() != 0o700) return error.PermissionDenied;
 }
 
 /// Bind `listener` at `socket_path` so the socket file is owner-only (0600)
@@ -1076,12 +1106,12 @@ fn createPrivateSocketParent(parent: []const u8) !void {
 /// in `sun_path`, the socket is bound in place only if that is provably
 /// private (see bindSocketInPlace); otherwise the bind is refused rather than
 /// exposed.
-fn bindPrivateSocket(listener: posix.fd_t, socket_path: []const u8) !void {
+fn bindPrivateSocket(io: std.Io, listener: posix.fd_t, socket_path: []const u8) !void {
     // Linux derives the socket file mode from the socket inode's mode, so this
     // makes bind create the file 0600 outright. macOS rejects fchmod on
     // sockets; staging covers both.
     const mode_preset = builtin.os.tag == .linux and blk: {
-        posix.fchmod(listener, 0o600) catch break :blk false;
+        sys.fchmod(listener, 0o600) catch break :blk false;
         break :blk true;
     };
 
@@ -1093,7 +1123,7 @@ fn bindPrivateSocket(listener: posix.fd_t, socket_path: []const u8) !void {
     // dir_prefix + staging dir name + "/" + staged_socket_name must fit.
     const fixed_len = dir_prefix.len + staging_dir_prefix.len + 1 + staged_socket_name.len;
     if (fixed_len + staging_dir_random_hex_min > max_socket_path_len) {
-        return bindSocketInPlace(listener, socket_path, dir_prefix, mode_preset);
+        return bindSocketInPlace(io, listener, socket_path, dir_prefix, mode_preset);
     }
     const hex_len = @min(staging_dir_random_hex_max, max_socket_path_len - fixed_len);
 
@@ -1102,14 +1132,14 @@ fn bindPrivateSocket(listener: posix.fd_t, socket_path: []const u8) !void {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         var random: [staging_dir_random_hex_max / 2]u8 = undefined;
-        std.crypto.random.bytes(&random);
+        io.random(&random);
         const hex = std.fmt.bytesToHex(random, .lower);
         staging_dir = std.fmt.bufPrint(&dir_buf, "{s}{s}{s}", .{
             dir_prefix,
             staging_dir_prefix,
             hex[0..hex_len],
         }) catch unreachable;
-        posix.mkdir(staging_dir, 0o700) catch |err| switch (err) {
+        sys.mkdir(staging_dir, 0o700) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 if (attempt + 1 >= staging_dir_attempts) return err;
                 continue;
@@ -1118,40 +1148,35 @@ fn bindPrivateSocket(listener: posix.fd_t, socket_path: []const u8) !void {
         };
         break;
     }
-    defer posix.rmdir(staging_dir) catch {};
+    defer sys.rmdir(staging_dir) catch {};
 
     // Hold the directory by fd and validate that fd, so later checks cannot be
     // redirected by someone swapping the name in a writable parent.
-    const dir_fd = try posix.open(staging_dir, .{
-        .ACCMODE = .RDONLY,
-        .DIRECTORY = true,
-        .NOFOLLOW = true,
-        .CLOEXEC = true,
-    }, 0);
-    defer posix.close(dir_fd);
+    const dir_fd = try sys.openDirNoFollow(staging_dir);
+    defer sys.close(dir_fd);
     // A umask that clears owner bits would make the directory unusable.
-    try posix.fchmod(dir_fd, 0o700);
-    const dir_stat = try posix.fstat(dir_fd);
-    if (dir_stat.uid != posix.geteuid()) return error.PermissionDenied;
-    if ((dir_stat.mode & 0o7777) != 0o700) return error.PermissionDenied;
+    try sys.fchmod(dir_fd, 0o700);
+    const dir_stat = try sys.fstat(dir_fd);
+    if (dir_stat.uid != sys.geteuid()) return error.PermissionDenied;
+    if (dir_stat.permissions() != 0o700) return error.PermissionDenied;
 
     var staged_buf: [max_socket_path_len]u8 = undefined;
     const staged_path = std.fmt.bufPrint(&staged_buf, "{s}/{s}", .{ staging_dir, staged_socket_name }) catch unreachable;
 
-    const address = try std.net.Address.initUnix(staged_path);
-    try posix.bind(listener, &address.any, address.getOsSockLen());
+    const address = try sys.UnixAddress.init(staged_path);
+    try sys.bind(listener, &address);
     var staged = true;
-    defer if (staged) posix.unlinkat(dir_fd, staged_socket_name, 0) catch {};
+    defer if (staged) sys.unlinkAt(dir_fd, staged_socket_name) catch {};
 
-    try posix.fchmodat(dir_fd, staged_socket_name, 0o600, 0);
-    const socket_stat = try posix.fstatat(dir_fd, staged_socket_name, posix.AT.SYMLINK_NOFOLLOW);
-    if ((socket_stat.mode & posix.S.IFMT) != posix.S.IFSOCK) return error.PermissionDenied;
-    if ((socket_stat.mode & 0o7777) != 0o600) return error.PermissionDenied;
+    try sys.fchmodat(dir_fd, staged_socket_name, 0o600);
+    const socket_stat = try sys.statAt(dir_fd, staged_socket_name, false);
+    if (!socket_stat.isSocket()) return error.PermissionDenied;
+    if (socket_stat.permissions() != 0o600) return error.PermissionDenied;
     // The path we bound must be the file inside the directory we validated.
-    const path_stat = try posix.fstatat(posix.AT.FDCWD, staged_path, posix.AT.SYMLINK_NOFOLLOW);
+    const path_stat = try sys.statAt(sys.cwd_fd, staged_path, false);
     if (path_stat.dev != socket_stat.dev or path_stat.ino != socket_stat.ino) return error.PermissionDenied;
 
-    try posix.rename(staged_path, socket_path);
+    try sys.rename(staged_path, socket_path);
     staged = false;
 }
 
@@ -1163,6 +1188,7 @@ fn bindPrivateSocket(listener: posix.fd_t, socket_path: []const u8) !void {
 ///     access: nobody else can traverse to the socket.
 /// Anything else would briefly expose a umask-mode socket, so it is refused.
 fn bindSocketInPlace(
+    io: std.Io,
     listener: posix.fd_t,
     socket_path: []const u8,
     dir_prefix: []const u8,
@@ -1170,29 +1196,22 @@ fn bindSocketInPlace(
 ) !void {
     if (!mode_preset) {
         const parent = if (dir_prefix.len == 0) "." else dir_prefix;
-        const parent_stat = try posix.fstatat(posix.AT.FDCWD, parent, 0);
-        const private = (parent_stat.mode & posix.S.IFMT) == posix.S.IFDIR and
-            parent_stat.uid == posix.geteuid() and
+        const parent_stat = try sys.statAt(sys.cwd_fd, parent, true);
+        const private = parent_stat.isDir() and
+            parent_stat.uid == sys.geteuid() and
             (parent_stat.mode & 0o077) == 0;
         if (!private) return error.SocketStagingPathTooLong;
     }
 
-    const address = try std.net.Address.initUnix(socket_path);
-    try posix.bind(listener, &address.any, address.getOsSockLen());
-    errdefer std.fs.deleteFileAbsolute(socket_path) catch {};
-    try posix.fchmodat(posix.AT.FDCWD, socket_path, 0o600, 0);
+    const address = try sys.UnixAddress.init(socket_path);
+    try sys.bind(listener, &address);
+    errdefer std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
+    try sys.fchmodat(sys.cwd_fd, socket_path, 0o600);
     const socket_stat = try socketPathStat(socket_path);
-    if ((socket_stat.mode & 0o7777) != 0o600) return error.PermissionDenied;
+    if (socket_stat.permissions() != 0o600) return error.PermissionDenied;
 }
 
-fn writeAll(fd: posix.fd_t, bytes: []const u8) !void {
-    var offset: usize = 0;
-    while (offset < bytes.len) {
-        const n = try posix.write(fd, bytes[offset..]);
-        if (n == 0) return error.WriteZero;
-        offset += n;
-    }
-}
+const writeAll = sys.sendAll;
 
 fn setSocketSendTimeout(fd: posix.fd_t) void {
     switch (builtin.os.tag) {
@@ -1269,7 +1288,7 @@ const MuxCreateArgs = struct {
     env_entries: ?[][]const u8 = null,
     opts: mux.CreateOptions,
 
-    fn deinit(self: *MuxCreateArgs) void {
+    pub fn deinit(self: *MuxCreateArgs) void {
         if (self.env_entries) |entries| freeStringSlice(self.allocator, entries);
         self.env_entries = null;
         self.opts = .{};
@@ -1345,6 +1364,7 @@ fn envEntriesFromParams(allocator: Allocator, params: ?Value) !?[][]const u8 {
         const value_text = try envValueString(allocator, entry.value_ptr.*);
         defer allocator.free(value_text);
         const env_entry = try std.fmt.allocPrint(allocator, "{s}={s}", .{ entry.key_ptr.*, value_text });
+        errdefer allocator.free(env_entry);
         try entries.append(allocator, env_entry);
     }
 
@@ -1390,7 +1410,7 @@ fn base64Decode(allocator: Allocator, encoded: []const u8) ![]u8 {
 
 fn peerHasSameEuid(fd: posix.fd_t) bool {
     const uid = peerEuid(fd) orelse return false;
-    return uid == posix.geteuid();
+    return uid == sys.geteuid();
 }
 
 /// Effective uid of the connected peer, or null when the OS cannot report it.
@@ -1411,12 +1431,10 @@ fn linuxPeerUid(fd: posix.fd_t) std.c.uid_t {
         gid: std.c.gid_t,
     };
     var cred: UCred = undefined;
-    posix.getsockopt(
-        fd,
-        linux.SOL.SOCKET,
-        linux.SO.PEERCRED,
-        std.mem.asBytes(&cred),
-    ) catch return std.math.maxInt(std.c.uid_t);
+    var len: std.c.socklen_t = @sizeOf(UCred);
+    if (std.c.getsockopt(fd, linux.SOL.SOCKET, linux.SO.PEERCRED, &cred, &len) != 0 or len != @sizeOf(UCred)) {
+        return std.math.maxInt(std.c.uid_t);
+    }
     return cred.uid;
 }
 
@@ -1428,6 +1446,107 @@ fn darwinPeerUid(fd: posix.fd_t) std.c.uid_t {
 }
 
 extern "c" fn getpeereid(socket: c_int, euid: *std.c.uid_t, egid: *std.c.gid_t) c_int;
+
+/// Internal hooks exposed for the repository's own fuzz suites.
+pub const fuzz_hooks = struct {
+    pub const Connection = ClientConnection;
+    pub const CreateArgs = MuxCreateArgs;
+    pub const CreateArgsOpts = CreateArgsOptions;
+    pub const max_request_size = max_request_bytes;
+    pub const attach_replay_cap = attach_replay_max_bytes;
+    pub const broadcast_queue_cap = broadcast_queue_max_bytes;
+
+    pub const muxCreateArgs = muxCreateArgsFromParams;
+    pub const envEntries = envEntriesFromParams;
+    pub const envValue = envValueString;
+    pub const freeEnvEntries = freeStringSlice;
+    pub const scrollbackBytes = scrollbackBytesFromParams;
+    pub const axis = axisParam;
+    pub const sessionId = sessionIdParam;
+    pub const paneId = paneIdParam;
+    pub const windowId = windowIdParam;
+    pub const clientId = clientIdParam;
+    pub const boolParamVal = boolParam;
+    pub const intParamVal = intParam;
+    pub const replayTail = truncatedReplay;
+    pub const b64Encode = base64Encode;
+    pub const b64Decode = base64Decode;
+
+    pub fn createConnection(allocator: Allocator, io: std.Io, fd: posix.fd_t) !*ClientConnection {
+        return ClientConnection.create(allocator, io, fd);
+    }
+
+    pub fn releaseConnection(conn: *ClientConnection) void {
+        conn.release();
+    }
+
+    pub fn closeConnection(conn: *ClientConnection) void {
+        conn.close();
+    }
+
+    pub fn isConnectionClosed(conn: *const ClientConnection) bool {
+        return conn.isClosed();
+    }
+
+    pub fn enqueueBroadcast(conn: *ClientConnection, bytes: []const u8) !void {
+        return conn.enqueueBroadcast(bytes);
+    }
+
+    pub fn takeQueuedWrite(conn: *ClientConnection) ?[]u8 {
+        return conn.takeQueuedWrite();
+    }
+
+    pub fn trackMuxClient(conn: *ClientConnection, client_id: []const u8) !void {
+        return conn.trackMuxClient(client_id);
+    }
+
+    pub fn untrackMuxClient(conn: *ClientConnection, client_id: []const u8) bool {
+        return conn.untrackMuxClient(client_id);
+    }
+
+    pub fn takeMuxClients(conn: *ClientConnection) std.ArrayList([]u8) {
+        return conn.takeMuxClients();
+    }
+
+    /// Initialize a Server without binding a UNIX socket on disk so wire-level
+    /// JSON-RPC fuzzers can drive `handleClient` over an in-memory socketpair.
+    pub fn initInMemoryServer(allocator: Allocator, io: std.Io) !Server {
+        const owned_socket_path = try allocator.dupe(u8, "/in-memory/zmux-fuzz.sock");
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .socket_path = owned_socket_path,
+            .socket_stat = .{ .dev = 0, .ino = 0, .mode = 0, .uid = 0 },
+            .listener_fd = -1,
+            .manager = mux.Manager.init(allocator, io, null),
+            .last_activity_seconds = std.atomic.Value(i64).init(monotonicSeconds(io)),
+            .idle_timeout_seconds = 0,
+        };
+    }
+
+    pub fn deinitInMemoryServer(server: *Server) void {
+        server.running.store(false, .seq_cst);
+        server.closeConnections();
+        server.waitForWorkers();
+        server.manager.event_sink = null;
+        server.manager.deinit();
+        server.connections.deinit(server.allocator);
+        server.allocator.free(server.socket_path);
+    }
+
+    /// Drive a single client connection synchronously until EOF / shutdown.
+    /// Takes ownership of `client_fd` (closed when the connection is released).
+    pub fn driveClient(server: *Server, client_fd: posix.fd_t) !void {
+        const connection = try ClientConnection.create(server.allocator, server.io, client_fd);
+        defer connection.release();
+        defer connection.close();
+
+        server.registerConnection(connection);
+        defer server.unregisterConnection(connection);
+
+        server.handleClient(connection);
+    }
+};
 
 test "server parses aliases for session id" {
     var parsed = try std.json.parseFromSlice(Value, std.testing.allocator, "{\"id\":\"sess-1\"}", .{});
@@ -1508,13 +1627,14 @@ test "truncatedReplay keeps tail when larger than cap" {
     try std.testing.expectEqualStrings("abcdefghij", truncatedReplay(full, 128));
 }
 
+const test_io = std.testing.io;
+
 test "peer credential check accepts same-user unix socket peer" {
     if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
 
-    var sockets: [2]std.c.fd_t = undefined;
-    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &sockets) != 0) return error.SkipZigTest;
-    defer posix.close(sockets[0]);
-    defer posix.close(sockets[1]);
+    const sockets = sys.socketPair() catch return error.SkipZigTest;
+    defer sys.close(sockets[0]);
+    defer sys.close(sockets[1]);
 
     try std.testing.expect(peerHasSameEuid(sockets[0]));
 }
@@ -1525,14 +1645,14 @@ test "self-created socket parent is validated as private 0700" {
     const allocator = std.testing.allocator;
     const parent = try tempPath(allocator, "zmx-created-parent");
     defer allocator.free(parent);
-    defer std.fs.deleteTreeAbsolute(parent) catch {};
+    defer std.Io.Dir.cwd().deleteTree(test_io, parent) catch {};
 
     // The parent does not exist yet, so zmux owns its creation: Server.init
     // must bring it up as a private 0700 directory owned by the current uid.
     const socket_path = try std.fs.path.join(allocator, &.{ parent, "sessions.sock" });
     defer allocator.free(socket_path);
 
-    var server = Server.init(allocator, socket_path, 0) catch |err| switch (err) {
+    var server = Server.init(allocator, test_io, socket_path, 0) catch |err| switch (err) {
         error.AccessDenied => return error.SkipZigTest,
         else => return err,
     };
@@ -1546,22 +1666,48 @@ test "existing socket parent permissions are left unchanged" {
     const allocator = std.testing.allocator;
     const parent = try tempPath(allocator, "zmx-existing-parent");
     defer allocator.free(parent);
-    defer std.fs.deleteTreeAbsolute(parent) catch {};
+    defer std.Io.Dir.cwd().deleteTree(test_io, parent) catch {};
 
     // A pre-existing parent of an explicit socket path must be accepted as-is
     // and left at its original mode (here 0755), never chmod'd or rejected.
-    try std.fs.makeDirAbsolute(parent);
+    try std.Io.Dir.createDirAbsolute(test_io, parent, .default_dir);
     try chmodAbsolute(allocator, parent, 0o755);
 
     const socket_path = try std.fs.path.join(allocator, &.{ parent, "sessions.sock" });
     defer allocator.free(socket_path);
 
-    var server = Server.init(allocator, socket_path, 0) catch |err| switch (err) {
+    var server = Server.init(allocator, test_io, socket_path, 0) catch |err| switch (err) {
         error.AccessDenied => return error.SkipZigTest,
         else => return err,
     };
     server.deinit();
     try std.testing.expectEqual(@as(u32, 0o755), try dirMode(parent));
+}
+
+test "self-created socket parent is 0700 under umask 0022" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const parent = try tempPath(allocator, "zmx-created-umask022");
+    defer allocator.free(parent);
+    defer std.Io.Dir.cwd().deleteTree(test_io, parent) catch {};
+
+    const original_umask = std.c.umask(0o022);
+    defer _ = std.c.umask(original_umask);
+
+    const socket_path = try std.fs.path.join(allocator, &.{ parent, "sessions.sock" });
+    defer allocator.free(socket_path);
+
+    var server = Server.init(allocator, test_io, socket_path, 0) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0o700), try dirMode(parent));
+    const stat = try socketPathStat(socket_path);
+    try std.testing.expect(stat.isSocket());
+    try std.testing.expectEqual(@as(u32, 0o600), stat.permissions());
 }
 
 test "new socket parent is private" {
@@ -1570,7 +1716,7 @@ test "new socket parent is private" {
     const allocator = std.testing.allocator;
     const parent = try tempPath(allocator, "zmx-new-parent");
     defer allocator.free(parent);
-    defer std.fs.deleteTreeAbsolute(parent) catch {};
+    defer std.Io.Dir.cwd().deleteTree(test_io, parent) catch {};
 
     const socket_path = try std.fs.path.join(allocator, &.{ parent, "sessions.sock" });
     defer allocator.free(socket_path);
@@ -1585,12 +1731,12 @@ test "server init rejects a socket path longer than sun_path before touching the
     const allocator = std.testing.allocator;
     const parent = try tempPath(allocator, "zmx-too-long");
     defer allocator.free(parent);
-    defer std.fs.deleteTreeAbsolute(parent) catch {};
+    defer std.Io.Dir.cwd().deleteTree(test_io, parent) catch {};
 
     const socket_path = try paddedSocketPath(allocator, parent, max_socket_path_len + 1);
     defer allocator.free(socket_path);
 
-    try std.testing.expectError(error.SocketPathTooLong, Server.init(allocator, socket_path, 0));
+    try std.testing.expectError(error.SocketPathTooLong, Server.init(allocator, test_io, socket_path, 0));
     // Rejected up front: not even the parent directory was created.
     try std.testing.expectError(error.FileNotFound, socketPathStat(parent));
 }
@@ -1610,8 +1756,8 @@ test "server socket is 0600 without mutating the process umask" {
     const allocator = std.testing.allocator;
     const parent = try tempPath(allocator, "zmx-umask");
     defer allocator.free(parent);
-    defer std.fs.deleteTreeAbsolute(parent) catch {};
-    try std.fs.makeDirAbsolute(parent);
+    defer std.Io.Dir.cwd().deleteTree(test_io, parent) catch {};
+    try std.Io.Dir.createDirAbsolute(test_io, parent, .default_dir);
     // A shared (0755) parent forces the staged bind rather than the
     // private-parent shortcut.
     try chmodAbsolute(allocator, parent, 0o755);
@@ -1627,25 +1773,23 @@ test "server socket is 0600 without mutating the process umask" {
     const original_umask = std.c.umask(permissive_umask);
     defer _ = std.c.umask(original_umask);
 
-    var server = try Server.init(allocator, socket_path, 0);
+    var server = try Server.init(allocator, test_io, socket_path, 0);
     defer server.deinit();
 
     const umask_after_init = std.c.umask(permissive_umask);
     try std.testing.expectEqual(permissive_umask, umask_after_init);
 
     const stat = try socketPathStat(socket_path);
-    try std.testing.expectEqual(@as(u32, posix.S.IFSOCK), @as(u32, @intCast(stat.mode & posix.S.IFMT)));
-    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode & 0o7777)));
-    try std.testing.expectEqual(posix.geteuid(), stat.uid);
+    try std.testing.expect(stat.isSocket());
+    try std.testing.expectEqual(@as(u32, 0o600), stat.permissions());
+    try std.testing.expectEqual(sys.geteuid(), stat.uid);
 
     // The staging directory is gone: the socket is the parent's only entry.
     try std.testing.expectEqual(@as(usize, 1), try countDirEntries(parent));
 
     // The renamed socket is the bound one: a client can connect through it.
-    const address = try std.net.Address.initUnix(socket_path);
-    const client = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-    defer posix.close(client);
-    try posix.connect(client, &address.any, address.getOsSockLen());
+    const client = try sys.connectUnix(socket_path);
+    defer sys.close(client);
 }
 
 test "server init replaces a stale socket with a private one" {
@@ -1654,21 +1798,26 @@ test "server init replaces a stale socket with a private one" {
     const allocator = std.testing.allocator;
     const socket_path = try tempPath(allocator, "zmx-stale-replace");
     defer allocator.free(socket_path);
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(test_io, socket_path) catch {};
 
     const stale = bindRawUnixListener(socket_path) catch |err| switch (err) {
         error.AccessDenied => return error.SkipZigTest,
         else => return err,
     };
-    posix.close(stale);
-    const stale_stat = try socketPathStat(socket_path);
+    sys.close(stale);
+    // Confirm the stale socket file is genuinely unreachable before replacement.
+    try std.testing.expectError(error.ConnectionRefused, sys.connectUnix(socket_path));
 
-    var server = try Server.init(allocator, socket_path, 0);
+    var server = try Server.init(allocator, test_io, socket_path, 0);
     defer server.deinit();
 
     const stat = try socketPathStat(socket_path);
-    try std.testing.expect(stat.ino != stale_stat.ino or stat.dev != stale_stat.dev);
-    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode & 0o7777)));
+    try std.testing.expect(stat.isSocket());
+    try std.testing.expectEqual(@as(u32, 0o600), stat.permissions());
+    // Linux filesystems can immediately recycle the freed inode number after
+    // unlink(), so verify replacement by connecting to the newly bound server.
+    const client = try sys.connectUnix(socket_path);
+    defer sys.close(client);
 }
 
 test "socket path at the sun_path limit binds in place under a private parent" {
@@ -1677,7 +1826,7 @@ test "socket path at the sun_path limit binds in place under a private parent" {
     const allocator = std.testing.allocator;
     const parent = try tempPath(allocator, "zmx-limit-private");
     defer allocator.free(parent);
-    defer std.fs.deleteTreeAbsolute(parent) catch {};
+    defer std.Io.Dir.cwd().deleteTree(test_io, parent) catch {};
 
     // Parent does not exist, so Server.init creates it 0700. The path is
     // exactly the limit, which leaves no room for a staging directory.
@@ -1687,7 +1836,7 @@ test "socket path at the sun_path limit binds in place under a private parent" {
     const original_umask = std.c.umask(0);
     defer _ = std.c.umask(original_umask);
 
-    var server = Server.init(allocator, socket_path, 0) catch |err| switch (err) {
+    var server = Server.init(allocator, test_io, socket_path, 0) catch |err| switch (err) {
         error.AccessDenied => return error.SkipZigTest,
         else => return err,
     };
@@ -1695,7 +1844,7 @@ test "socket path at the sun_path limit binds in place under a private parent" {
 
     try std.testing.expectEqual(@as(std.c.mode_t, 0), std.c.umask(0));
     const stat = try socketPathStat(socket_path);
-    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode & 0o7777)));
+    try std.testing.expectEqual(@as(u32, 0o600), stat.permissions());
 }
 
 test "socket path at the sun_path limit is never exposed under a shared parent" {
@@ -1704,8 +1853,8 @@ test "socket path at the sun_path limit is never exposed under a shared parent" 
     const allocator = std.testing.allocator;
     const parent = try tempPath(allocator, "zmx-limit-shared");
     defer allocator.free(parent);
-    defer std.fs.deleteTreeAbsolute(parent) catch {};
-    try std.fs.makeDirAbsolute(parent);
+    defer std.Io.Dir.cwd().deleteTree(test_io, parent) catch {};
+    try std.Io.Dir.createDirAbsolute(test_io, parent, .default_dir);
     try chmodAbsolute(allocator, parent, 0o755);
 
     const socket_path = try paddedSocketPath(allocator, parent, max_socket_path_len);
@@ -1714,12 +1863,12 @@ test "socket path at the sun_path limit is never exposed under a shared parent" 
     const original_umask = std.c.umask(0);
     defer _ = std.c.umask(original_umask);
 
-    if (Server.init(allocator, socket_path, 0)) |created| {
+    if (Server.init(allocator, test_io, socket_path, 0)) |created| {
         // Linux creates the file 0600 at bind time via the pre-bind fchmod.
         var server = created;
         defer server.deinit();
         const stat = try socketPathStat(socket_path);
-        try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode & 0o7777)));
+        try std.testing.expectEqual(@as(u32, 0o600), stat.permissions());
     } else |err| switch (err) {
         // Elsewhere there is no race-free way to bind here, so it is refused
         // and nothing is left behind.
@@ -1739,15 +1888,15 @@ test "server deinit does not unlink a replacement socket" {
     const allocator = std.testing.allocator;
     const socket_path = try tempPath(allocator, "zmx-replaced-socket");
     defer allocator.free(socket_path);
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(test_io, socket_path) catch {};
     try requireUnixSocketBind(socket_path);
 
-    var server = try Server.init(allocator, socket_path, 0);
+    var server = try Server.init(allocator, test_io, socket_path, 0);
     try std.testing.expect(socketExists(socket_path));
 
-    try std.fs.deleteFileAbsolute(socket_path);
+    try std.Io.Dir.deleteFileAbsolute(test_io, socket_path);
     const replacement = try bindRawUnixListener(socket_path);
-    defer posix.close(replacement);
+    defer sys.close(replacement);
 
     server.deinit();
     try std.testing.expect(socketExists(socket_path));
@@ -1759,10 +1908,10 @@ test "server deinit unlinks its owned socket" {
     const allocator = std.testing.allocator;
     const socket_path = try tempPath(allocator, "zmx-owned-socket");
     defer allocator.free(socket_path);
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(test_io, socket_path) catch {};
     try requireUnixSocketBind(socket_path);
 
-    var server = try Server.init(allocator, socket_path, 0);
+    var server = try Server.init(allocator, test_io, socket_path, 0);
     try std.testing.expect(socketExists(socket_path));
 
     server.deinit();
@@ -1770,16 +1919,14 @@ test "server deinit unlinks its owned socket" {
 }
 
 test "server connection reader keeps leftover request bytes" {
-    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
-
-    const fds = try std.posix.pipe();
+    const fds = try sys.pipe();
     var read_fd_owned = true;
-    defer if (read_fd_owned) posix.close(fds[0]);
-    defer posix.close(fds[1]);
+    defer if (read_fd_owned) sys.close(fds[0]);
+    defer sys.close(fds[1]);
 
-    _ = try posix.write(fds[1], "{\"id\":1}\n{\"id\":2}\n");
+    _ = try sys.write(fds[1], "{\"id\":1}\n{\"id\":2}\n");
 
-    var connection = try ClientConnection.create(std.testing.allocator, fds[0]);
+    var connection = try ClientConnection.create(std.testing.allocator, test_io, fds[0]);
     read_fd_owned = false;
     defer connection.release();
 
@@ -1795,16 +1942,15 @@ test "server connection reader keeps leftover request bytes" {
 test "client connection close shuts down without releasing the fd number" {
     if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
 
-    var sockets: [2]std.c.fd_t = undefined;
-    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &sockets) != 0) return error.SkipZigTest;
-    defer posix.close(sockets[1]);
+    const sockets = sys.socketPair() catch return error.SkipZigTest;
+    defer sys.close(sockets[1]);
 
-    var connection = try ClientConnection.create(std.testing.allocator, sockets[0]);
+    var connection = try ClientConnection.create(std.testing.allocator, test_io, sockets[0]);
     const original_fd = connection.fd;
     connection.close();
 
-    const devnull = try posix.open("/dev/null", .{ .ACCMODE = .RDONLY }, 0);
-    defer posix.close(devnull);
+    const devnull = try sys.open("/dev/null", .{ .ACCMODE = .RDONLY }, 0);
+    defer sys.close(devnull);
     try std.testing.expect(devnull != original_fd);
 
     connection.release();
@@ -1816,29 +1962,29 @@ test "server idle timeout ignores terminated panes" {
     const allocator = std.testing.allocator;
     const socket_path = try tempPath(allocator, "zmx-idle-terminated");
     defer allocator.free(socket_path);
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(test_io, socket_path) catch {};
     try requireUnixSocketBind(socket_path);
 
-    var server = try Server.init(allocator, socket_path, 1);
+    var server = try Server.init(allocator, test_io, socket_path, 1);
     defer server.deinit();
 
     _ = try server.manager.createSessionPane(.{ .shell = "/bin/sh", .command = "true" });
 
-    const deadline = std.time.milliTimestamp() + 2_000;
-    while (std.time.milliTimestamp() < deadline) {
+    const deadline = std.Io.Clock.awake.now(test_io).addDuration(.fromSeconds(2));
+    while (std.Io.Clock.awake.now(test_io).compare(.lt, deadline)) {
         server.manager.reapExitedPanes();
         if (server.manager.count() == 0) break;
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        test_io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
     try std.testing.expectEqual(@as(usize, 0), server.manager.count());
 
-    server.last_activity_seconds.store(std.time.timestamp() - 2, .seq_cst);
+    server.last_activity_seconds.store(monotonicSeconds(test_io) - 2, .seq_cst);
     try std.testing.expect(server.shouldExitForIdle());
 }
 
 fn tempPath(allocator: Allocator, prefix: []const u8) ![]u8 {
     var seed: [8]u8 = undefined;
-    std.crypto.random.bytes(&seed);
+    test_io.random(&seed);
     const nonce = std.mem.readInt(u64, &seed, .little);
     const root = switch (builtin.os.tag) {
         .macos, .ios, .tvos, .watchos, .visionos => "/private/tmp",
@@ -1857,11 +2003,11 @@ fn paddedSocketPath(allocator: Allocator, parent: []const u8, total_len: usize) 
 }
 
 fn countDirEntries(path: []const u8) !usize {
-    var dir = try std.fs.openDirAbsolute(path, .{ .iterate = true });
-    defer dir.close();
+    var dir = try std.Io.Dir.openDirAbsolute(test_io, path, .{ .iterate = true });
+    defer dir.close(test_io);
     var iterator = dir.iterate();
     var count: usize = 0;
-    while (try iterator.next()) |_| count += 1;
+    while (try iterator.next(test_io)) |_| count += 1;
     return count;
 }
 
@@ -1873,11 +2019,11 @@ fn envContains(entries: []const []const u8, expected: []const u8) bool {
 }
 
 fn bindRawUnixListener(path: []const u8) !posix.fd_t {
-    const address = try std.net.Address.initUnix(path);
-    const listener = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-    errdefer posix.close(listener);
-    try posix.bind(listener, &address.any, address.getOsSockLen());
-    try posix.listen(listener, 1);
+    const address = try sys.UnixAddress.init(path);
+    const listener = try sys.unixStreamSocket();
+    errdefer sys.close(listener);
+    try sys.bind(listener, &address);
+    try sys.listen(listener, 1);
     return listener;
 }
 
@@ -1886,8 +2032,8 @@ fn requireUnixSocketBind(path: []const u8) !void {
         error.AccessDenied => return error.SkipZigTest,
         else => return err,
     };
-    posix.close(listener);
-    std.fs.deleteFileAbsolute(path) catch {};
+    sys.close(listener);
+    std.Io.Dir.deleteFileAbsolute(test_io, path) catch {};
 }
 
 fn socketExists(path: []const u8) bool {
@@ -1895,19 +2041,17 @@ fn socketExists(path: []const u8) bool {
     return true;
 }
 
-fn socketPathStat(path: []const u8) !posix.Stat {
-    return posix.fstatat(posix.AT.FDCWD, path, posix.AT.SYMLINK_NOFOLLOW);
+fn socketPathStat(path: []const u8) !sys.Stat {
+    return sys.statAt(sys.cwd_fd, path, false);
 }
 
 fn chmodAbsolute(allocator: Allocator, path: []const u8, mode: std.c.mode_t) !void {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     if (std.c.chmod(path_z.ptr, mode) != 0) return error.ChmodFailed;
 }
 
 fn dirMode(path: []const u8) !u32 {
-    var dir = try std.fs.openDirAbsolute(path, .{});
-    defer dir.close();
-    const stat = try posix.fstat(dir.fd);
-    return @intCast(stat.mode & 0o7777);
+    const stat = try sys.statAt(sys.cwd_fd, path, true);
+    return stat.permissions();
 }

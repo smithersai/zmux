@@ -11,6 +11,12 @@
 //!     stack buffer and written with a single `write(2)`. Fields that do not
 //!     fit are dropped and the line is marked `"truncated":true`.
 //!   * The default level is `.warn`, so a healthy run writes nothing.
+//!
+//! Like `std.log`, the logger is process-global and does not take an `Io`
+//! parameter: it reads the wall clock through `std.Options.debug_io` and
+//! serializes lines with `std.debug.lockStderr`, the same stderr lock that
+//! `std.debug.print` and `std.log` use, so zmux lines never interleave with
+//! other stderr diagnostics in an embedding process.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -23,20 +29,19 @@ pub const env_var = "ZMUX_LOG_LEVEL";
 /// Upper bound for one formatted line, including the trailing newline.
 pub const max_line_bytes: usize = 1024;
 
-var current_level = std.atomic.Value(u8).init(@intFromEnum(default_level));
-var write_mutex: std.Thread.Mutex = .{};
+var current_level = std.atomic.Value(u8).init(@backingInt(default_level));
 
 pub fn setLevel(level: Level) void {
-    current_level.store(@intFromEnum(level), .seq_cst);
+    current_level.store(@backingInt(level), .seq_cst);
 }
 
 pub fn getLevel() Level {
-    return @enumFromInt(current_level.load(.seq_cst));
+    return @fromBackingInt(@intCast(current_level.load(.seq_cst)));
 }
 
 /// True when an event at `level` would be written at the current level.
 pub fn enabled(level: Level) bool {
-    return @intFromEnum(level) <= current_level.load(.seq_cst);
+    return @backingInt(level) <= current_level.load(.seq_cst);
 }
 
 pub fn parseLevel(text: []const u8) error{InvalidLogLevel}!Level {
@@ -54,13 +59,14 @@ pub fn parseLevel(text: []const u8) error{InvalidLogLevel}!Level {
     return error.InvalidLogLevel;
 }
 
-/// Set the level from `ZMUX_LOG_LEVEL`. Unset or unparseable values select the
+/// Set the level from `ZMUX_LOG_LEVEL` in `environ` (for example
+/// `std.process.Init.environ_map`). Unset or unparseable values select the
 /// default (`.warn`) so a typo in the environment cannot make a daemon noisy.
-pub fn initFromEnv() void {
-    setLevel(levelFromEnvValue(std.posix.getenv(env_var)));
+pub fn initFromEnv(environ: *const std.process.Environ.Map) void {
+    setLevel(levelFromEnvValue(environ.get(env_var)));
 }
 
-fn levelFromEnvValue(value: ?[]const u8) Level {
+pub fn levelFromEnvValue(value: ?[]const u8) Level {
     const text = value orelse return default_level;
     return parseLevel(text) catch default_level;
 }
@@ -83,10 +89,8 @@ pub fn emit(level: Level, comptime event: []const u8, fields: anytype) void {
     if (!enabled(level)) return;
 
     var buf: [max_line_bytes]u8 = undefined;
-    const line = format(&buf, level, std.time.milliTimestamp(), currentPid(), event, fields);
-
-    write_mutex.lock();
-    defer write_mutex.unlock();
+    const now_ms = std.Io.Clock.real.now(std.Options.debug_io).toMilliseconds();
+    const line = format(&buf, level, now_ms, currentPid(), event, fields);
     writeStderr(line);
 }
 
@@ -134,12 +138,12 @@ pub fn format(
     line.string(event);
 
     var truncated = line.overflow;
-    inline for (std.meta.fields(@TypeOf(fields))) |field| {
+    inline for (@typeInfo(@TypeOf(fields)).@"struct".field_names) |field_name| {
         const checkpoint = line.len;
         line.raw(",");
-        line.string(field.name);
+        line.string(field_name);
         line.raw(":");
-        line.value(@field(fields, field.name));
+        line.value(@field(fields, field_name));
         if (line.overflow) {
             // Roll back the partial field; keep trying later (shorter) fields.
             line.len = checkpoint;
@@ -180,18 +184,54 @@ const Line = struct {
 
     fn string(self: *Line, bytes: []const u8) void {
         self.raw("\"");
-        for (bytes) |byte| {
+        var i: usize = 0;
+        while (i < bytes.len) {
+            const byte = bytes[i];
             switch (byte) {
-                '"' => self.raw("\\\""),
-                '\\' => self.raw("\\\\"),
-                '\n' => self.raw("\\n"),
-                '\r' => self.raw("\\r"),
-                '\t' => self.raw("\\t"),
+                '"' => {
+                    self.raw("\\\"");
+                    i += 1;
+                },
+                '\\' => {
+                    self.raw("\\\\");
+                    i += 1;
+                },
+                '\n' => {
+                    self.raw("\\n");
+                    i += 1;
+                },
+                '\r' => {
+                    self.raw("\\r");
+                    i += 1;
+                },
+                '\t' => {
+                    self.raw("\\t");
+                    i += 1;
+                },
                 0...8, 11, 12, 14...0x1f, 0x7f => {
                     var tmp: [6]u8 = undefined;
                     self.raw(std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{byte}) catch "?");
+                    i += 1;
                 },
-                else => self.raw(&.{byte}),
+                0x80...0xff => {
+                    // Emit valid UTF-8 sequences verbatim; escape stray invalid
+                    // UTF-8 bytes as \u00XX so the output is always valid JSON.
+                    const seq_len = std.unicode.utf8ByteSequenceLength(byte) catch 0;
+                    if (seq_len > 1 and i + seq_len <= bytes.len and
+                        std.unicode.utf8ValidateSlice(bytes[i .. i + seq_len]))
+                    {
+                        self.raw(bytes[i .. i + seq_len]);
+                        i += seq_len;
+                    } else {
+                        var tmp: [6]u8 = undefined;
+                        self.raw(std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{byte}) catch "?");
+                        i += 1;
+                    }
+                },
+                else => {
+                    self.raw(&.{byte});
+                    i += 1;
+                },
             }
         }
         self.raw("\"");
@@ -203,6 +243,10 @@ const Line = struct {
             .int, .comptime_int => self.int(v),
             .bool => self.raw(if (v) "true" else "false"),
             .float, .comptime_float => {
+                if (@typeInfo(T) == .float and !std.math.isFinite(v)) {
+                    self.raw("null");
+                    return;
+                }
                 var tmp: [64]u8 = undefined;
                 self.raw(std.fmt.bufPrint(&tmp, "{d}", .{v}) catch "0");
             },
@@ -237,12 +281,11 @@ fn currentPid() i64 {
 }
 
 fn writeStderr(bytes: []const u8) void {
-    var offset: usize = 0;
-    while (offset < bytes.len) {
-        const written = std.posix.write(std.posix.STDERR_FILENO, bytes[offset..]) catch return;
-        if (written == 0) return;
-        offset += written;
-    }
+    // An empty buffer makes the locked writer hand `bytes` straight to one
+    // `write(2)` (retried only on a short write).
+    const stderr = std.debug.lockStderr(&.{});
+    defer std.debug.unlockStderr();
+    stderr.file_writer.interface.writeAll(bytes) catch {};
 }
 
 test "parseLevel accepts documented names case-insensitively" {
@@ -321,9 +364,9 @@ test "format escapes strings so a field cannot break out of its line" {
 
 test "format drops fields that overflow and still emits valid JSON" {
     var buf: [max_line_bytes]u8 = undefined;
-    const huge = "x" ** (max_line_bytes * 2);
+    const huge: [max_line_bytes * 2]u8 = @splat('x');
     const line = format(&buf, .warn, 1, 2, "big", .{
-        .payload = @as([]const u8, huge),
+        .payload = @as([]const u8, &huge),
         .count = @as(u32, 9),
     });
     try std.testing.expect(line.len <= max_line_bytes);

@@ -4,6 +4,7 @@ const rpc_line_reader = @import("rpc_line_reader.zig");
 const protocol = @import("protocol.zig");
 
 const posix = std.posix;
+const sys = @import("sys.zig");
 const LineReader = rpc_line_reader.LineReader;
 
 const buffer_size: usize = 32 * 1024;
@@ -35,13 +36,28 @@ fn connectPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
     std.debug.defaultPanic(msg, first_trace_addr);
 }
 
-pub fn main() void {
-    runMain() catch |err| {
+/// An absolute point on the monotonic clock for a bootstrap RPC exchange.
+/// Carries the `Io` that reads the clock so call chains pass one value.
+const Deadline = struct {
+    io: std.Io,
+    at: std.Io.Clock.Timestamp,
+
+    pub fn fromNow(io: std.Io, timeout_ms: i64) Deadline {
+        return .{ .io = io, .at = .fromNow(io, .{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake }) };
+    }
+
+    fn timeout(self: Deadline) std.Io.Timeout {
+        return .{ .deadline = self.at };
+    }
+};
+
+pub fn main(init: std.process.Init) void {
+    runMain(init) catch |err| {
         switch (err) {
             error.InvalidArguments, error.ReadTimeout, error.RpcError => {},
             else => {
                 var buf: [1024]u8 = undefined;
-                var w = std.fs.File.stderr().writer(&buf);
+                var w = std.Io.File.stderr().writerStreaming(init.io, &buf);
                 w.interface.print("zmux-connect: {s}\n", .{@errorName(err)}) catch {};
                 w.interface.flush() catch {};
             },
@@ -50,85 +66,139 @@ pub fn main() void {
     };
 }
 
-fn runMain() !void {
-    var dbg: std.heap.DebugAllocator(.{}) = .init;
-    const allocator = dbg.allocator();
-    defer _ = dbg.deinit();
+pub const ParsedAttachArgs = struct {
+    session_id: ?[]const u8 = null,
+    explicit_socket_path: ?[]const u8 = null,
+    spawn_daemon: bool = false,
+    auto_create: bool = true,
+    create_command: ?[]const u8 = null,
+    show_version: bool = false,
+    show_help: bool = false,
+    detach_key: ?u8 = default_detach_key,
+};
 
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+pub const ParseAttachArgsError = error{
+    MissingSocketValue,
+    MissingCommandValue,
+    MissingDetachKeyValue,
+    InvalidDetachKeyValue,
+    UnknownFlag,
+    UnexpectedArgument,
+};
+
+pub const ParseAttachArgsFailure = struct {
+    err: ParseAttachArgsError,
+    arg: ?[]const u8 = null,
+};
+
+pub fn parseAttachArgs(argv: []const []const u8, failure: ?*ParseAttachArgsFailure) ParseAttachArgsError!ParsedAttachArgs {
+    var parsed: ParsedAttachArgs = .{};
+    var i: usize = 1;
+    while (i < argv.len) : (i += 1) {
+        const a = argv[i];
+        if (std.mem.eql(u8, a, "--socket")) {
+            i += 1;
+            if (i >= argv.len) {
+                if (failure) |f| f.* = .{ .err = error.MissingSocketValue };
+                return error.MissingSocketValue;
+            }
+            parsed.explicit_socket_path = argv[i];
+        } else if (std.mem.eql(u8, a, "--spawn-daemon")) {
+            parsed.spawn_daemon = true;
+        } else if (std.mem.eql(u8, a, "--no-create")) {
+            parsed.auto_create = false;
+        } else if (std.mem.eql(u8, a, "--command")) {
+            i += 1;
+            if (i >= argv.len) {
+                if (failure) |f| f.* = .{ .err = error.MissingCommandValue };
+                return error.MissingCommandValue;
+            }
+            parsed.create_command = argv[i];
+        } else if (std.mem.eql(u8, a, "--detach-key")) {
+            i += 1;
+            if (i >= argv.len) {
+                if (failure) |f| f.* = .{ .err = error.MissingDetachKeyValue };
+                return error.MissingDetachKeyValue;
+            }
+            parsed.detach_key = parseDetachKey(argv[i]) catch {
+                if (failure) |f| f.* = .{ .err = error.InvalidDetachKeyValue, .arg = argv[i] };
+                return error.InvalidDetachKeyValue;
+            };
+        } else if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "-V")) {
+            parsed.show_version = true;
+        } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+            parsed.show_help = true;
+            return parsed;
+        } else if (a.len > 0 and a[0] == '-') {
+            if (failure) |f| f.* = .{ .err = error.UnknownFlag, .arg = a };
+            return error.UnknownFlag;
+        } else if (parsed.session_id == null) {
+            parsed.session_id = a;
+        } else {
+            if (failure) |f| f.* = .{ .err = error.UnexpectedArgument, .arg = a };
+            return error.UnexpectedArgument;
+        }
+    }
+    return parsed;
+}
+
+fn runMain(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
 
     // Management verbs (`ls`, `kill`, `rename`, `shutdown`) are dispatched from
     // the first positional token. A bare `zmux-connect <name>` still attaches,
     // so anything that isn't a known verb falls through to the attach path.
     if (argv.len >= 2) {
         if (parseVerb(argv[1])) |verb| {
-            return runVerb(allocator, verb, argv[2..]);
+            return runVerb(allocator, io, init.environ_map, verb, argv[2..]);
         }
     }
 
-    var session_id: ?[]const u8 = null;
-    var explicit_socket_path: ?[]const u8 = null;
-    var spawn_daemon = false;
-    var auto_create = true;
-    var create_command: ?[]const u8 = null;
-    var show_version = false;
-    var detach_key: ?u8 = default_detach_key;
+    var failure: ParseAttachArgsFailure = .{ .err = error.UnknownFlag };
+    const parsed = parseAttachArgs(argv, &failure) catch |err| switch (err) {
+        error.MissingSocketValue => return fail(io, "missing value for --socket", .{}),
+        error.MissingCommandValue => return fail(io, "missing value for --command", .{}),
+        error.MissingDetachKeyValue => return fail(io, "missing value for --detach-key", .{}),
+        error.InvalidDetachKeyValue => return fail(io, "invalid --detach-key: {s}", .{failure.arg.?}),
+        error.UnknownFlag => return fail(io, "unknown flag: {s}", .{failure.arg.?}),
+        error.UnexpectedArgument => return fail(io, "unexpected argument: {s}", .{failure.arg.?}),
+    };
 
-    var i: usize = 1;
-    while (i < argv.len) : (i += 1) {
-        const a = argv[i];
-        if (std.mem.eql(u8, a, "--socket")) {
-            i += 1;
-            if (i >= argv.len) return fail("missing value for --socket", .{});
-            explicit_socket_path = argv[i];
-        } else if (std.mem.eql(u8, a, "--spawn-daemon")) {
-            spawn_daemon = true;
-        } else if (std.mem.eql(u8, a, "--no-create")) {
-            auto_create = false;
-        } else if (std.mem.eql(u8, a, "--command")) {
-            i += 1;
-            if (i >= argv.len) return fail("missing value for --command", .{});
-            create_command = argv[i];
-        } else if (std.mem.eql(u8, a, "--detach-key")) {
-            i += 1;
-            if (i >= argv.len) return fail("missing value for --detach-key", .{});
-            detach_key = parseDetachKey(argv[i]) catch return fail("invalid --detach-key: {s}", .{argv[i]});
-        } else if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "-V")) {
-            show_version = true;
-        } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
-            try printUsage();
-            return;
-        } else if (a.len > 0 and a[0] == '-') {
-            return fail("unknown flag: {s}", .{a});
-        } else if (session_id == null) {
-            session_id = a;
-        } else {
-            return fail("unexpected argument: {s}", .{a});
-        }
+    if (parsed.show_help) {
+        try printUsage(io);
+        return;
     }
-
-    if (show_version) {
-        try printVersion();
+    if (parsed.show_version) {
+        try printVersion(io);
         return;
     }
 
-    const sid = session_id orelse return fail("session_id is required", .{});
+    const session_id = parsed.session_id;
+    const explicit_socket_path = parsed.explicit_socket_path;
+    const spawn_daemon = parsed.spawn_daemon;
+    const auto_create = parsed.auto_create;
+    const create_command = parsed.create_command;
+    const detach_key = parsed.detach_key;
+
+    const sid = session_id orelse return fail(io, "session_id is required", .{});
 
     const path = if (explicit_socket_path) |value|
         try allocator.dupe(u8, value)
     else
-        try resolveSocketPath(allocator);
+        try resolveSocketPath(allocator, init.environ_map);
     defer allocator.free(path);
 
-    const socket_fd = connectWithRetry(allocator, path, spawn_daemon) catch |err| {
+    const socket_fd = connectWithRetry(allocator, io, path, spawn_daemon) catch |err| {
         if (try connectFailureMessage(allocator, path, err)) |message| {
             defer allocator.free(message);
-            return fail("{s}", .{message});
+            return fail(io, "{s}", .{message});
         }
         return err;
     };
-    defer posix.close(socket_fd);
+    defer sys.close(socket_fd);
     var socket_reader: LineReader = .{};
 
     // Probe the daemon's protocol version before attaching. A version skew is
@@ -139,7 +209,7 @@ fn runMain() !void {
         allocator,
         &socket_reader,
         socket_fd,
-        std.time.milliTimestamp() + version_handshake_timeout_ms,
+        .fromNow(io, version_handshake_timeout_ms),
     );
 
     const initial_size = terminalSize(0) orelse @as(TerminalSize, .{ .rows = 24, .cols = 80 });
@@ -151,11 +221,11 @@ fn runMain() !void {
         initial_size,
         auto_create,
         create_command,
-        std.time.milliTimestamp() + bootstrap_response_timeout_ms,
+        .fromNow(io, bootstrap_response_timeout_ms),
     );
     defer allocator.free(attach_response);
     if (findJsonField(attach_response, "\"error\"")) |_| {
-        try stderrWrite(attach_response);
+        try stderrWrite(io, attach_response);
         std.process.exit(1);
     }
 
@@ -176,7 +246,7 @@ fn runMain() !void {
     const stdin_fd: posix.fd_t = 0;
     const stdout_fd: posix.fd_t = 1;
 
-    const stdin_is_tty = posix.isatty(stdin_fd);
+    const stdin_is_tty = sys.isatty(stdin_fd);
     if (stdin_is_tty) try enterRawMode(stdin_fd);
     defer restoreTermios();
 
@@ -198,28 +268,25 @@ fn runMain() !void {
     }) catch |err| {
         restoreTermios();
         if (err == error.ReadTimeout) {
-            return fail("daemon at {s} is not responding; is zmuxd hung?", .{path});
+            return fail(io, "daemon at {s} is not responding; is zmuxd hung?", .{path});
         }
-        return fail("{s}", .{@errorName(err)});
+        return fail(io, "{s}", .{@errorName(err)});
     };
 
     restoreTermios();
     switch (outcome) {
-        .detached => stderrWrite("[detached]\n") catch {},
-        .session_ended => stderrWrite("session ended\n") catch {},
+        .detached => stderrWrite(io, "[detached]\n") catch {},
+        .session_ended => stderrWrite(io, "session ended\n") catch {},
         .connection_lost => {
-            stderrWrite("zmux-connect: daemon connection lost\n") catch {};
+            stderrWrite(io, "zmux-connect: daemon connection lost\n") catch {};
             std.process.exit(1);
         },
         .exited => {},
     }
 }
 
-fn printVersion() !void {
-    var buf: [64]u8 = undefined;
-    var out = std.fs.File.stdout().writer(&buf);
-    try out.interface.print("zmux-connect {s}\n", .{protocol.version});
-    try out.interface.flush();
+fn printVersion(io: std.Io) !void {
+    try std.Io.File.stdout().writeStreamingAll(io, "zmux-connect " ++ protocol.version ++ "\n");
 }
 
 // Send `client.attach` and, if the daemon reports `PaneNotFound` and
@@ -236,9 +303,9 @@ fn attachOrCreate(
     size: TerminalSize,
     auto_create: bool,
     create_command: ?[]const u8,
-    deadline_ms: i64,
+    deadline: Deadline,
 ) ![]u8 {
-    var first = try sendAttach(allocator, reader, socket_fd, sid, size, 1, deadline_ms);
+    var first = try sendAttach(allocator, reader, socket_fd, sid, size, 1, deadline);
     // The errdefer is guarded so the manual `allocator.free(first)` below
     // doesn't double-free if a later step (`sendCreate`, the create
     // response read, the retry attach) returns an error.
@@ -257,13 +324,13 @@ fn attachOrCreate(
     // including this connection, which has not attached yet. Filter on the
     // JSON-RPC `id` so we don't consume a notification as the create
     // response.
-    const create_response = try readRpcResponse(allocator, reader, socket_fd, 2, deadline_ms);
+    const create_response = try readRpcResponse(allocator, reader, socket_fd, 2, deadline);
     defer allocator.free(create_response);
     if (findJsonField(create_response, "\"error\"")) |_| {
         return try allocator.dupe(u8, create_response);
     }
 
-    return try sendAttach(allocator, reader, socket_fd, sid, size, 3, deadline_ms);
+    return try sendAttach(allocator, reader, socket_fd, sid, size, 3, deadline);
 }
 
 fn sendAttach(
@@ -273,7 +340,7 @@ fn sendAttach(
     sid: []const u8,
     size: TerminalSize,
     rpc_id: u32,
-    deadline_ms: i64,
+    deadline: Deadline,
 ) ![]u8 {
     const req = try std.fmt.allocPrint(
         allocator,
@@ -282,7 +349,7 @@ fn sendAttach(
     );
     defer allocator.free(req);
     try writeAll(socket_fd, req);
-    return readRpcResponse(allocator, reader, socket_fd, rpc_id, deadline_ms);
+    return readRpcResponse(allocator, reader, socket_fd, rpc_id, deadline);
 }
 
 // Read newline-delimited JSON-RPC frames until we find the response
@@ -295,10 +362,10 @@ fn readRpcResponse(
     reader: *LineReader,
     fd: posix.fd_t,
     expected_id: u32,
-    deadline_ms: i64,
+    deadline: Deadline,
 ) ![]u8 {
     while (true) {
-        const line = try reader.readLineAllocWithDeadline(allocator, fd, rpc_line_max, deadline_ms);
+        const line = try reader.readLineAllocTimeout(allocator, deadline.io, fd, rpc_line_max, deadline.timeout());
         if (matchesRpcId(allocator, line, expected_id)) return line;
         allocator.free(line);
     }
@@ -386,14 +453,14 @@ fn warnOnVersionMismatch(
     allocator: std.mem.Allocator,
     reader: *LineReader,
     socket_fd: posix.fd_t,
-    deadline_ms: i64,
+    deadline: Deadline,
 ) void {
-    const daemon_ver = daemonVersion(allocator, reader, socket_fd, deadline_ms) catch return;
+    const daemon_ver = daemonVersion(allocator, reader, socket_fd, deadline) catch return;
     defer allocator.free(daemon_ver);
     if (std.mem.eql(u8, daemon_ver, protocol.version)) return;
 
     var buf: [256]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.Io.File.stderr().writerStreaming(deadline.io, &buf);
     w.interface.print(
         "zmux-connect: warning: daemon protocol {s} differs from client {s}; continuing\n",
         .{ daemon_ver, protocol.version },
@@ -405,7 +472,7 @@ fn daemonVersion(
     allocator: std.mem.Allocator,
     reader: *LineReader,
     socket_fd: posix.fd_t,
-    deadline_ms: i64,
+    deadline: Deadline,
 ) ![]u8 {
     const req = try std.fmt.allocPrint(
         allocator,
@@ -415,7 +482,7 @@ fn daemonVersion(
     defer allocator.free(req);
     try writeAll(socket_fd, req);
 
-    const response = try readRpcResponse(allocator, reader, socket_fd, ping_rpc_id, deadline_ms);
+    const response = try readRpcResponse(allocator, reader, socket_fd, ping_rpc_id, deadline);
     defer allocator.free(response);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
@@ -451,12 +518,29 @@ fn verbName(verb: Verb) []const u8 {
     };
 }
 
-fn runVerb(allocator: std.mem.Allocator, verb: Verb, rest: []const []const u8) !void {
-    var target: ?[]const u8 = null;
-    var new_name: ?[]const u8 = null;
-    var json = false;
-    var explicit_socket: ?[]const u8 = null;
+pub const ParsedVerbArgs = struct {
+    target: ?[]const u8 = null,
+    new_name: ?[]const u8 = null,
+    json: bool = false,
+    explicit_socket: ?[]const u8 = null,
+    show_help: bool = false,
+};
 
+pub const ParseVerbArgsError = error{
+    MissingSocketValue,
+    UnknownFlag,
+    UnexpectedArgument,
+    MissingTarget,
+    MissingNewName,
+};
+
+pub const ParseVerbArgsFailure = struct {
+    err: ParseVerbArgsError,
+    arg: ?[]const u8 = null,
+};
+
+pub fn parseVerbArgs(verb: Verb, rest: []const []const u8, failure: ?*ParseVerbArgsFailure) ParseVerbArgsError!ParsedVerbArgs {
+    var parsed: ParsedVerbArgs = .{};
     const needs_target = (verb == .kill or verb == .rename);
     const needs_new_name = (verb == .rename);
 
@@ -466,39 +550,78 @@ fn runVerb(allocator: std.mem.Allocator, verb: Verb, rest: []const []const u8) !
         const a = rest[i];
         if (std.mem.eql(u8, a, "--socket")) {
             i += 1;
-            if (i >= rest.len) return fail("missing value for --socket", .{});
-            explicit_socket = rest[i];
+            if (i >= rest.len) {
+                if (failure) |f| f.* = .{ .err = error.MissingSocketValue };
+                return error.MissingSocketValue;
+            }
+            parsed.explicit_socket = rest[i];
         } else if (std.mem.eql(u8, a, "--json")) {
-            json = true;
+            parsed.json = true;
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
-            try printUsage();
-            return;
+            parsed.show_help = true;
+            return parsed;
         } else if (a.len > 0 and a[0] == '-') {
-            return fail("unknown flag: {s}", .{a});
+            if (failure) |f| f.* = .{ .err = error.UnknownFlag, .arg = a };
+            return error.UnknownFlag;
         } else if (positionals == 0 and needs_target) {
-            target = a;
+            parsed.target = a;
             positionals += 1;
         } else if (positionals == 1 and needs_new_name) {
-            new_name = a;
+            parsed.new_name = a;
             positionals += 1;
         } else {
-            return fail("unexpected argument: {s}", .{a});
+            if (failure) |f| f.* = .{ .err = error.UnexpectedArgument, .arg = a };
+            return error.UnexpectedArgument;
         }
     }
 
-    if (needs_target and target == null) return fail("{s} requires a session id", .{verbName(verb)});
-    if (needs_new_name and new_name == null) return fail("rename requires a new name", .{});
+    if (needs_target and parsed.target == null) {
+        if (failure) |f| f.* = .{ .err = error.MissingTarget };
+        return error.MissingTarget;
+    }
+    if (needs_new_name and parsed.new_name == null) {
+        if (failure) |f| f.* = .{ .err = error.MissingNewName };
+        return error.MissingNewName;
+    }
+    return parsed;
+}
+
+fn runVerb(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    verb: Verb,
+    rest: []const []const u8,
+) !void {
+    var failure: ParseVerbArgsFailure = .{ .err = error.UnknownFlag };
+    const parsed = parseVerbArgs(verb, rest, &failure) catch |err| switch (err) {
+        error.MissingSocketValue => return fail(io, "missing value for --socket", .{}),
+        error.UnknownFlag => return fail(io, "unknown flag: {s}", .{failure.arg.?}),
+        error.UnexpectedArgument => return fail(io, "unexpected argument: {s}", .{failure.arg.?}),
+        error.MissingTarget => return fail(io, "{s} requires a session id", .{verbName(verb)}),
+        error.MissingNewName => return fail(io, "rename requires a new name", .{}),
+    };
+
+    if (parsed.show_help) {
+        try printUsage(io);
+        return;
+    }
+
+    const target = parsed.target;
+    const new_name = parsed.new_name;
+    const json = parsed.json;
+    const explicit_socket = parsed.explicit_socket;
 
     const path = if (explicit_socket) |value|
         try allocator.dupe(u8, value)
     else
-        try resolveSocketPath(allocator);
+        try resolveSocketPath(allocator, environ);
     defer allocator.free(path);
 
     const socket_fd = tryConnect(path) catch {
-        return verbError("no daemon reachable at {s}", .{path});
+        return verbError(io, "no daemon reachable at {s}", .{path});
     };
-    defer posix.close(socket_fd);
+    defer sys.close(socket_fd);
 
     var reader: LineReader = .{};
     try executeVerb(
@@ -510,7 +633,7 @@ fn runVerb(allocator: std.mem.Allocator, verb: Verb, rest: []const []const u8) !
         new_name,
         json,
         1,
-        std.time.milliTimestamp() + bootstrap_response_timeout_ms,
+        .fromNow(io, bootstrap_response_timeout_ms),
     );
 }
 
@@ -523,19 +646,19 @@ fn executeVerb(
     new_name: ?[]const u8,
     json: bool,
     out_fd: posix.fd_t,
-    deadline_ms: i64,
+    deadline: Deadline,
 ) !void {
     const request = try buildVerbRequest(allocator, verb, target, new_name);
     defer allocator.free(request);
     try writeAll(socket_fd, request);
 
-    const response = try readRpcResponse(allocator, reader, socket_fd, verb_rpc_id, deadline_ms);
+    const response = try readRpcResponse(allocator, reader, socket_fd, verb_rpc_id, deadline);
     defer allocator.free(response);
 
     if (rpcErrorMessage(allocator, response)) |msg| {
         defer allocator.free(msg);
         var buf: [1024]u8 = undefined;
-        var w = std.fs.File.stderr().writer(&buf);
+        var w = std.Io.File.stderr().writer(deadline.io, &buf);
         w.interface.print("zmux-connect: {s}\n", .{msg}) catch {};
         w.interface.flush() catch {};
         return error.RpcError;
@@ -647,9 +770,9 @@ fn rpcErrorMessage(allocator: std.mem.Allocator, response: []const u8) ?[]u8 {
     return allocator.dupe(u8, message.string) catch null;
 }
 
-fn verbError(comptime fmt: []const u8, args: anytype) error{RpcError} {
+fn verbError(io: std.Io, comptime fmt: []const u8, args: anytype) error{RpcError} {
     var buf: [1024]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.Io.File.stderr().writer(io, &buf);
     w.interface.print("zmux-connect: " ++ fmt ++ "\n", args) catch {};
     w.interface.flush() catch {};
     return error.RpcError;
@@ -786,7 +909,7 @@ fn drainReadableSocket(
     return saw_exit;
 }
 
-fn connectWithRetry(allocator: std.mem.Allocator, path: []const u8, spawn_daemon: bool) !posix.fd_t {
+fn connectWithRetry(allocator: std.mem.Allocator, io: std.Io, path: []const u8, spawn_daemon: bool) !posix.fd_t {
     if (tryConnect(path)) |fd| return fd else |err| switch (err) {
         error.ConnectionRefused, error.FileNotFound => {
             if (!spawn_daemon) return err;
@@ -794,13 +917,13 @@ fn connectWithRetry(allocator: std.mem.Allocator, path: []const u8, spawn_daemon
         else => return err,
     }
 
-    try spawnDaemonDetached(allocator, path);
+    try spawnDaemonDetached(allocator, io, path);
 
-    const deadline_ms = std.time.milliTimestamp() + 2000;
-    while (std.time.milliTimestamp() < deadline_ms) {
+    const deadline = Deadline.fromNow(io, 2000);
+    while (std.Io.Clock.awake.now(io).compare(.lt, deadline.at.raw)) {
         if (tryConnect(path)) |fd| return fd else |err| switch (err) {
             error.ConnectionRefused, error.FileNotFound => {
-                std.Thread.sleep(50 * std.time.ns_per_ms);
+                try io.sleep(.fromMilliseconds(50), .awake);
             },
             else => return err,
         }
@@ -825,46 +948,56 @@ fn connectFailureMessage(allocator: std.mem.Allocator, path: []const u8, err: an
 }
 
 fn tryConnect(path: []const u8) !posix.fd_t {
-    const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-    errdefer posix.close(fd);
-    const address = std.net.Address.initUnix(path) catch return error.FileNotFound;
-    try posix.connect(fd, &address.any, address.getOsSockLen());
+    const address = sys.UnixAddress.init(path) catch return error.FileNotFound;
+    const fd = try sys.unixStreamSocket();
+    errdefer sys.close(fd);
+    try sys.connect(fd, &address);
     return fd;
 }
 
-fn spawnDaemonDetached(allocator: std.mem.Allocator, socket_path: []const u8) !void {
+fn spawnDaemonDetached(allocator: std.mem.Allocator, io: std.Io, socket_path: []const u8) !void {
     // Locate the daemon binary by looking next to our own executable.
-    const self_path = std.fs.selfExePathAlloc(allocator) catch |err| return err;
+    const self_path = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(self_path);
     const dir = std.fs.path.dirname(self_path) orelse ".";
-    const daemon_path = try findDaemonSibling(allocator, dir, std.fs.path.basename(self_path));
+    const daemon_path = try findDaemonSibling(allocator, io, dir, std.fs.path.basename(self_path));
     defer allocator.free(daemon_path);
 
-    const pid = try posix.fork();
+    // Prepare every NUL-terminated string before fork: a forked child of a
+    // Zig process may only invoke async-signal-safe syscalls before exec
+    // (no heap allocation, no `std.Io`, no locks).
+    const daemon_z = try allocator.dupeSentinel(u8, daemon_path, 0);
+    defer allocator.free(daemon_z);
+    const path_z = try allocator.dupeSentinel(u8, socket_path, 0);
+    defer allocator.free(path_z);
+    const log_path_z = try std.fmt.allocPrintSentinel(allocator, "{s}.log", .{socket_path}, 0);
+    defer allocator.free(log_path_z);
+    const argv = [_:null]?[*:0]const u8{ daemon_z.ptr, "--socket", path_z.ptr };
+    const envp = sys.currentEnviron();
+
+    const pid = try sys.fork();
     if (pid != 0) return;
 
     // Child: detach and exec.
     _ = std.c.setsid();
     // Redirect stdio to /dev/null, and stderr to the socket log for startup diagnostics.
-    const devnull = posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch std.c._exit(127);
-    _ = std.c.dup2(devnull, 0);
-    _ = std.c.dup2(devnull, 1);
+    const devnull = sys.openZ("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch std.c._exit(127);
+    sys.dup2(devnull, 0) catch {};
+    sys.dup2(devnull, 1) catch {};
 
-    const log_path = std.fmt.allocPrint(allocator, "{s}.log", .{socket_path}) catch std.c._exit(127);
-    defer allocator.free(log_path);
-    const log_fd = posix.open(log_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, 0o600) catch devnull;
-    _ = std.c.dup2(log_fd, 2);
-    if (log_fd > 2) posix.close(log_fd);
+    const log_fd = sys.openZ(
+        log_path_z.ptr,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true },
+        0o600,
+    ) catch devnull;
+    sys.dup2(log_fd, 2) catch {};
+    if (log_fd > 2) sys.close(log_fd);
+    if (devnull > 2 and devnull != log_fd) sys.close(devnull);
 
-    if (devnull > 2) posix.close(devnull);
-
-    const daemon_z = allocator.dupeZ(u8, daemon_path) catch std.c._exit(127);
-    const socket_flag_z = allocator.dupeZ(u8, "--socket") catch std.c._exit(127);
-    const path_z = allocator.dupeZ(u8, socket_path) catch std.c._exit(127);
-    const argv = [_:null]?[*:0]const u8{ daemon_z.ptr, socket_flag_z.ptr, path_z.ptr };
-    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
-    posix.execvpeZ(daemon_z.ptr, &argv, envp) catch {};
-    std.c._exit(127);
+    // execvpeZ only returns on failure; the log fd already holds stderr.
+    switch (sys.execvpeZ(daemon_z.ptr, &argv, envp)) {
+        else => std.c._exit(127),
+    }
 }
 
 fn enterRawMode(fd: posix.fd_t) !void {
@@ -901,44 +1034,44 @@ fn restoreTermios() void {
     }
 }
 
-fn winchHandler(_: c_int) callconv(.c) void {
+fn winchHandler(_: posix.SIG) callconv(.c) void {
     g_winch_flag.store(true, .seq_cst);
 }
 
-fn exitRestoreHandler(sig: c_int) callconv(.c) void {
+fn exitRestoreHandler(sig: posix.SIG) callconv(.c) void {
     restoreTermios();
     // Reset to default and re-raise so the default action takes effect.
-    var dfl: posix.Sigaction = undefined;
-    @memset(std.mem.asBytes(&dfl), 0);
-    dfl.handler = .{ .handler = null };
-    dfl.mask = std.mem.zeroes(posix.sigset_t);
-    dfl.flags = 0;
-    posix.sigaction(@intCast(sig), &dfl, null);
+    const dfl: posix.Sigaction = .{
+        .handler = .{ .handler = posix.SIG.DFL },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(sig, &dfl, null);
     _ = std.c.raise(sig);
 }
 
 fn installSigwinchHandler() void {
-    var act: posix.Sigaction = undefined;
-    @memset(std.mem.asBytes(&act), 0);
-    act.handler = .{ .handler = winchHandler };
-    act.mask = std.mem.zeroes(posix.sigset_t);
-    act.flags = 0;
-    posix.sigaction(std.c.SIG.WINCH, &act, null);
+    const act: posix.Sigaction = .{
+        .handler = .{ .handler = winchHandler },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(.WINCH, &act, null);
 }
 
 fn installExitRestoreHandlers() void {
     // Raw mode disables ISIG, so interactive ^C is forwarded as input bytes.
     // Signal-delivered INT/TERM still need to restore the local terminal.
-    var act: posix.Sigaction = undefined;
-    @memset(std.mem.asBytes(&act), 0);
-    act.handler = .{ .handler = exitRestoreHandler };
-    act.mask = std.mem.zeroes(posix.sigset_t);
-    act.flags = 0;
-    posix.sigaction(std.c.SIG.HUP, &act, null);
-    posix.sigaction(std.c.SIG.PIPE, &act, null);
-    posix.sigaction(std.c.SIG.QUIT, &act, null);
-    posix.sigaction(std.c.SIG.INT, &act, null);
-    posix.sigaction(std.c.SIG.TERM, &act, null);
+    const act: posix.Sigaction = .{
+        .handler = .{ .handler = exitRestoreHandler },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(.HUP, &act, null);
+    posix.sigaction(.PIPE, &act, null);
+    posix.sigaction(.QUIT, &act, null);
+    posix.sigaction(.INT, &act, null);
+    posix.sigaction(.TERM, &act, null);
 }
 
 fn sendResize(
@@ -972,13 +1105,13 @@ fn terminalSize(tty_fd: posix.fd_t) ?TerminalSize {
 }
 
 // Mirrors daemon.zig::socketPath. Keep in sync.
-fn resolveSocketPath(allocator: std.mem.Allocator) ![]u8 {
+fn resolveSocketPath(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]u8 {
     return resolveSocketPathFromEnv(
         allocator,
-        std.posix.getenv("ZMUX_SOCKET"),
-        std.posix.getenv("SMITHERS_SESSION_SOCKET"),
-        std.posix.getenv("XDG_RUNTIME_DIR"),
-        std.posix.getenv("HOME"),
+        environ.get("ZMUX_SOCKET"),
+        environ.get("SMITHERS_SESSION_SOCKET"),
+        environ.get("XDG_RUNTIME_DIR"),
+        environ.get("HOME"),
     );
 }
 
@@ -1002,7 +1135,7 @@ fn resolveSocketPathFromEnv(
         if (home_path.len > 0) return std.fs.path.join(allocator, &.{ home_path, ".smithers", "sessions.sock" });
     }
 
-    const fallback_dir = try std.fmt.allocPrint(allocator, "/tmp/zmux-{d}", .{posix.geteuid()});
+    const fallback_dir = try std.fmt.allocPrint(allocator, "/tmp/zmux-{d}", .{sys.geteuid()});
     defer allocator.free(fallback_dir);
     return std.fs.path.join(allocator, &.{ fallback_dir, "sessions.sock" });
 }
@@ -1014,20 +1147,41 @@ fn tiocgwinsz() usize {
     };
 }
 
+/// Write to a socket using `MSG_NOSIGNAL` (falling back to `write(2)` only on
+/// non-socket descriptors such as unit-test pipes).
 fn writeAll(fd: posix.fd_t, bytes: []const u8) !void {
     var offset: usize = 0;
     while (offset < bytes.len) {
-        const n = posix.write(fd, bytes[offset..]) catch |err| switch (err) {
+        const chunk = bytes[offset..];
+        const rc = std.c.send(fd, chunk.ptr, chunk.len, std.c.MSG.NOSIGNAL);
+        switch (posix.errno(rc)) {
+            .SUCCESS => {
+                const n: usize = @intCast(rc);
+                if (n == 0) return error.WriteZero;
+                offset += n;
+            },
+            .INTR, .AGAIN => continue,
+            .NOTSOCK => return writeAllFd(fd, chunk),
+            .PIPE => return error.BrokenPipe,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .IO => return error.InputOutput,
+            .NOSPC => return error.NoSpaceLeft,
+            .ACCES, .PERM => return error.AccessDenied,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn writeAllFd(fd: posix.fd_t, bytes: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const n = sys.write(fd, bytes[offset..]) catch |err| switch (err) {
             error.WouldBlock => continue,
             else => return err,
         };
         if (n == 0) return error.WriteZero;
         offset += n;
     }
-}
-
-fn writeAllFd(fd: posix.fd_t, bytes: []const u8) !void {
-    return writeAll(fd, bytes);
 }
 
 fn handleServerLine(
@@ -1150,25 +1304,22 @@ fn replayScrollbackFromAttach(
     try writeAllFd(out_fd, decoded);
 }
 
-fn stderrWrite(bytes: []const u8) !void {
-    var buf: [1024]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
-    try w.interface.writeAll(bytes);
-    try w.interface.flush();
+fn stderrWrite(io: std.Io, bytes: []const u8) !void {
+    try std.Io.File.stderr().writeStreamingAll(io, bytes);
 }
 
-fn fail(comptime fmt: []const u8, args: anytype) error{InvalidArguments} {
+fn fail(io: std.Io, comptime fmt: []const u8, args: anytype) error{InvalidArguments} {
     var buf: [1024]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.Io.File.stderr().writerStreaming(io, &buf);
     w.interface.print("zmux-connect: " ++ fmt ++ "\n", args) catch {};
     w.interface.print("Try 'zmux-connect --help' for usage.\n", .{}) catch {};
     w.interface.flush() catch {};
     return error.InvalidArguments;
 }
 
-fn printUsage() !void {
+fn printUsage(io: std.Io) !void {
     var buf: [2048]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
+    var w = std.Io.File.stdout().writerStreaming(io, &buf);
     try w.interface.writeAll(
         \\Usage: zmux-connect <session_id> [--socket PATH] [--spawn-daemon]
         \\                    [--no-create] [--command CMD] [--detach-key KEY]
@@ -1194,7 +1345,7 @@ fn printUsage() !void {
     try w.interface.flush();
 }
 
-fn findDaemonSibling(allocator: std.mem.Allocator, dir: []const u8, self_name: []const u8) ![]u8 {
+fn findDaemonSibling(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, self_name: []const u8) ![]u8 {
     const zmux_order = [_][]const u8{ "zmuxd", "smithers-session-daemon" };
     const smithers_order = [_][]const u8{ "smithers-session-daemon", "zmuxd" };
     const candidates: []const []const u8 = if (std.mem.eql(u8, self_name, "zmux-connect"))
@@ -1204,7 +1355,7 @@ fn findDaemonSibling(allocator: std.mem.Allocator, dir: []const u8, self_name: [
 
     for (candidates) |name| {
         const path = try std.fs.path.join(allocator, &.{ dir, name });
-        if (std.fs.accessAbsolute(path, .{})) |_| {
+        if (std.Io.Dir.accessAbsolute(io, path, .{})) |_| {
             return path;
         } else |_| {
             allocator.free(path);
@@ -1213,6 +1364,49 @@ fn findDaemonSibling(allocator: std.mem.Allocator, dir: []const u8, self_name: [
 
     return std.fs.path.join(allocator, &.{ dir, candidates[0] });
 }
+
+const test_io = std.testing.io;
+
+/// Internal hooks exposed for the repository's own fuzz suites.
+pub const fuzz_hooks = struct {
+    pub const VerbKind = Verb;
+    pub const RunOutcomeKind = RunOutcome;
+    pub const RunLoopOpts = RunLoopOptions;
+    pub const TermSize = TerminalSize;
+    pub const RpcDeadline = Deadline;
+    pub const default_detach = default_detach_key;
+    pub const ping_id = ping_rpc_id;
+    pub const verb_id = verb_rpc_id;
+    pub const detach_id = detach_rpc_id;
+
+    pub const parseAttachArgsFn = parseAttachArgs;
+    pub const parseVerbArgsFn = parseVerbArgs;
+    pub const parseDetachKeyFn = parseDetachKey;
+    pub const controlByteFn = controlByte;
+    pub const parseVerbFn = parseVerb;
+    pub const verbNameFn = verbName;
+    pub const buildVerbRequestFn = buildVerbRequest;
+    pub const formatVerbResultFn = formatVerbResult;
+    pub const formatSessionListFn = formatSessionList;
+    pub const rpcErrorMessageFn = rpcErrorMessage;
+    pub const matchesRpcIdFn = matchesRpcId;
+    pub const isPaneNotFoundFn = isPaneNotFound;
+    pub const paneIdFromAttachFn = paneIdFromAttach;
+    pub const clientIdFromAttachFn = clientIdFromAttach;
+    pub const handleServerLineFn = handleServerLine;
+    pub const replayScrollbackFromAttachFn = replayScrollbackFromAttach;
+    pub const resolveSocketPathFromEnvFn = resolveSocketPathFromEnv;
+    pub const connectFailureMessageFn = connectFailureMessage;
+    pub const attachOrCreateFn = attachOrCreate;
+    pub const executeVerbFn = executeVerb;
+    pub const daemonVersionFn = daemonVersion;
+    pub const readRpcResponseFn = readRpcResponse;
+    pub const runLoopFn = runLoop;
+    pub const b64EncodeFn = base64Encode;
+    pub const b64DecodeFn = base64Decode;
+    pub const findDaemonSiblingFn = findDaemonSibling;
+    pub const writeAllFn = writeAll;
+};
 
 test "tiocgwinsz encodes the platform ioctl" {
     const req = tiocgwinsz();
@@ -1225,7 +1419,7 @@ test "resolveSocketPathFromEnv falls back to uid-scoped /tmp path" {
     const expected_prefix = try std.fmt.allocPrint(
         std.testing.allocator,
         "/tmp/zmux-{d}/sessions.sock",
-        .{posix.geteuid()},
+        .{sys.geteuid()},
     );
     defer std.testing.allocator.free(expected_prefix);
     try std.testing.expectEqualStrings(expected_prefix, path);
@@ -1244,11 +1438,9 @@ test "matchesRpcId accepts only the expected numeric response id" {
 }
 
 test "readRpcResponse skips notifications and out-of-order responses" {
-    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
-
-    const fds = try std.posix.pipe();
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
+    const fds = try sys.pipe();
+    defer sys.close(fds[0]);
+    defer sys.close(fds[1]);
 
     try writeAll(
         fds[1],
@@ -1258,21 +1450,19 @@ test "readRpcResponse skips notifications and out-of-order responses" {
     );
 
     var reader: LineReader = .{};
-    const line = try readRpcResponse(std.testing.allocator, &reader, fds[0], 2, std.time.milliTimestamp() + 10_000);
+    const line = try readRpcResponse(std.testing.allocator, &reader, fds[0], 2, Deadline.fromNow(test_io, 10_000));
     defer std.testing.allocator.free(line);
 
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"ok\":true}}\n", line);
 }
 
 test "readRpcResponse returns ReadTimeout" {
-    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
-
-    const fds = try std.posix.pipe();
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
+    const fds = try sys.pipe();
+    defer sys.close(fds[0]);
+    defer sys.close(fds[1]);
 
     var reader: LineReader = .{};
-    const deadline = std.time.milliTimestamp() + 20;
+    const deadline = Deadline.fromNow(test_io, 20);
     try std.testing.expectError(
         error.ReadTimeout,
         readRpcResponse(std.testing.allocator, &reader, fds[0], 1, deadline),
@@ -1280,20 +1470,20 @@ test "readRpcResponse returns ReadTimeout" {
 }
 
 fn socketPairForTest() ![2]posix.fd_t {
-    var pair: [2]posix.fd_t = undefined;
-    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &pair) != 0) return error.SkipZigTest;
-    return pair;
+    return sys.socketPair() catch error.SkipZigTest;
 }
 
 fn readRequestLineForTest(allocator: std.mem.Allocator, reader: *LineReader, fd: posix.fd_t) ![]u8 {
-    return reader.readLineAllocWithDeadline(allocator, fd, rpc_line_max, std.time.milliTimestamp() + 2_000);
+    return reader.readLineAllocTimeout(allocator, test_io, fd, rpc_line_max, .{
+        .duration = .{ .raw = .fromSeconds(2), .clock = .awake },
+    });
 }
 
 test "attachOrCreate returns an attach success without creating" {
     const allocator = std.testing.allocator;
     const pair = try socketPairForTest();
-    defer posix.close(pair[0]);
-    defer posix.close(pair[1]);
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
 
     try writeAll(pair[1], "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"clientId\":\"client-1\",\"paneId\":\"work\"}}\n");
 
@@ -1306,7 +1496,7 @@ test "attachOrCreate returns an attach success without creating" {
         .{ .rows = 24, .cols = 80 },
         true,
         null,
-        std.time.milliTimestamp() + 2_000,
+        Deadline.fromNow(test_io, 2_000),
     );
     defer allocator.free(response);
     try std.testing.expect(std.mem.indexOf(u8, response, "\"clientId\":\"client-1\"") != null);
@@ -1321,8 +1511,8 @@ test "attachOrCreate returns an attach success without creating" {
 test "attachOrCreate creates after PaneNotFound and skips interleaved notifications" {
     const allocator = std.testing.allocator;
     const pair = try socketPairForTest();
-    defer posix.close(pair[0]);
-    defer posix.close(pair[1]);
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
 
     try writeAll(
         pair[1],
@@ -1341,7 +1531,7 @@ test "attachOrCreate creates after PaneNotFound and skips interleaved notificati
         .{ .rows = 40, .cols = 120 },
         true,
         "printf ok",
-        std.time.milliTimestamp() + 2_000,
+        Deadline.fromNow(test_io, 2_000),
     );
     defer allocator.free(response);
     try std.testing.expect(std.mem.indexOf(u8, response, "\"clientId\":\"client-2\"") != null);
@@ -1363,8 +1553,8 @@ test "attachOrCreate creates after PaneNotFound and skips interleaved notificati
 test "attachOrCreate returns PaneNotFound when auto create is disabled" {
     const allocator = std.testing.allocator;
     const pair = try socketPairForTest();
-    defer posix.close(pair[0]);
-    defer posix.close(pair[1]);
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
 
     const pane_error = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"PaneNotFound\"}}\n";
     try writeAll(pair[1], pane_error);
@@ -1378,7 +1568,7 @@ test "attachOrCreate returns PaneNotFound when auto create is disabled" {
         .{ .rows = 24, .cols = 80 },
         false,
         null,
-        std.time.milliTimestamp() + 2_000,
+        Deadline.fromNow(test_io, 2_000),
     );
     defer allocator.free(response);
     try std.testing.expectEqualStrings(pane_error, response);
@@ -1392,8 +1582,8 @@ test "attachOrCreate returns PaneNotFound when auto create is disabled" {
 test "attachOrCreate returns create errors without retrying attach" {
     const allocator = std.testing.allocator;
     const pair = try socketPairForTest();
-    defer posix.close(pair[0]);
-    defer posix.close(pair[1]);
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
 
     const create_error = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"bad create\"}}\n";
     try writeAll(
@@ -1411,7 +1601,7 @@ test "attachOrCreate returns create errors without retrying attach" {
         .{ .rows = 24, .cols = 80 },
         true,
         null,
-        std.time.milliTimestamp() + 2_000,
+        Deadline.fromNow(test_io, 2_000),
     );
     defer allocator.free(response);
     try std.testing.expectEqualStrings(create_error, response);
@@ -1446,8 +1636,6 @@ test "paneIdFromAttach extracts canonical pane id" {
 }
 
 test "handleServerLine writes matching pane output and ignores other panes" {
-    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
-
     const ignored =
         "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":" ++
         "{\"pane_id\":\"pane-other\",\"data_base64\":\"aGVsbG8=\"}}\n";
@@ -1458,9 +1646,9 @@ test "handleServerLine writes matching pane output and ignores other panes" {
         @as(posix.fd_t, -1),
     ));
 
-    const fds = try std.posix.pipe();
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
+    const fds = try sys.pipe();
+    defer sys.close(fds[0]);
+    defer sys.close(fds[1]);
 
     const matching =
         "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":" ++
@@ -1468,7 +1656,7 @@ test "handleServerLine writes matching pane output and ignores other panes" {
     try std.testing.expect(!try handleServerLine(std.testing.allocator, matching, "pane-1", fds[1]));
 
     var buf: [16]u8 = undefined;
-    const n = try posix.read(fds[0], &buf);
+    const n = try sys.read(fds[0], &buf);
     try std.testing.expectEqualStrings("hello", buf[0..n]);
 }
 
@@ -1485,11 +1673,9 @@ test "handleServerLine exits only for matching session exit notification" {
 }
 
 test "replayScrollbackFromAttach decodes replay bytes" {
-    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
-
-    const fds = try std.posix.pipe();
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
+    const fds = try sys.pipe();
+    defer sys.close(fds[0]);
+    defer sys.close(fds[1]);
 
     try replayScrollbackFromAttach(
         std.testing.allocator,
@@ -1498,7 +1684,7 @@ test "replayScrollbackFromAttach decodes replay bytes" {
     );
 
     var buf: [32]u8 = undefined;
-    const n = try posix.read(fds[0], &buf);
+    const n = try sys.read(fds[0], &buf);
     try std.testing.expectEqualStrings("replay bytes", buf[0..n]);
 }
 
@@ -1508,33 +1694,32 @@ test "exit restore handlers include external INT and TERM signals" {
     var old_quit: posix.Sigaction = undefined;
     var old_int: posix.Sigaction = undefined;
     var old_term: posix.Sigaction = undefined;
-    posix.sigaction(std.c.SIG.HUP, null, &old_hup);
-    posix.sigaction(std.c.SIG.PIPE, null, &old_pipe);
-    posix.sigaction(std.c.SIG.QUIT, null, &old_quit);
-    posix.sigaction(std.c.SIG.INT, null, &old_int);
-    posix.sigaction(std.c.SIG.TERM, null, &old_term);
-    defer posix.sigaction(std.c.SIG.HUP, &old_hup, null);
-    defer posix.sigaction(std.c.SIG.PIPE, &old_pipe, null);
-    defer posix.sigaction(std.c.SIG.QUIT, &old_quit, null);
-    defer posix.sigaction(std.c.SIG.INT, &old_int, null);
-    defer posix.sigaction(std.c.SIG.TERM, &old_term, null);
+    posix.sigaction(.HUP, null, &old_hup);
+    posix.sigaction(.PIPE, null, &old_pipe);
+    posix.sigaction(.QUIT, null, &old_quit);
+    posix.sigaction(.INT, null, &old_int);
+    posix.sigaction(.TERM, null, &old_term);
+    defer posix.sigaction(.HUP, &old_hup, null);
+    defer posix.sigaction(.PIPE, &old_pipe, null);
+    defer posix.sigaction(.QUIT, &old_quit, null);
+    defer posix.sigaction(.INT, &old_int, null);
+    defer posix.sigaction(.TERM, &old_term, null);
 
     installExitRestoreHandlers();
 
     var current_int: posix.Sigaction = undefined;
     var current_term: posix.Sigaction = undefined;
-    posix.sigaction(std.c.SIG.INT, null, &current_int);
-    posix.sigaction(std.c.SIG.TERM, null, &current_term);
+    posix.sigaction(.INT, null, &current_int);
+    posix.sigaction(.TERM, null, &current_term);
     try std.testing.expect(current_int.handler.handler.? == exitRestoreHandler);
     try std.testing.expect(current_term.handler.handler.? == exitRestoreHandler);
 }
 
 test "stdin WouldBlock is not treated as EOF" {
-    if (!@hasDecl(std.posix, "pipe2")) return error.SkipZigTest;
-
-    const fds = try std.posix.pipe2(.{ .NONBLOCK = true });
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
+    const fds = try sys.pipe();
+    defer sys.close(fds[0]);
+    defer sys.close(fds[1]);
+    try sys.setNonBlocking(fds[0]);
 
     var buf: [16]u8 = undefined;
     switch (try readStdinChunk(fds[0], &buf)) {
@@ -1545,22 +1730,20 @@ test "stdin WouldBlock is not treated as EOF" {
 }
 
 test "runLoop drains final socket output after HUP" {
-    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
-
     const allocator = std.testing.allocator;
-    const stdin_fds = try std.posix.pipe();
-    defer posix.close(stdin_fds[0]);
-    defer posix.close(stdin_fds[1]);
+    const stdin_fds = try sys.pipe();
+    defer sys.close(stdin_fds[0]);
+    defer sys.close(stdin_fds[1]);
 
-    const socket_fds = try std.posix.pipe();
-    defer posix.close(socket_fds[0]);
+    const socket_fds = try sys.pipe();
+    defer sys.close(socket_fds[0]);
     var socket_write_open = true;
-    defer if (socket_write_open) posix.close(socket_fds[1]);
+    defer if (socket_write_open) sys.close(socket_fds[1]);
 
-    const stdout_fds = try std.posix.pipe();
-    defer posix.close(stdout_fds[0]);
+    const stdout_fds = try sys.pipe();
+    defer sys.close(stdout_fds[0]);
     var stdout_write_open = true;
-    defer if (stdout_write_open) posix.close(stdout_fds[1]);
+    defer if (stdout_write_open) sys.close(stdout_fds[1]);
 
     const first_line = try paneOutputLineForTest(allocator, "pane-1", "FIRST\n");
     defer allocator.free(first_line);
@@ -1575,14 +1758,14 @@ test "runLoop drains final socket output after HUP" {
 
     try writeAll(socket_fds[1], first_line);
     try writeAll(socket_fds[1], tail_line);
-    posix.close(socket_fds[1]);
+    sys.close(socket_fds[1]);
     socket_write_open = false;
 
     var reader: LineReader = .{};
     const outcome = try runLoop(stdin_fds[0], stdout_fds[1], socket_fds[0], &reader, allocator, "pane-1", .{});
     try std.testing.expectEqual(RunOutcome.connection_lost, outcome);
 
-    posix.close(stdout_fds[1]);
+    sys.close(stdout_fds[1]);
     stdout_write_open = false;
     const output = try readAllFdForTest(allocator, stdout_fds[0]);
     defer allocator.free(output);
@@ -1592,27 +1775,25 @@ test "runLoop drains final socket output after HUP" {
 }
 
 test "runLoop reports session end when the daemon sends a matching exit notification" {
-    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
-
     const allocator = std.testing.allocator;
-    const stdin_fds = try std.posix.pipe();
-    defer posix.close(stdin_fds[0]);
-    defer posix.close(stdin_fds[1]);
+    const stdin_fds = try sys.pipe();
+    defer sys.close(stdin_fds[0]);
+    defer sys.close(stdin_fds[1]);
 
-    const socket_fds = try std.posix.pipe();
-    defer posix.close(socket_fds[0]);
+    const socket_fds = try sys.pipe();
+    defer sys.close(socket_fds[0]);
     var socket_write_open = true;
-    defer if (socket_write_open) posix.close(socket_fds[1]);
+    defer if (socket_write_open) sys.close(socket_fds[1]);
 
-    const stdout_fds = try std.posix.pipe();
-    defer posix.close(stdout_fds[0]);
-    defer posix.close(stdout_fds[1]);
+    const stdout_fds = try sys.pipe();
+    defer sys.close(stdout_fds[0]);
+    defer sys.close(stdout_fds[1]);
 
     try writeAll(
         socket_fds[1],
         "{\"jsonrpc\":\"2.0\",\"method\":\"session_exited\",\"params\":{\"session_id\":\"pane-1\",\"pid\":123,\"exit_code\":0,\"signal\":null}}\n",
     );
-    posix.close(socket_fds[1]);
+    sys.close(socket_fds[1]);
     socket_write_open = false;
 
     var reader: LineReader = .{};
@@ -1671,18 +1852,17 @@ test "clientIdFromAttach extracts the logical client id" {
 }
 
 test "runLoop intercepts the detach chord and sends client.detach" {
-    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
     g_winch_flag.store(false, .seq_cst);
 
     const allocator = std.testing.allocator;
 
-    const stdin_fds = try std.posix.pipe();
-    defer posix.close(stdin_fds[0]);
-    defer posix.close(stdin_fds[1]);
+    const stdin_fds = try sys.pipe();
+    defer sys.close(stdin_fds[0]);
+    defer sys.close(stdin_fds[1]);
 
-    const socket_fds = try std.posix.pipe();
-    defer posix.close(socket_fds[0]);
-    defer posix.close(socket_fds[1]);
+    const socket_fds = try sys.pipe();
+    defer sys.close(socket_fds[0]);
+    defer sys.close(socket_fds[1]);
 
     // Feed the default detach chord (Ctrl-\) as raw stdin.
     try writeAll(stdin_fds[1], &.{default_detach_key});
@@ -1776,12 +1956,12 @@ test "executeVerb round-trips session.list over a socket and formats output" {
 
     var pair: [2]posix.fd_t = undefined;
     if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &pair) != 0) return error.SkipZigTest;
-    defer posix.close(pair[0]);
-    defer posix.close(pair[1]);
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
 
-    const out = try std.posix.pipe();
-    defer posix.close(out[0]);
-    defer posix.close(out[1]);
+    const out = try sys.pipe();
+    defer sys.close(out[0]);
+    defer sys.close(out[1]);
 
     const response =
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":[" ++
@@ -1799,7 +1979,7 @@ test "executeVerb round-trips session.list over a socket and formats output" {
         null,
         false,
         out[1],
-        std.time.milliTimestamp() + 2_000,
+        Deadline.fromNow(test_io, 2_000),
     );
 
     var buf: [512]u8 = undefined;
@@ -1815,12 +1995,12 @@ test "executeVerb surfaces a daemon RPC error as error.RpcError" {
 
     var pair: [2]posix.fd_t = undefined;
     if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &pair) != 0) return error.SkipZigTest;
-    defer posix.close(pair[0]);
-    defer posix.close(pair[1]);
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
 
-    const out = try std.posix.pipe();
-    defer posix.close(out[0]);
-    defer posix.close(out[1]);
+    const out = try sys.pipe();
+    defer sys.close(out[0]);
+    defer sys.close(out[1]);
 
     const response =
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"session not found\"}}\n";
@@ -1836,7 +2016,7 @@ test "executeVerb surfaces a daemon RPC error as error.RpcError" {
         null,
         false,
         out[1],
-        std.time.milliTimestamp() + 2_000,
+        Deadline.fromNow(test_io, 2_000),
     ));
 }
 
@@ -1849,8 +2029,8 @@ test "daemonVersion reads the daemon-reported protocol version" {
     // test needs a bidirectional socketpair rather than a one-way pipe.
     var pair: [2]posix.fd_t = undefined;
     if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &pair) != 0) return error.SkipZigTest;
-    defer posix.close(pair[0]);
-    defer posix.close(pair[1]);
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
 
     // A notification the ping read must skip, then the ping response itself.
     try writeAll(
@@ -1860,7 +2040,7 @@ test "daemonVersion reads the daemon-reported protocol version" {
     );
 
     var reader: LineReader = .{};
-    const version = try daemonVersion(allocator, &reader, pair[0], std.time.milliTimestamp() + 2_000);
+    const version = try daemonVersion(allocator, &reader, pair[0], Deadline.fromNow(test_io, 2_000));
     defer allocator.free(version);
     try std.testing.expectEqualStrings("9.9.9", version);
 }

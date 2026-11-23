@@ -2,15 +2,27 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const build_options = @import("test_build_options");
-const server_mod = @import("zmux_server");
+const zmux = @import("zmux");
 
 const posix = std.posix;
+const server_mod = zmux.server;
+const sys = zmux.sys;
+const io = std.testing.io;
+
+/// Milliseconds on the monotonic clock; only compared with other `nowMs` values.
+fn nowMs() i64 {
+    return std.Io.Clock.awake.now(io).toMilliseconds();
+}
+
+fn sleepMs(ms: i64) void {
+    io.sleep(.fromMilliseconds(ms), .awake) catch {};
+}
 
 fn tempSocketPath(allocator: std.mem.Allocator) ![]u8 {
     // Use the system tmp dir for the UNIX domain socket. sun_path has a
     // ~104 byte limit on Darwin, so we keep the path short.
     var seed: [8]u8 = undefined;
-    std.crypto.random.bytes(&seed);
+    io.random(&seed);
     const nonce = std.mem.readInt(u64, &seed, .little);
     const root = switch (builtin.os.tag) {
         .macos, .ios, .tvos, .watchos, .visionos => "/private/tmp",
@@ -23,34 +35,34 @@ fn tempSocketPath(allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn requireUnixSocketBind(path: []const u8) !void {
-    const address = try std.net.Address.initUnix(path);
-    const listener = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0) catch |err| switch (err) {
+    const address = try sys.UnixAddress.init(path);
+    const listener = sys.unixStreamSocket() catch |err| switch (err) {
         error.AccessDenied => return error.SkipZigTest,
         else => return err,
     };
-    defer posix.close(listener);
-    posix.bind(listener, &address.any, address.getOsSockLen()) catch |err| switch (err) {
+    defer sys.close(listener);
+    sys.bind(listener, &address) catch |err| switch (err) {
         error.AccessDenied => return error.SkipZigTest,
         else => return err,
     };
-    std.fs.deleteFileAbsolute(path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, path) catch {};
 }
 
 fn connectClient(path: []const u8) !posix.fd_t {
-    const address = try std.net.Address.initUnix(path);
-    const deadline_ms = std.time.milliTimestamp() + 2_000;
+    const address = try sys.UnixAddress.init(path);
+    const deadline_ms = nowMs() + 2_000;
     while (true) {
-        const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-        if (posix.connect(fd, &address.any, address.getOsSockLen())) |_| {
+        const fd = try sys.unixStreamSocket();
+        if (sys.connect(fd, &address)) |_| {
             return fd;
         } else |err| {
-            posix.close(fd);
+            sys.close(fd);
             // A saturated listen backlog surfaces as a transient ECONNREFUSED
             // on unix sockets (macOS clamps the accept queue to somaxconn):
             // the server drains and accepts moments later, so retry briefly
             // rather than treating a full backlog as a hard failure.
-            if (err == error.ConnectionRefused and std.time.milliTimestamp() < deadline_ms) {
-                std.Thread.sleep(2 * std.time.ns_per_ms);
+            if (err == error.ConnectionRefused and nowMs() < deadline_ms) {
+                sleepMs(2);
                 continue;
             }
             return err;
@@ -61,7 +73,7 @@ fn connectClient(path: []const u8) !posix.fd_t {
 fn writeAll(fd: posix.fd_t, bytes: []const u8) !void {
     var offset: usize = 0;
     while (offset < bytes.len) {
-        offset += try posix.write(fd, bytes[offset..]);
+        offset += try sys.write(fd, bytes[offset..]);
     }
 }
 
@@ -84,10 +96,10 @@ fn readLineAlloc(allocator: std.mem.Allocator, fd: posix.fd_t, max_len: usize) !
 fn readLineAllocTimeout(allocator: std.mem.Allocator, fd: posix.fd_t, max_len: usize, timeout_ms: i64) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
-    const deadline = std.time.milliTimestamp() + timeout_ms;
+    const deadline = nowMs() + timeout_ms;
     var byte: [1]u8 = undefined;
     while (true) {
-        const now = std.time.milliTimestamp();
+        const now = nowMs();
         if (now >= deadline) return error.ReadTimeout;
         var fds = [_]posix.pollfd{.{
             .fd = fd,
@@ -120,7 +132,7 @@ fn rpcLine(
     max_len: usize,
 ) ![]u8 {
     const client = try connectClient(socket_path);
-    defer posix.close(client);
+    defer sys.close(client);
     try writeAll(client, request);
     return readRpcResponseWithAnyId(allocator, client, max_len);
 }
@@ -153,9 +165,9 @@ fn readRpcResponseLineTimeout(
     max_len: usize,
     timeout_ms: i64,
 ) ![]u8 {
-    const deadline = std.time.milliTimestamp() + timeout_ms;
+    const deadline = nowMs() + timeout_ms;
     while (true) {
-        const now = std.time.milliTimestamp();
+        const now = nowMs();
         if (now >= deadline) return error.ReadTimeout;
         const line = try readLineAllocTimeout(allocator, fd, max_len, deadline - now);
         if (lineMatchesRpcId(allocator, line, expected_id)) return line;
@@ -181,21 +193,21 @@ fn lineMatchesRpcId(allocator: std.mem.Allocator, line: []const u8, expected_id:
 }
 
 fn waitForSocket(path: []const u8, timeout_ms: i64) !void {
-    const deadline = std.time.milliTimestamp() + timeout_ms;
-    while (std.time.milliTimestamp() < deadline) {
-        const fd = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0) catch {
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+    const deadline = nowMs() + timeout_ms;
+    while (nowMs() < deadline) {
+        const fd = sys.unixStreamSocket() catch {
+            sleepMs(10);
             continue;
         };
-        defer posix.close(fd);
-        const address = std.net.Address.initUnix(path) catch {
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+        defer sys.close(fd);
+        const address = sys.UnixAddress.init(path) catch {
+            sleepMs(10);
             continue;
         };
-        if (posix.connect(fd, &address.any, address.getOsSockLen())) |_| {
+        if (sys.connect(fd, &address)) |_| {
             return;
         } else |_| {
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            sleepMs(10);
         }
     }
     return error.SocketNotReady;
@@ -207,18 +219,18 @@ fn waitForClientCount(
     expected_count: usize,
     timeout_ms: i64,
 ) !void {
-    const deadline = std.time.milliTimestamp() + timeout_ms;
-    while (std.time.milliTimestamp() < deadline) {
+    const deadline = nowMs() + timeout_ms;
+    while (nowMs() < deadline) {
         const client = connectClient(socket_path) catch {
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            sleepMs(10);
             continue;
         };
-        defer posix.close(client);
+        defer sys.close(client);
 
         try writeAll(client, "{\"id\":99,\"method\":\"client.list\",\"params\":{}}\n");
 
         const line = readRpcResponseLine(allocator, client, 99, 64 * 1024) catch {
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            sleepMs(10);
             continue;
         };
         defer allocator.free(line);
@@ -226,22 +238,22 @@ fn waitForClientCount(
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
         const result_val = parsed.value.object.get("result") orelse {
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            sleepMs(10);
             continue;
         };
         if (result_val == .array and result_val.array.items.len == expected_count) {
             return;
         }
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        sleepMs(10);
     }
     return error.ClientCountTimeout;
 }
 
 fn waitForProcessGone(pid: posix.pid_t, timeout_ms: i64) !void {
-    const deadline = std.time.milliTimestamp() + timeout_ms;
-    while (std.time.milliTimestamp() < deadline) {
-        if (std.c.kill(pid, 0) != 0) return;
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+    const deadline = nowMs() + timeout_ms;
+    while (nowMs() < deadline) {
+        if (std.c.kill(pid, @fromBackingInt(0)) != 0) return;
+        sleepMs(10);
     }
     return error.ProcessStillExists;
 }
@@ -253,9 +265,9 @@ fn waitForSessionExited(
     expected_exit_code: i64,
     timeout_ms: i64,
 ) !void {
-    const deadline = std.time.milliTimestamp() + timeout_ms;
-    while (std.time.milliTimestamp() < deadline) {
-        const line = try readLineAllocTimeout(allocator, fd, 1024 * 1024, deadline - std.time.milliTimestamp());
+    const deadline = nowMs() + timeout_ms;
+    while (nowMs() < deadline) {
+        const line = try readLineAllocTimeout(allocator, fd, 1024 * 1024, deadline - nowMs());
         defer allocator.free(line);
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
         defer parsed.deinit();
@@ -280,7 +292,7 @@ fn waitForPaneOutput(
     pane_id: []const u8,
     timeout_ms: i64,
 ) !void {
-    const deadline = std.time.milliTimestamp() + timeout_ms;
+    const deadline = nowMs() + timeout_ms;
     // Drain in bulk rather than one syscall per byte: a slow reader lets the
     // server's per-connection broadcast queue overflow while another pane is
     // flooding, which drops this client (EndOfStream) before the target line
@@ -289,7 +301,7 @@ fn waitForPaneOutput(
     defer pending.deinit(allocator);
     var chunk: [64 * 1024]u8 = undefined;
     while (true) {
-        const now = std.time.milliTimestamp();
+        const now = nowMs();
         if (now >= deadline) return error.PaneOutputTimeout;
         var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
         const remaining: i32 = @intCast(@min(deadline - now, std.math.maxInt(i32)));
@@ -332,8 +344,8 @@ fn paneOutputMatches(allocator: std.mem.Allocator, line: []const u8, pane_id: []
 }
 
 fn firstPaneMasterFd(server: *server_mod.Server) !posix.fd_t {
-    server.manager.mutex.lock();
-    defer server.manager.mutex.unlock();
+    server.manager.mutex.lockUncancelable(server.io);
+    defer server.manager.mutex.unlock(server.io);
 
     if (server.manager.sessions.items.len == 0) return error.MissingSession;
     const session = server.manager.sessions.items[0];
@@ -372,12 +384,12 @@ fn waitForCaptureContains(
     needle: []const u8,
     timeout_ms: i64,
 ) ![]u8 {
-    const deadline = std.time.milliTimestamp() + timeout_ms;
-    while (std.time.milliTimestamp() < deadline) {
+    const deadline = nowMs() + timeout_ms;
+    while (nowMs() < deadline) {
         const text = try captureSessionText(allocator, socket_path, session_id);
         if (std.mem.indexOf(u8, text, needle) != null) return text;
         allocator.free(text);
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        sleepMs(50);
     }
     return error.CaptureTimeout;
 }
@@ -402,10 +414,10 @@ fn testShutdownProbe() bool {
 }
 
 fn waitForRunDone(ctx: *RunServerCtx, timeout_ms: i64) !void {
-    const deadline = std.time.milliTimestamp() + timeout_ms;
-    while (std.time.milliTimestamp() < deadline) {
+    const deadline = nowMs() + timeout_ms;
+    while (nowMs() < deadline) {
         if (ctx.done.load(.seq_cst)) return;
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        sleepMs(10);
     }
     return error.ServerRunTimeout;
 }
@@ -527,7 +539,7 @@ fn attachReplay(
     rpc_id: i64,
 ) ![]u8 {
     const client = try connectClient(socket_path);
-    defer posix.close(client);
+    defer sys.close(client);
     const attach_req = try std.fmt.allocPrint(
         allocator,
         "{{\"id\":{},\"method\":\"client.attach\",\"params\":{{\"paneId\":\"{s}\",\"rows\":24,\"cols\":80}}}}\n",
@@ -553,9 +565,9 @@ fn readNotificationLine(
     expected_pane_id: []const u8,
     timeout_ms: i64,
 ) ![]u8 {
-    const deadline = std.time.milliTimestamp() + timeout_ms;
+    const deadline = nowMs() + timeout_ms;
     while (true) {
-        const now = std.time.milliTimestamp();
+        const now = nowMs();
         if (now >= deadline) return error.NotificationTimeout;
         const line = try readLineAllocTimeout(allocator, fd, 1024 * 1024, deadline - now);
         errdefer allocator.free(line);
@@ -600,9 +612,9 @@ fn readPaneOutputContaining(
     needle: []const u8,
     timeout_ms: i64,
 ) ![]u8 {
-    const deadline = std.time.milliTimestamp() + timeout_ms;
+    const deadline = nowMs() + timeout_ms;
     while (true) {
-        const now = std.time.milliTimestamp();
+        const now = nowMs();
         if (now >= deadline) return error.PaneOutputTimeout;
         const line = try readNotificationLine(allocator, fd, "pane_output", pane_id, deadline - now);
         defer allocator.free(line);
@@ -619,7 +631,7 @@ fn readPaneOutputContaining(
 
 fn expectTermExited(term: std.process.Child.Term, expected_code: u8) !void {
     switch (term) {
-        .Exited => |code| try std.testing.expectEqual(expected_code, code),
+        .exited => |code| try std.testing.expectEqual(expected_code, code),
         else => return error.UnexpectedChildTerm,
     }
 }
@@ -640,10 +652,10 @@ test "built CLI binaries handle version help and unknown flags" {
 
     for (binaries) |binary| {
         {
-            const result = try std.process.Child.run(.{
-                .allocator = allocator,
+            const result = try std.process.run(allocator, io, .{
                 .argv = &.{ binary.path, "--version" },
-                .max_output_bytes = 4096,
+                .stdout_limit = .limited(4096),
+                .stderr_limit = .limited(4096),
             });
             defer allocator.free(result.stdout);
             defer allocator.free(result.stderr);
@@ -652,10 +664,10 @@ test "built CLI binaries handle version help and unknown flags" {
             try std.testing.expect(std.mem.indexOf(u8, result.stdout, "zmux") != null);
         }
         {
-            const result = try std.process.Child.run(.{
-                .allocator = allocator,
+            const result = try std.process.run(allocator, io, .{
                 .argv = &.{ binary.path, "--help" },
-                .max_output_bytes = 4096,
+                .stdout_limit = .limited(4096),
+                .stderr_limit = .limited(4096),
             });
             defer allocator.free(result.stdout);
             defer allocator.free(result.stderr);
@@ -663,15 +675,15 @@ test "built CLI binaries handle version help and unknown flags" {
             try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Usage:") != null);
         }
         {
-            const result = try std.process.Child.run(.{
-                .allocator = allocator,
+            const result = try std.process.run(allocator, io, .{
                 .argv = &.{ binary.path, "--definitely-not-a-zmux-flag" },
-                .max_output_bytes = 4096,
+                .stdout_limit = .limited(4096),
+                .stderr_limit = .limited(4096),
             });
             defer allocator.free(result.stdout);
             defer allocator.free(result.stderr);
             switch (result.term) {
-                .Exited => |code| try std.testing.expect(code != 0),
+                .exited => |code| try std.testing.expect(code != 0),
                 else => return error.UnexpectedChildTerm,
             }
             try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Usage") != null or
@@ -688,28 +700,26 @@ test "daemon restart over a stale socket file binds and serves" {
     defer allocator.free(socket_path);
     const pid_path = try std.fmt.allocPrint(allocator, "{s}.pid", .{socket_path});
     defer allocator.free(pid_path);
-    std.fs.deleteFileAbsolute(socket_path) catch {};
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
-    defer std.fs.deleteFileAbsolute(pid_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, pid_path) catch {};
 
-    var child = std.process.Child.init(&.{ build_options.zmuxd_path, "--socket", socket_path, "--idle-seconds", "0" }, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ build_options.zmuxd_path, "--socket", socket_path, "--idle-seconds", "0" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
     var child_running = true;
-    errdefer if (child_running) {
-        _ = std.c.kill(child.id, std.c.SIG.KILL);
-        _ = child.wait() catch {};
-    };
+    errdefer if (child_running) child.kill(io);
 
     try waitForSocket(socket_path, 2_000);
-    if (std.c.kill(child.id, std.c.SIG.KILL) != 0) return error.KillFailed;
-    _ = try child.wait();
+    if (std.c.kill(child.id.?, .KILL) != 0) return error.KillFailed;
+    _ = try child.wait(io);
     child_running = false;
-    try std.fs.accessAbsolute(socket_path, .{});
+    try std.Io.Dir.accessAbsolute(io, socket_path, .{});
 
-    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var server = try server_mod.Server.init(allocator, io, socket_path, 0);
     var ctx = RunServerCtx{ .server = &server };
     const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
     var server_stopped = false;
@@ -744,10 +754,10 @@ test "daemon JSON-RPC errors are framed and the connection remains usable" {
     const allocator = std.testing.allocator;
     const socket_path = try tempSocketPath(allocator);
     defer allocator.free(socket_path);
-    std.fs.deleteFileAbsolute(socket_path) catch {};
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
 
-    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var server = try server_mod.Server.init(allocator, io, socket_path, 0);
     var ctx = RunServerCtx{ .server = &server };
     const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
 
@@ -763,7 +773,7 @@ test "daemon JSON-RPC errors are framed and the connection remains usable" {
     try waitForSocket(socket_path, 2_000);
 
     const client = try connectClient(socket_path);
-    defer posix.close(client);
+    defer sys.close(client);
 
     {
         try writeAll(client, "not-json\n");
@@ -811,7 +821,7 @@ test "daemon JSON-RPC errors are framed and the connection remains usable" {
         oversized[oversized.len - 1] = '\n';
 
         const overflow = try connectClient(socket_path);
-        defer posix.close(overflow);
+        defer sys.close(overflow);
         try writeAll(overflow, oversized);
         const line = try readRpcResponseWithAnyId(allocator, overflow, 64 * 1024);
         defer allocator.free(line);
@@ -852,10 +862,10 @@ test "natural child exit is reaped and broadcasts session_exited" {
     const allocator = std.testing.allocator;
     const socket_path = try tempSocketPath(allocator);
     defer allocator.free(socket_path);
-    std.fs.deleteFileAbsolute(socket_path) catch {};
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
 
-    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var server = try server_mod.Server.init(allocator, io, socket_path, 0);
     var ctx = RunServerCtx{ .server = &server };
     const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
     var server_stopped = false;
@@ -870,7 +880,7 @@ test "natural child exit is reaped and broadcasts session_exited" {
     try waitForSocket(socket_path, 2_000);
 
     const observer = try connectClient(socket_path);
-    defer posix.close(observer);
+    defer sys.close(observer);
 
     var pane_id: []u8 = &.{};
     defer if (pane_id.len > 0) allocator.free(pane_id);
@@ -929,20 +939,20 @@ test "PTY master fd does not leak into subsequently spawned pane child" {
     const allocator = std.testing.allocator;
     var padding = std.ArrayList(posix.fd_t).empty;
     defer {
-        for (padding.items) |fd| posix.close(fd);
+        for (padding.items) |fd| sys.close(fd);
         padding.deinit(allocator);
     }
     for (0..32) |_| {
-        const fd = try posix.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        const fd = try sys.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
         try padding.append(allocator, fd);
     }
 
     const socket_path = try tempSocketPath(allocator);
     defer allocator.free(socket_path);
-    std.fs.deleteFileAbsolute(socket_path) catch {};
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
 
-    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var server = try server_mod.Server.init(allocator, io, socket_path, 0);
     var ctx = RunServerCtx{ .server = &server };
     const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
     var server_stopped = false;
@@ -974,7 +984,7 @@ test "PTY master fd does not leak into subsequently spawned pane child" {
     }
 
     const master_fd = try firstPaneMasterFd(&server);
-    for (padding.items) |fd| posix.close(fd);
+    for (padding.items) |fd| sys.close(fd);
     padding.clearRetainingCapacity();
     try std.testing.expect(master_fd > 16);
 
@@ -1033,10 +1043,10 @@ test "server shutdown waits for an idle client handler to exit" {
     const allocator = std.testing.allocator;
     const socket_path = try tempSocketPath(allocator);
     defer allocator.free(socket_path);
-    std.fs.deleteFileAbsolute(socket_path) catch {};
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
 
-    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var server = try server_mod.Server.init(allocator, io, socket_path, 0);
     var ctx = RunServerCtx{ .server = &server };
     const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
     var server_stopped = false;
@@ -1051,8 +1061,8 @@ test "server shutdown waits for an idle client handler to exit" {
     try waitForSocket(socket_path, 2_000);
 
     const idle = try connectClient(socket_path);
-    defer posix.close(idle);
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    defer sys.close(idle);
+    sleepMs(100);
 
     {
         const line = try rpcLine(allocator, socket_path, "{\"id\":1,\"method\":\"daemon.shutdown\",\"params\":{}}\n", 64 * 1024);
@@ -1073,12 +1083,12 @@ test "shutdown probe stops the server and deinit terminates live sessions" {
     const allocator = std.testing.allocator;
     const socket_path = try tempSocketPath(allocator);
     defer allocator.free(socket_path);
-    std.fs.deleteFileAbsolute(socket_path) catch {};
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
     test_shutdown_requested.store(false, .seq_cst);
     defer test_shutdown_requested.store(false, .seq_cst);
 
-    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var server = try server_mod.Server.init(allocator, io, socket_path, 0);
     server.shutdown_probe = testShutdownProbe;
     var ctx = RunServerCtx{ .server = &server };
     const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
@@ -1112,7 +1122,7 @@ test "shutdown probe stops the server and deinit terminates live sessions" {
     }
     {
         const client = try connectClient(socket_path);
-        defer posix.close(client);
+        defer sys.close(client);
         const req = try std.fmt.allocPrint(
             allocator,
             "{{\"id\":2,\"method\":\"client.attach\",\"params\":{{\"paneId\":\"{s}\",\"rows\":24,\"cols\":80}}}}\n",
@@ -1133,7 +1143,7 @@ test "shutdown probe stops the server and deinit terminates live sessions" {
     server_deinited = true;
     try waitForProcessGone(child_pid, 1_000);
     try std.testing.expect(ctx.run_error == null);
-    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(socket_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, socket_path, .{}));
 }
 
 test "daemon.shutdown with live attached sessions terminates cleanly" {
@@ -1142,10 +1152,10 @@ test "daemon.shutdown with live attached sessions terminates cleanly" {
     const allocator = std.testing.allocator;
     const socket_path = try tempSocketPath(allocator);
     defer allocator.free(socket_path);
-    std.fs.deleteFileAbsolute(socket_path) catch {};
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
 
-    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var server = try server_mod.Server.init(allocator, io, socket_path, 0);
     var ctx = RunServerCtx{ .server = &server };
     const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
     var server_stopped = false;
@@ -1179,7 +1189,7 @@ test "daemon.shutdown with live attached sessions terminates cleanly" {
 
     var attached = [_]posix.fd_t{ try connectClient(socket_path), try connectClient(socket_path) };
     defer {
-        for (attached) |fd| posix.close(fd);
+        for (attached) |fd| sys.close(fd);
     }
     for (&attached, 0..) |*fd, index| {
         const req = try std.fmt.allocPrint(
@@ -1213,10 +1223,10 @@ test "idle timeout exits with no sessions and unlinks its socket after deinit" {
     const allocator = std.testing.allocator;
     const socket_path = try tempSocketPath(allocator);
     defer allocator.free(socket_path);
-    std.fs.deleteFileAbsolute(socket_path) catch {};
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
 
-    var server = try server_mod.Server.init(allocator, socket_path, 1);
+    var server = try server_mod.Server.init(allocator, io, socket_path, 1);
     var ctx = RunServerCtx{ .server = &server };
     const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
     var server_deinited = false;
@@ -1234,7 +1244,7 @@ test "idle timeout exits with no sessions and unlinks its socket after deinit" {
     server.deinit();
     server_deinited = true;
     try std.testing.expect(ctx.run_error == null);
-    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(socket_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, socket_path, .{}));
 }
 
 test "idle timeout waits for a live session then exits after it is terminated" {
@@ -1243,10 +1253,10 @@ test "idle timeout waits for a live session then exits after it is terminated" {
     const allocator = std.testing.allocator;
     const socket_path = try tempSocketPath(allocator);
     defer allocator.free(socket_path);
-    std.fs.deleteFileAbsolute(socket_path) catch {};
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
 
-    var server = try server_mod.Server.init(allocator, socket_path, 1);
+    var server = try server_mod.Server.init(allocator, io, socket_path, 1);
     var ctx = RunServerCtx{ .server = &server };
     const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
     var server_stopped = false;
@@ -1276,7 +1286,7 @@ test "idle timeout waits for a live session then exits after it is terminated" {
         pane_id = try allocator.dupe(u8, try expectStringField(result_val, "id"));
     }
 
-    std.Thread.sleep(1_500 * std.time.ns_per_ms);
+    sleepMs(1_500);
     try std.testing.expect(!ctx.done.load(.seq_cst));
     {
         const line = try rpcLine(allocator, socket_path, "{\"id\":2,\"method\":\"daemon.ping\",\"params\":{}}\n", 64 * 1024);
@@ -1302,16 +1312,24 @@ test "idle timeout waits for a live session then exits after it is terminated" {
     try std.testing.expect(ctx.run_error == null);
 }
 
+fn waitForActiveConnections(server: *const server_mod.Server, expected: usize) !void {
+    const deadline = nowMs() + 2_000;
+    while (server.active_connections.load(.seq_cst) != expected) {
+        if (nowMs() >= deadline) return error.ActiveConnectionCountTimeout;
+        sleepMs(10);
+    }
+}
+
 test "server rejects connections above max_client_connections" {
     if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const socket_path = try tempSocketPath(allocator);
     defer allocator.free(socket_path);
-    std.fs.deleteFileAbsolute(socket_path) catch {};
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
 
-    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var server = try server_mod.Server.init(allocator, io, socket_path, 0);
     var ctx = RunServerCtx{ .server = &server };
     const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
     var server_stopped = false;
@@ -1324,21 +1342,23 @@ test "server rejects connections above max_client_connections" {
     }
 
     try waitForSocket(socket_path, 2_000);
+    try waitForActiveConnections(&server, 0);
 
     const max_connections = server_mod.max_client_connections;
     var clients = std.ArrayList(posix.fd_t).empty;
     try clients.ensureTotalCapacity(allocator, max_connections);
     defer {
-        for (clients.items) |fd| posix.close(fd);
+        for (clients.items) |fd| sys.close(fd);
         clients.deinit(allocator);
     }
 
     for (0..max_connections) |_| {
         try clients.append(allocator, try connectClient(socket_path));
     }
+    try waitForActiveConnections(&server, max_connections);
 
     const overflow_client = try connectClient(socket_path);
-    defer posix.close(overflow_client);
+    defer sys.close(overflow_client);
     var saw_limit_error = false;
     var overflow_msg: ?[]u8 = null;
     overflow_msg = readLineAllocTimeout(
@@ -1363,12 +1383,12 @@ test "server rejects connections above max_client_connections" {
     // Free one slot and confirm a new live connection is accepted. The control
     // connection is scoped so it releases its slot before the shutdown request.
     const released = clients.orderedRemove(0);
-    posix.close(released);
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    sys.close(released);
+    try waitForActiveConnections(&server, max_connections - 1);
 
     {
         const control = try connectClient(socket_path);
-        defer posix.close(control);
+        defer sys.close(control);
         try writeAll(control, "{\"id\":99,\"method\":\"daemon.ping\",\"params\":{}}\n");
         const ping_response = try readLineAllocTimeout(allocator, control, 64 * 1024, 2_000);
         defer allocator.free(ping_response);
@@ -1378,13 +1398,13 @@ test "server rejects connections above max_client_connections" {
     // Release every remaining held client so the shutdown request is not turned
     // away by the connection cap, then let the accept loop drain the closures.
     // Clear the list so the outer defer does not double-close these fds.
-    for (clients.items) |fd| posix.close(fd);
+    for (clients.items) |fd| sys.close(fd);
     clients.clearRetainingCapacity();
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    try waitForActiveConnections(&server, 0);
 
     {
         const shutdown = try connectClient(socket_path);
-        defer posix.close(shutdown);
+        defer sys.close(shutdown);
         try writeAll(shutdown, "{\"id\":100,\"method\":\"daemon.shutdown\",\"params\":{}}\n");
         const shutdown_response = try readLineAllocTimeout(allocator, shutdown, 64 * 1024, 2_000);
         defer allocator.free(shutdown_response);
@@ -1402,10 +1422,10 @@ test "stalled client does not block live pane output or active termination" {
     const allocator = std.testing.allocator;
     const socket_path = try tempSocketPath(allocator);
     defer allocator.free(socket_path);
-    std.fs.deleteFileAbsolute(socket_path) catch {};
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
 
-    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var server = try server_mod.Server.init(allocator, io, socket_path, 0);
     var ctx = RunServerCtx{ .server = &server };
     const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
     var server_stopped = false;
@@ -1420,7 +1440,7 @@ test "stalled client does not block live pane output or active termination" {
     try waitForSocket(socket_path, 2_000);
 
     const stalled = try connectClient(socket_path);
-    defer posix.close(stalled);
+    defer sys.close(stalled);
 
     var flood_id: []u8 = &.{};
     defer if (flood_id.len > 0) allocator.free(flood_id);
@@ -1439,10 +1459,10 @@ test "stalled client does not block live pane output or active termination" {
         flood_id = try allocator.dupe(u8, (result_val.object.get("id") orelse return error.MissingSessionId).string);
     }
 
-    std.Thread.sleep(2_000 * std.time.ns_per_ms);
+    sleepMs(2_000);
 
     const live = try connectClient(socket_path);
-    defer posix.close(live);
+    defer sys.close(live);
 
     var victim_id: []u8 = &.{};
     defer if (victim_id.len > 0) allocator.free(victim_id);
@@ -1465,7 +1485,7 @@ test "stalled client does not block live pane output or active termination" {
 
     {
         const client = try connectClient(socket_path);
-        defer posix.close(client);
+        defer sys.close(client);
         const req = try std.fmt.allocPrint(
             allocator,
             "{{\"id\":3,\"method\":\"session.terminate\",\"params\":{{\"sessionId\":\"{s}\"}}}}\n",
@@ -1504,10 +1524,10 @@ test "attached clients receive pane output activity and bell notifications" {
     const allocator = std.testing.allocator;
     const socket_path = try tempSocketPath(allocator);
     defer allocator.free(socket_path);
-    std.fs.deleteFileAbsolute(socket_path) catch {};
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
 
-    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var server = try server_mod.Server.init(allocator, io, socket_path, 0);
     var ctx = RunServerCtx{ .server = &server };
     const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
     var server_stopped = false;
@@ -1538,9 +1558,9 @@ test "attached clients receive pane output activity and bell notifications" {
     }
 
     var client_a: ?posix.fd_t = try connectClient(socket_path);
-    defer if (client_a) |fd| posix.close(fd);
+    defer if (client_a) |fd| sys.close(fd);
     const client_b = try connectClient(socket_path);
-    defer posix.close(client_b);
+    defer sys.close(client_b);
 
     {
         const req = try std.fmt.allocPrint(
@@ -1592,7 +1612,7 @@ test "attached clients receive pane output activity and bell notifications" {
         defer allocator.free(activity_b);
     }
 
-    posix.close(client_a.?);
+    sys.close(client_a.?);
     client_a = null;
 
     {
@@ -1643,12 +1663,12 @@ test "native session daemon end-to-end: ping, create, send, capture, terminate, 
     const allocator = std.testing.allocator;
     const socket_path = try tempSocketPath(allocator);
     defer allocator.free(socket_path);
-    std.fs.deleteFileAbsolute(socket_path) catch {};
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
 
     // idle_timeout=0 means the server never self-exits due to idle; we drive
     // shutdown explicitly via daemon.shutdown.
-    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var server = try server_mod.Server.init(allocator, io, socket_path, 0);
 
     var ctx = RunServerCtx{ .server = &server };
     const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
@@ -1669,7 +1689,7 @@ test "native session daemon end-to-end: ping, create, send, capture, terminate, 
     // --- daemon.ping ---
     {
         const client = try connectClient(socket_path);
-        defer posix.close(client);
+        defer sys.close(client);
 
         try writeAll(client, "{\"id\":1,\"method\":\"daemon.ping\",\"params\":{}}\n");
         const line = try readRpcResponseLine(allocator, client, 1, 64 * 1024);
@@ -1700,7 +1720,7 @@ test "native session daemon end-to-end: ping, create, send, capture, terminate, 
     defer if (session_id_owned.len > 0) allocator.free(session_id_owned);
     {
         const client = try connectClient(socket_path);
-        defer posix.close(client);
+        defer sys.close(client);
 
         // Pass a shell + command so pty.spawn builds a login-shell command
         // argv. This exercises RPC wiring plus PTY fd passing.
@@ -1731,7 +1751,7 @@ test "native session daemon end-to-end: ping, create, send, capture, terminate, 
     // --- session.send "echo hi\n" ---
     {
         const client = try connectClient(socket_path);
-        defer posix.close(client);
+        defer sys.close(client);
 
         const req = try std.fmt.allocPrint(
             allocator,
@@ -1749,12 +1769,12 @@ test "native session daemon end-to-end: ping, create, send, capture, terminate, 
     }
 
     // Give the shell a moment to echo.
-    std.Thread.sleep(600 * std.time.ns_per_ms);
+    sleepMs(600);
 
     // --- session.capture, expect "hi" to appear in the scrollback. ---
     {
         const client = try connectClient(socket_path);
-        defer posix.close(client);
+        defer sys.close(client);
 
         const req = try std.fmt.allocPrint(
             allocator,
@@ -1780,7 +1800,7 @@ test "native session daemon end-to-end: ping, create, send, capture, terminate, 
     // --- session.terminate ---
     {
         const client = try connectClient(socket_path);
-        defer posix.close(client);
+        defer sys.close(client);
 
         const req = try std.fmt.allocPrint(
             allocator,
@@ -1800,7 +1820,7 @@ test "native session daemon end-to-end: ping, create, send, capture, terminate, 
     // --- daemon.shutdown: the server's run loop should exit. ---
     {
         const client = try connectClient(socket_path);
-        defer posix.close(client);
+        defer sys.close(client);
 
         try writeAll(client, "{\"id\":6,\"method\":\"daemon.shutdown\",\"params\":{}}\n");
         const line = try readRpcResponseLine(allocator, client, 6, 64 * 1024);
@@ -1827,10 +1847,10 @@ test "client.attach replays scrollback on reattach so reopened sessions keep the
     const allocator = std.testing.allocator;
     const socket_path = try tempSocketPath(allocator);
     defer allocator.free(socket_path);
-    std.fs.deleteFileAbsolute(socket_path) catch {};
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
 
-    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var server = try server_mod.Server.init(allocator, io, socket_path, 0);
     var ctx = RunServerCtx{ .server = &server };
     const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
     var server_stopped = false;
@@ -1852,7 +1872,7 @@ test "client.attach replays scrollback on reattach so reopened sessions keep the
     defer if (session_id_owned.len > 0) allocator.free(session_id_owned);
     {
         const client = try connectClient(socket_path);
-        defer posix.close(client);
+        defer sys.close(client);
         try writeAll(
             client,
             "{\"id\":1,\"method\":\"session.create\",\"params\":" ++
@@ -1869,12 +1889,12 @@ test "client.attach replays scrollback on reattach so reopened sessions keep the
     }
 
     // Give the child a moment to emit the sentinel into the scrollback.
-    std.Thread.sleep(500 * std.time.ns_per_ms);
+    sleepMs(500);
 
     // First logical attach: the replay should already contain the initial sentinel.
     {
         const client = try connectClient(socket_path);
-        defer posix.close(client);
+        defer sys.close(client);
         const attach_req = try std.fmt.allocPrint(
             allocator,
             "{{\"id\":2,\"method\":\"client.attach\",\"params\":{{\"paneId\":\"{s}\",\"rows\":24,\"cols\":80}}}}\n",
@@ -1900,7 +1920,7 @@ test "client.attach replays scrollback on reattach so reopened sessions keep the
     // so scrollback keeps growing while the UI is gone.
     {
         const client = try connectClient(socket_path);
-        defer posix.close(client);
+        defer sys.close(client);
         const send_req = try std.fmt.allocPrint(
             allocator,
             "{{\"id\":3,\"method\":\"session.send\",\"params\":" ++
@@ -1914,12 +1934,12 @@ test "client.attach replays scrollback on reattach so reopened sessions keep the
     }
 
     // Let `cat` echo the input back to the PTY so the daemon captures it.
-    std.Thread.sleep(500 * std.time.ns_per_ms);
+    sleepMs(500);
 
     // Second attach: the replay must now carry BOTH sentinels.
     {
         const client = try connectClient(socket_path);
-        defer posix.close(client);
+        defer sys.close(client);
         const attach_req = try std.fmt.allocPrint(
             allocator,
             "{{\"id\":4,\"method\":\"client.attach\",\"params\":{{\"paneId\":\"{s}\",\"rows\":24,\"cols\":80}}}}\n",
@@ -1944,7 +1964,7 @@ test "client.attach replays scrollback on reattach so reopened sessions keep the
     // Clean up: terminate the session and shut the server down.
     {
         const client = try connectClient(socket_path);
-        defer posix.close(client);
+        defer sys.close(client);
         const req = try std.fmt.allocPrint(
             allocator,
             "{{\"id\":5,\"method\":\"session.terminate\",\"params\":{{\"sessionId\":\"{s}\"}}}}\n",
@@ -1957,7 +1977,7 @@ test "client.attach replays scrollback on reattach so reopened sessions keep the
     }
     {
         const client = try connectClient(socket_path);
-        defer posix.close(client);
+        defer sys.close(client);
         try writeAll(client, "{\"id\":6,\"method\":\"daemon.shutdown\",\"params\":{}}\n");
         const line = try readRpcResponseLine(allocator, client, 6, 64 * 1024);
         defer allocator.free(line);
@@ -1975,10 +1995,10 @@ test "client.attach replay is capped to the newest 256 KiB tail" {
     const allocator = std.testing.allocator;
     const socket_path = try tempSocketPath(allocator);
     defer allocator.free(socket_path);
-    std.fs.deleteFileAbsolute(socket_path) catch {};
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
 
-    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var server = try server_mod.Server.init(allocator, io, socket_path, 0);
     var ctx = RunServerCtx{ .server = &server };
     const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
     var server_stopped = false;
@@ -2016,9 +2036,9 @@ test "client.attach replay is capped to the newest 256 KiB tail" {
     const replay_cap = 256 * 1024;
     var decoded: []u8 = &.{};
     var saw_replay = false;
-    const deadline = std.time.milliTimestamp() + 5_000;
+    const deadline = nowMs() + 5_000;
     var rpc_id: i64 = 20;
-    while (std.time.milliTimestamp() < deadline) : (rpc_id += 1) {
+    while (nowMs() < deadline) : (rpc_id += 1) {
         const replay = try attachReplay(allocator, socket_path, pane_id, rpc_id);
         if (std.mem.endsWith(u8, replay, sentinel)) {
             decoded = replay;
@@ -2026,7 +2046,7 @@ test "client.attach replay is capped to the newest 256 KiB tail" {
             break;
         }
         allocator.free(replay);
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        sleepMs(50);
     }
     if (!saw_replay) return error.ReplayTailTimeout;
     defer allocator.free(decoded);
@@ -2064,10 +2084,10 @@ test "logical client auto-detaches when connection closes so a reopened tab can 
     const allocator = std.testing.allocator;
     const socket_path = try tempSocketPath(allocator);
     defer allocator.free(socket_path);
-    std.fs.deleteFileAbsolute(socket_path) catch {};
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
 
-    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var server = try server_mod.Server.init(allocator, io, socket_path, 0);
     var ctx = RunServerCtx{ .server = &server };
     const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
     var server_stopped = false;
@@ -2085,7 +2105,7 @@ test "logical client auto-detaches when connection closes so a reopened tab can 
     defer if (session_id_owned.len > 0) allocator.free(session_id_owned);
     {
         const client = try connectClient(socket_path);
-        defer posix.close(client);
+        defer sys.close(client);
         try writeAll(
             client,
             "{\"id\":1,\"method\":\"session.create\",\"params\":" ++
@@ -2101,7 +2121,7 @@ test "logical client auto-detaches when connection closes so a reopened tab can 
         session_id_owned = try allocator.dupe(u8, id_val.string);
     }
 
-    std.Thread.sleep(500 * std.time.ns_per_ms);
+    sleepMs(500);
 
     {
         const client = try connectClient(socket_path);
@@ -2120,14 +2140,14 @@ test "logical client auto-detaches when connection closes so a reopened tab can 
         try std.testing.expect(parsed.value.object.get("result") != null);
 
         // Simulate app/process death without an explicit client.detach RPC.
-        posix.close(client);
+        sys.close(client);
     }
 
     try waitForClientCount(allocator, socket_path, 0, 2_000);
 
     {
         const client = try connectClient(socket_path);
-        defer posix.close(client);
+        defer sys.close(client);
         const attach_req = try std.fmt.allocPrint(
             allocator,
             "{{\"id\":3,\"method\":\"client.attach\",\"params\":{{\"paneId\":\"{s}\",\"rows\":24,\"cols\":80}}}}\n",
@@ -2149,7 +2169,7 @@ test "logical client auto-detaches when connection closes so a reopened tab can 
 
     {
         const client = try connectClient(socket_path);
-        defer posix.close(client);
+        defer sys.close(client);
         const req = try std.fmt.allocPrint(
             allocator,
             "{{\"id\":4,\"method\":\"session.terminate\",\"params\":{{\"sessionId\":\"{s}\"}}}}\n",
@@ -2162,7 +2182,7 @@ test "logical client auto-detaches when connection closes so a reopened tab can 
     }
     {
         const client = try connectClient(socket_path);
-        defer posix.close(client);
+        defer sys.close(client);
         try writeAll(client, "{\"id\":5,\"method\":\"daemon.shutdown\",\"params\":{}}\n");
         const line = try readRpcResponseLine(allocator, client, 5, 64 * 1024);
         defer allocator.free(line);
@@ -2180,10 +2200,10 @@ test "session RPCs resolve session names and returned session ids, and attach re
     const allocator = std.testing.allocator;
     const socket_path = try tempSocketPath(allocator);
     defer allocator.free(socket_path);
-    std.fs.deleteFileAbsolute(socket_path) catch {};
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
 
-    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var server = try server_mod.Server.init(allocator, io, socket_path, 0);
     var ctx = RunServerCtx{ .server = &server };
     const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
     var server_stopped = false;
@@ -2247,7 +2267,7 @@ test "session RPCs resolve session names and returned session ids, and attach re
         try std.testing.expect(parsed.value.object.get("error") == null);
     }
 
-    std.Thread.sleep(600 * std.time.ns_per_ms);
+    sleepMs(600);
 
     {
         const req = try std.fmt.allocPrint(
@@ -2353,9 +2373,9 @@ test "session RPCs resolve session names and returned session ids, and attach re
         exited_pane_id = try allocator.dupe(u8, try expectStringField(result_val, "id"));
     }
     {
-        const deadline = std.time.milliTimestamp() + 4_000;
+        const deadline = nowMs() + 4_000;
         while (true) {
-            if (std.time.milliTimestamp() >= deadline) return error.TerminatedPaneTimeout;
+            if (nowMs() >= deadline) return error.TerminatedPaneTimeout;
             const req = try std.fmt.allocPrint(
                 allocator,
                 "{{\"id\":52,\"method\":\"session.info\",\"params\":{{\"sessionId\":\"{s}\"}}}}\n",
@@ -2369,7 +2389,7 @@ test "session RPCs resolve session names and returned session ids, and attach re
             const result_val = try responseResult(parsed.value);
             const state = try expectStringField(result_val, "state");
             if (std.mem.eql(u8, state, "terminated")) break;
-            std.Thread.sleep(20 * std.time.ns_per_ms);
+            sleepMs(20);
         }
     }
     {
@@ -2414,10 +2434,10 @@ test "mux model API owns windows panes clients key bindings and respawn state" {
     const allocator = std.testing.allocator;
     const socket_path = try tempSocketPath(allocator);
     defer allocator.free(socket_path);
-    std.fs.deleteFileAbsolute(socket_path) catch {};
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
 
-    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var server = try server_mod.Server.init(allocator, io, socket_path, 0);
     var ctx = RunServerCtx{ .server = &server };
     const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
     var server_stopped = false;
@@ -2631,9 +2651,9 @@ test "mux model API owns windows panes clients key bindings and respawn state" {
     var client_one: []u8 = &.{};
     defer if (client_one.len > 0) allocator.free(client_one);
     var client_one_fd: ?posix.fd_t = null;
-    defer if (client_one_fd) |fd| posix.close(fd);
+    defer if (client_one_fd) |fd| sys.close(fd);
     var client_two_fd: ?posix.fd_t = null;
-    defer if (client_two_fd) |fd| posix.close(fd);
+    defer if (client_two_fd) |fd| sys.close(fd);
     {
         const client = try connectClient(socket_path);
         client_one_fd = client;
@@ -2898,11 +2918,11 @@ test "mux model API owns windows panes clients key bindings and respawn state" {
         defer allocator.free(line);
         try std.testing.expect(std.mem.indexOf(u8, line, "\"ok\":true") != null);
         if (client_one_fd) |fd| {
-            posix.close(fd);
+            sys.close(fd);
             client_one_fd = null;
         }
         if (client_two_fd) |fd| {
-            posix.close(fd);
+            sys.close(fd);
             client_two_fd = null;
         }
     }
@@ -2949,10 +2969,10 @@ test "session.create honors id and client.attach resolves session names" {
     const allocator = std.testing.allocator;
     const socket_path = try tempSocketPath(allocator);
     defer allocator.free(socket_path);
-    std.fs.deleteFileAbsolute(socket_path) catch {};
-    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
 
-    var server = try server_mod.Server.init(allocator, socket_path, 0);
+    var server = try server_mod.Server.init(allocator, io, socket_path, 0);
     var ctx = RunServerCtx{ .server = &server };
     const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
 

@@ -86,7 +86,9 @@ live processes alive across an operating-system reboot.
 
 ## Install
 
-`zmux` requires Zig **0.15.2** (pinned at `comptime` in `build.zig`).
+`zmux` requires Zig **0.17.1** or a later **0.17.x** patch release. A
+`comptime` guard in `build.zig` accepts `>= 0.17.1` and `< 0.18.0` and rejects
+0.18 development builds. zmux v0.2.0 is the last release for Zig 0.15.2.
 
 ### Prebuilt binaries
 
@@ -208,7 +210,7 @@ Drive the same daemon programmatically — every method is JSON-RPC 2.0:
 ```sh
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"daemon.ping"}' \
   | nc -U /tmp/zmux.sock
-# {"jsonrpc":"2.0","id":1,"result":{"version":"0.2.0","pid":12345,"socketPath":"/tmp/zmux.sock","sessions":0,"panes":0}}
+# {"jsonrpc":"2.0","id":1,"result":{"version":"0.3.0","pid":12345,"socketPath":"/tmp/zmux.sock","sessions":0,"panes":0}}
 ```
 
 The socket protocol is one JSON document per physical line, terminated by
@@ -269,12 +271,24 @@ embedding app can run an in-process server (tests, single-process apps) or
 build a custom client:
 
 ```zig
+const std = @import("std");
 const zmux = @import("zmux");
 
-var server = try zmux.Server.init(allocator, "/tmp/zmux.sock", 60);
-defer server.deinit();
-try server.run();
+pub fn main(init: std.process.Init) !void {
+    var server = try zmux.Server.init(init.gpa, init.io, "/tmp/zmux.sock", 60);
+    defer server.deinit();
+    try server.run();
+}
 ```
+
+Every stateful entry point takes a `std.Io` after the allocator:
+`zmux.Server.init(gpa, io, socket_path, idle_timeout_seconds)`,
+`zmux.NativeSession.create(gpa, io, options)`, and
+`zmux.SessionManager.init(gpa, io, event_sink)`. zmux runs each client
+connection and PTY reader on its own `std.Thread`, so pass a thread-safe
+implementation such as `std.Io.Threaded` (`std.process.Init.io` is one). The
+`Io` supplies mutexes, clocks, sleeps, randomness, and file access. PTY, socket,
+and `poll(2)` work stays on blocking descriptors.
 
 Top-level modules:
 

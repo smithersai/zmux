@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
+const sys = @import("sys.zig");
 
 extern "c" fn openpty(
     amaster: *posix.fd_t,
@@ -27,14 +28,17 @@ pub const ExitObserver = struct {
 };
 
 pub const Pty = struct {
+    /// Used only for `wait_mutex`; PTY reads and writes are blocking syscalls
+    /// on `master_fd` so callers can drive them from plain `std.Thread`s.
+    io: std.Io,
     master_fd: posix.fd_t,
     child_pid: posix.pid_t,
-    wait_mutex: std.Thread.Mutex = .{},
+    wait_mutex: std.Io.Mutex = .init,
     reaped: bool = false,
     exit_status: ?u32 = null,
     exit_observer: ?ExitObserver = null,
 
-    pub fn spawn(allocator: Allocator, opts: SpawnOptions) !Pty {
+    pub fn spawn(allocator: Allocator, io: std.Io, opts: SpawnOptions) !Pty {
         const wsz: posix.winsize = .{
             .row = opts.rows,
             .col = opts.cols,
@@ -45,17 +49,17 @@ pub const Pty = struct {
         const fds = try openPty(wsz);
         const master_fd = fds.master_fd;
         const slave_fd = fds.slave_fd;
-        errdefer posix.close(master_fd);
-        errdefer posix.close(slave_fd);
+        errdefer sys.close(master_fd);
+        errdefer sys.close(slave_fd);
 
         const shell_path = opts.shell orelse defaultShell();
-        const shell_z = try allocator.dupeZ(u8, shell_path);
+        const shell_z = try allocator.dupeSentinel(u8, shell_path, 0);
         defer allocator.free(shell_z);
 
-        const command_z = if (opts.command) |command| try allocator.dupeZ(u8, command) else null;
+        const command_z = if (opts.command) |command| try allocator.dupeSentinel(u8, command, 0) else null;
         defer if (command_z) |command| allocator.free(command);
 
-        const cwd_z = if (opts.cwd) |cwd| try allocator.dupeZ(u8, cwd) else null;
+        const cwd_z = if (opts.cwd) |cwd| try allocator.dupeSentinel(u8, cwd, 0) else null;
         defer if (cwd_z) |cwd| allocator.free(cwd);
 
         var env_storage = std.ArrayList([:0]u8).empty;
@@ -67,7 +71,7 @@ pub const Pty = struct {
         defer env_ptrs.deinit(allocator);
         if (opts.env) |env_entries| {
             for (env_entries) |entry| {
-                const entry_z = try allocator.dupeZ(u8, entry);
+                const entry_z = try allocator.dupeSentinel(u8, entry, 0);
                 var entry_owned = true;
                 errdefer if (entry_owned) allocator.free(entry_z);
                 try env_storage.append(allocator, entry_z);
@@ -86,35 +90,36 @@ pub const Pty = struct {
         const envp: [*:null]const ?[*:0]const u8 = if (opts.env != null)
             @ptrCast(env_ptrs.items.ptr)
         else
-            @ptrCast(std.c.environ);
+            sys.currentEnviron();
 
-        const pid = try posix.fork();
+        const pid = try sys.fork();
         if (pid == 0) {
             childExec(master_fd, slave_fd, cwd_z, shell_z.ptr, argv, envp);
         }
 
-        posix.close(slave_fd);
+        sys.close(slave_fd);
         return .{
+            .io = io,
             .master_fd = master_fd,
             .child_pid = pid,
         };
     }
 
     pub fn close(self: *Pty) void {
-        posix.close(self.master_fd);
+        sys.close(self.master_fd);
     }
 
     pub fn setExitObserver(self: *Pty, observer: ExitObserver) void {
         var should_emit = false;
         var emit_status: ?u32 = null;
 
-        self.wait_mutex.lock();
+        self.wait_mutex.lockUncancelable(self.io);
         self.exit_observer = observer;
         if (self.reaped) {
             should_emit = true;
             emit_status = self.exit_status;
         }
-        self.wait_mutex.unlock();
+        self.wait_mutex.unlock(self.io);
 
         if (should_emit) {
             observer.callback(observer.context, self.child_pid, emit_status);
@@ -152,7 +157,7 @@ pub const Pty = struct {
     pub fn write(self: *const Pty, bytes: []const u8) !void {
         var offset: usize = 0;
         while (offset < bytes.len) {
-            offset += try posix.write(self.master_fd, bytes[offset..]);
+            offset += try sys.write(self.master_fd, bytes[offset..]);
         }
     }
 
@@ -171,10 +176,10 @@ pub const Pty = struct {
         var should_emit = false;
         var status_to_emit: ?u32 = null;
 
-        self.wait_mutex.lock();
+        self.wait_mutex.lockUncancelable(self.io);
         if (self.reaped) {
             const status = self.exit_status;
-            self.wait_mutex.unlock();
+            self.wait_mutex.unlock(self.io);
             return status;
         }
 
@@ -188,7 +193,7 @@ pub const Pty = struct {
                 status_to_emit = status;
             },
         }
-        self.wait_mutex.unlock();
+        self.wait_mutex.unlock(self.io);
 
         if (should_emit) {
             if (observer) |active| {
@@ -201,8 +206,8 @@ pub const Pty = struct {
     }
 
     pub fn isReaped(self: *Pty) bool {
-        self.wait_mutex.lock();
-        defer self.wait_mutex.unlock();
+        self.wait_mutex.lockUncancelable(self.io);
+        defer self.wait_mutex.unlock(self.io);
         return self.reaped;
     }
 };
@@ -216,22 +221,16 @@ fn openPty(wsz: posix.winsize) !OpenPtyResult {
     var master_fd: posix.fd_t = undefined;
     var slave_fd: posix.fd_t = undefined;
     if (openpty(&master_fd, &slave_fd, null, null, &wsz) != 0) return error.OpenPtyFailed;
-    errdefer posix.close(master_fd);
-    errdefer posix.close(slave_fd);
+    errdefer sys.close(master_fd);
+    errdefer sys.close(slave_fd);
 
-    try setCloseOnExec(master_fd);
-    try setCloseOnExec(slave_fd);
+    try sys.setCloseOnExec(master_fd);
+    try sys.setCloseOnExec(slave_fd);
 
     return .{
         .master_fd = master_fd,
         .slave_fd = slave_fd,
     };
-}
-
-fn setCloseOnExec(fd: posix.fd_t) !void {
-    var flags = try posix.fcntl(fd, posix.F.GETFD, 0);
-    flags |= @as(usize, @intCast(posix.FD_CLOEXEC));
-    _ = try posix.fcntl(fd, posix.F.SETFD, flags);
 }
 
 const WaitPidNoHangResult = union(enum) {
@@ -284,7 +283,7 @@ fn childExec(
             _ = std.c.write(fd, msg.ptr, msg.len);
         }
     }
-    const err = posix.execvpeZ(shell_path, argv, envp);
+    const err = sys.execvpeZ(shell_path, argv, envp);
     const fd: i32 = 2;
     var buf: [256]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, "zmux-pty: execvpe(\"{s}\") failed: {s}\n", .{
@@ -295,7 +294,10 @@ fn childExec(
 }
 
 fn defaultShell() []const u8 {
-    if (posix.getenv("SHELL")) |shell| {
+    // The child inherits the libc environment block (see `spawn`), so read
+    // SHELL from the same place.
+    if (std.c.getenv("SHELL")) |shell_z| {
+        const shell = std.mem.sliceTo(shell_z, 0);
         if (shell.len > 0) return shell;
     }
     return switch (builtin.os.tag) {
@@ -322,6 +324,10 @@ fn ioctlRequest(value: usize) c_int {
     return @bitCast(@as(u32, @truncate(value)));
 }
 
+fn testSleepMs(ms: i64) void {
+    std.testing.io.sleep(.fromMilliseconds(ms), .awake) catch {};
+}
+
 test "default shell is absolute" {
     try std.testing.expect(std.mem.startsWith(u8, defaultShell(), "/"));
 }
@@ -335,14 +341,11 @@ test "open pty marks master and slave close-on-exec" {
         .xpixel = 0,
         .ypixel = 0,
     });
-    defer posix.close(fds.master_fd);
-    defer posix.close(fds.slave_fd);
+    defer sys.close(fds.master_fd);
+    defer sys.close(fds.slave_fd);
 
-    const master_flags = try posix.fcntl(fds.master_fd, posix.F.GETFD, 0);
-    const slave_flags = try posix.fcntl(fds.slave_fd, posix.F.GETFD, 0);
-    const cloexec = @as(usize, @intCast(posix.FD_CLOEXEC));
-    try std.testing.expect((master_flags & cloexec) != 0);
-    try std.testing.expect((slave_flags & cloexec) != 0);
+    try std.testing.expect(try sys.isCloseOnExec(fds.master_fd));
+    try std.testing.expect(try sys.isCloseOnExec(fds.slave_fd));
 }
 
 test "reapExited tolerates children auto-reaped by ignored SIGCHLD" {
@@ -359,7 +362,7 @@ test "reapExited tolerates children auto-reaped by ignored SIGCHLD" {
     ignored.flags = 0;
     posix.sigaction(std.c.SIG.CHLD, &ignored, null);
 
-    var child = try Pty.spawn(std.testing.allocator, .{
+    var child = try Pty.spawn(std.testing.allocator, std.testing.io, .{
         .shell = "/bin/sh",
         .command = "exit 0",
         .rows = 24,
@@ -372,7 +375,7 @@ test "reapExited tolerates children auto-reaped by ignored SIGCHLD" {
     while (waited < 50 and !child.isReaped()) : (waited += 1) {
         _ = child.reapExited();
         if (child.isReaped()) break;
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        testSleepMs(10);
     }
 
     try std.testing.expect(child.isReaped());
@@ -384,14 +387,14 @@ fn cleanupPtyForTest(child: *Pty) void {
     var waited: u32 = 0;
     while (waited < 50) : (waited += 1) {
         if (child.reapExited() != null) break;
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        testSleepMs(10);
     }
     child.close();
 }
 
 fn spawnWithEnvForFailureTest(allocator: Allocator) !void {
     const env = [_][]const u8{ "FOO=bar", "BAZ=qux" };
-    var child = try Pty.spawn(allocator, .{
+    var child = try Pty.spawn(allocator, std.testing.io, .{
         .shell = "/bin/sh",
         .command = "exit 0",
         .env = &env,
@@ -412,7 +415,7 @@ test "spawn with bare shell (no command) exits cleanly" {
 
     // /bin/sh -c ':' via command path is exercised elsewhere; this path
     // covers the bare-login case that used to trip `unreachable`.
-    var pty = try Pty.spawn(std.testing.allocator, .{
+    var pty = try Pty.spawn(std.testing.allocator, std.testing.io, .{
         .shell = "/bin/sh",
         .command = null,
         .rows = 24,
@@ -432,7 +435,7 @@ test "spawn with bare shell (no command) exits cleanly" {
             reaped = true;
             break;
         }
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        testSleepMs(10);
     }
     try std.testing.expect(reaped);
 }

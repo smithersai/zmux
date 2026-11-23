@@ -3,28 +3,77 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
 
+const sys = @import("sys.zig");
+
+/// Buffered newline-delimited reader over a raw, blocking descriptor.
+///
+/// Reads use `poll(2)` + `read(2)` directly on the descriptor so a reader can
+/// share a socket with a concurrent writer thread. Only the timeout variants
+/// need an `std.Io`, to read the monotonic clock.
 pub const LineReader = struct {
     buffer: [4096]u8 = undefined,
     start: usize = 0,
     end: usize = 0,
 
+    /// An absolute point on `io`'s clock after which reads fail with
+    /// `error.ReadTimeout`.
+    const Deadline = struct {
+        io: std.Io,
+        at: std.Io.Clock.Timestamp,
+
+        fn init(io: std.Io, timeout: std.Io.Timeout) ?Deadline {
+            const at = timeout.toTimestamp(io) orelse return null;
+            return .{ .io = io, .at = at };
+        }
+
+        /// Milliseconds left, rounded up so a sub-millisecond remainder still
+        /// polls once instead of timing out early; 0 once expired.
+        fn remainingMs(self: Deadline) i64 {
+            const ns = self.at.durationFromNow(self.io).raw.toNanoseconds();
+            if (ns <= 0) return 0;
+            return @intCast(@divFloor(ns + std.time.ns_per_ms - 1, std.time.ns_per_ms));
+        }
+    };
+
+    /// Read one complete line (newline included), blocking without a time
+    /// limit. EOF before a newline is `error.ConnectionClosed`.
     pub fn readLineAlloc(self: *LineReader, allocator: Allocator, fd: posix.fd_t, max_len: usize) ![]u8 {
-        const line = try self.readLineAllocMaybeWithDeadline(allocator, fd, max_len, std.math.maxInt(i64)) orelse return error.ConnectionClosed;
-        if (line.len == 0 or line[line.len - 1] != '\n') {
-            allocator.free(line);
-            return error.ConnectionClosed;
-        }
-        return line;
+        return requireNewline(allocator, try self.readLineAllocMaybeDeadline(allocator, fd, max_len, null));
     }
 
-    pub fn readLineAllocWithDeadline(
+    /// Like `readLineAlloc`, but fails with `error.ReadTimeout` once `timeout`
+    /// (measured on `io`'s clock) elapses.
+    pub fn readLineAllocTimeout(
         self: *LineReader,
         allocator: Allocator,
+        io: std.Io,
         fd: posix.fd_t,
         max_len: usize,
-        deadline_ms: i64,
+        timeout: std.Io.Timeout,
     ) ![]u8 {
-        const line = try self.readLineAllocMaybeWithDeadline(allocator, fd, max_len, deadline_ms) orelse return error.ConnectionClosed;
+        return requireNewline(allocator, try self.readLineAllocMaybeDeadline(allocator, fd, max_len, .init(io, timeout)));
+    }
+
+    /// Read one line, returning `null` on EOF with nothing buffered and the
+    /// unterminated remainder on EOF after a partial line.
+    pub fn readLineAllocMaybe(self: *LineReader, allocator: Allocator, fd: posix.fd_t, max_len: usize) !?[]u8 {
+        return self.readLineAllocMaybeDeadline(allocator, fd, max_len, null);
+    }
+
+    /// `readLineAllocMaybe` with a timeout on `io`'s clock.
+    pub fn readLineAllocMaybeTimeout(
+        self: *LineReader,
+        allocator: Allocator,
+        io: std.Io,
+        fd: posix.fd_t,
+        max_len: usize,
+        timeout: std.Io.Timeout,
+    ) !?[]u8 {
+        return self.readLineAllocMaybeDeadline(allocator, fd, max_len, .init(io, timeout));
+    }
+
+    fn requireNewline(allocator: Allocator, maybe_line: ?[]u8) ![]u8 {
+        const line = maybe_line orelse return error.ConnectionClosed;
         if (line.len == 0 or line[line.len - 1] != '\n') {
             allocator.free(line);
             return error.ConnectionClosed;
@@ -32,16 +81,12 @@ pub const LineReader = struct {
         return line;
     }
 
-    pub fn readLineAllocMaybe(self: *LineReader, allocator: Allocator, fd: posix.fd_t, max_len: usize) !?[]u8 {
-        return self.readLineAllocMaybeWithDeadline(allocator, fd, max_len, std.math.maxInt(i64));
-    }
-
-    pub fn readLineAllocMaybeWithDeadline(
+    fn readLineAllocMaybeDeadline(
         self: *LineReader,
         allocator: Allocator,
         fd: posix.fd_t,
         max_len: usize,
-        deadline_ms: i64,
+        deadline: ?Deadline,
     ) !?[]u8 {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
@@ -50,16 +95,18 @@ pub const LineReader = struct {
             if (try self.appendBufferedLine(allocator, &out, max_len)) |line| return line;
             if (self.bufferedLen() != 0) try self.appendBufferedBytes(allocator, &out, max_len);
 
-            const now = std.time.milliTimestamp();
-            if (now >= deadline_ms) return error.ReadTimeout;
+            const poll_timeout_ms: i32 = if (deadline) |d| blk: {
+                const remaining_ms = d.remainingMs();
+                if (remaining_ms <= 0) return error.ReadTimeout;
+                break :blk @intCast(@min(remaining_ms, std.math.maxInt(i32)));
+            } else -1;
 
             var fds = [_]posix.pollfd{.{
                 .fd = fd,
                 .events = posix.POLL.IN,
                 .revents = 0,
             }};
-            const remaining_ms = @min(deadline_ms - now, std.math.maxInt(i32));
-            const ready = try posix.poll(&fds, @intCast(remaining_ms));
+            const ready = try posix.poll(&fds, poll_timeout_ms);
             if (ready == 0) return error.ReadTimeout;
 
             if ((fds[0].revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0 and
@@ -130,13 +177,11 @@ pub const LineReader = struct {
 };
 
 test "line reader keeps leftover bytes for the next line" {
-    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
+    const fds = try sys.pipe();
+    defer sys.close(fds[0]);
+    defer sys.close(fds[1]);
 
-    const fds = try std.posix.pipe();
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
-
-    _ = try posix.write(fds[1], "one\ntwo\n");
+    _ = try sys.write(fds[1], "one\ntwo\n");
 
     var reader: LineReader = .{};
     const first = (try reader.readLineAllocMaybe(std.testing.allocator, fds[0], 64)).?;
@@ -148,40 +193,37 @@ test "line reader keeps leftover bytes for the next line" {
     try std.testing.expectEqualStrings("two\n", second);
 }
 
-test "readLineAllocWithDeadline returns ReadTimeout" {
-    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
-
-    const fds = try std.posix.pipe();
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
+test "readLineAllocTimeout returns ReadTimeout" {
+    const fds = try sys.pipe();
+    defer sys.close(fds[0]);
+    defer sys.close(fds[1]);
 
     var reader: LineReader = .{};
-    const deadline = std.time.milliTimestamp() + 20;
     try std.testing.expectError(
         error.ReadTimeout,
-        reader.readLineAllocWithDeadline(std.testing.allocator, fds[0], 64, deadline),
+        reader.readLineAllocTimeout(std.testing.allocator, std.testing.io, fds[0], 64, .{
+            .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake },
+        }),
     );
 }
 
 const DelayedWrite = struct {
     fd: posix.fd_t,
     bytes: []const u8,
-    delay_ms: u64,
+    delay_ms: i64,
 
     fn run(self: DelayedWrite) void {
-        std.Thread.sleep(self.delay_ms * std.time.ns_per_ms);
-        _ = posix.write(self.fd, self.bytes) catch {};
+        std.testing.io.sleep(.fromMilliseconds(self.delay_ms), .awake) catch {};
+        _ = sys.write(self.fd, self.bytes) catch {};
     }
 };
 
 test "line reader assembles a line split across multiple reads" {
-    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
+    const fds = try sys.pipe();
+    defer sys.close(fds[0]);
+    defer sys.close(fds[1]);
 
-    const fds = try std.posix.pipe();
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
-
-    _ = try posix.write(fds[1], "par");
+    _ = try sys.write(fds[1], "par");
     const writer = try std.Thread.spawn(.{}, DelayedWrite.run, .{DelayedWrite{
         .fd = fds[1],
         .bytes = "tial\n",
@@ -196,15 +238,13 @@ test "line reader assembles a line split across multiple reads" {
 }
 
 test "line reader enforces max_len while accumulating a partial line" {
-    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
-
-    const fds = try std.posix.pipe();
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
+    const fds = try sys.pipe();
+    defer sys.close(fds[0]);
+    defer sys.close(fds[1]);
 
     var bytes: [2048]u8 = undefined;
     @memset(&bytes, 'x');
-    _ = try posix.write(fds[1], &bytes);
+    _ = try sys.write(fds[1], &bytes);
 
     var reader: LineReader = .{};
     try std.testing.expectError(
@@ -214,14 +254,12 @@ test "line reader enforces max_len while accumulating a partial line" {
 }
 
 test "line reader max_len accepts an exact boundary and rejects one byte over" {
-    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
-
     {
-        const fds = try std.posix.pipe();
-        defer posix.close(fds[0]);
-        defer posix.close(fds[1]);
+        const fds = try sys.pipe();
+        defer sys.close(fds[0]);
+        defer sys.close(fds[1]);
 
-        _ = try posix.write(fds[1], "1234\n");
+        _ = try sys.write(fds[1], "1234\n");
         var reader: LineReader = .{};
         const line = try reader.readLineAlloc(std.testing.allocator, fds[0], 5);
         defer std.testing.allocator.free(line);
@@ -229,11 +267,11 @@ test "line reader max_len accepts an exact boundary and rejects one byte over" {
     }
 
     {
-        const fds = try std.posix.pipe();
-        defer posix.close(fds[0]);
-        defer posix.close(fds[1]);
+        const fds = try sys.pipe();
+        defer sys.close(fds[0]);
+        defer sys.close(fds[1]);
 
-        _ = try posix.write(fds[1], "12345\n");
+        _ = try sys.write(fds[1], "12345\n");
         var reader: LineReader = .{};
         try std.testing.expectError(
             error.MessageTooLarge,
@@ -243,13 +281,11 @@ test "line reader max_len accepts an exact boundary and rejects one byte over" {
 }
 
 test "line reader distinguishes EOF partial lines for strict and maybe reads" {
-    if (!@hasDecl(std.posix, "pipe")) return error.SkipZigTest;
-
     {
-        const fds = try std.posix.pipe();
-        defer posix.close(fds[0]);
-        _ = try posix.write(fds[1], "noeol");
-        posix.close(fds[1]);
+        const fds = try sys.pipe();
+        defer sys.close(fds[0]);
+        _ = try sys.write(fds[1], "noeol");
+        sys.close(fds[1]);
 
         var reader: LineReader = .{};
         try std.testing.expectError(
@@ -259,10 +295,10 @@ test "line reader distinguishes EOF partial lines for strict and maybe reads" {
     }
 
     {
-        const fds = try std.posix.pipe();
-        defer posix.close(fds[0]);
-        _ = try posix.write(fds[1], "noeol");
-        posix.close(fds[1]);
+        const fds = try sys.pipe();
+        defer sys.close(fds[0]);
+        _ = try sys.write(fds[1], "noeol");
+        sys.close(fds[1]);
 
         var reader: LineReader = .{};
         const line = (try reader.readLineAllocMaybe(std.testing.allocator, fds[0], 64)).?;

@@ -3,7 +3,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 
-pub const version = "0.2.0";
+pub const version = "0.3.0";
 
 pub const foreground_changed_method = "foreground_changed";
 pub const session_exited_method = "session_exited";

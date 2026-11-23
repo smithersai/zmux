@@ -64,9 +64,18 @@ pub const EventSink = struct {
     emit: *const fn (context: *anyopaque, event: Event) void,
 };
 
+/// A single PTY-backed shell with bounded scrollback and a background reader
+/// thread. Reference counted: `create` returns one reference; `release` (or
+/// `destroy`) drops it and the last release terminates the child.
+///
+/// `io` supplies the mutex, clock, and sleep primitives. The reader runs on a
+/// dedicated `std.Thread` doing blocking `poll(2)`/`read(2)` on the PTY master,
+/// so any `std.Io` implementation whose `Mutex` and `sleep` are thread-safe
+/// works (for example `std.Io.Threaded`).
 pub const NativeSession = struct {
     allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
     ref_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
     id: []u8,
     title_value: []u8,
@@ -82,7 +91,7 @@ pub const NativeSession = struct {
     reader_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     reader_thread: ?std.Thread = null,
 
-    pub fn create(allocator: std.mem.Allocator, opts: NativeSessionOptions) !*NativeSession {
+    pub fn create(allocator: std.mem.Allocator, io: std.Io, opts: NativeSessionOptions) !*NativeSession {
         const native = try allocator.create(NativeSession);
         errdefer allocator.destroy(native);
 
@@ -101,7 +110,7 @@ pub const NativeSession = struct {
         var scrollback = try buffer.ScrollbackBuffer.init(allocator, opts.scrollback_bytes);
         errdefer scrollback.deinit();
 
-        var handle = try pty.Pty.spawn(allocator, .{
+        var handle = try pty.Pty.spawn(allocator, io, .{
             .shell = opts.shell,
             .command = opts.command,
             .cwd = opts.cwd,
@@ -113,6 +122,7 @@ pub const NativeSession = struct {
 
         native.* = .{
             .allocator = allocator,
+            .io = io,
             .id = id,
             .title_value = native_title,
             .shell_value = shell,
@@ -166,12 +176,15 @@ pub const NativeSession = struct {
     }
 
     pub fn state(self: *NativeSession) NativeSessionState {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.state_value;
     }
 
     pub fn terminate(self: *NativeSession) void {
+        const previous = self.io.swapCancelProtection(.blocked);
+        defer _ = self.io.swapCancelProtection(previous);
+
         self.handle.terminate();
 
         // Try to reap the child, waiting briefly for it to exit
@@ -183,7 +196,7 @@ pub const NativeSession = struct {
                 break;
             }
             if (self.handle.isReaped()) break;
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            self.sleepMs(10);
         }
 
         // If still not exited after 200ms, send SIGKILL
@@ -197,7 +210,7 @@ pub const NativeSession = struct {
                     break;
                 }
                 if (self.handle.isReaped()) break;
-                std.Thread.sleep(10 * std.time.ns_per_ms);
+                self.sleepMs(10);
             }
         }
 
@@ -239,14 +252,14 @@ pub const NativeSession = struct {
     }
 
     pub fn capture(self: *NativeSession, allocator: std.mem.Allocator, lines: usize) ![]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.scrollback.captureLastLines(allocator, lines);
     }
 
     pub fn scrollbackSnapshot(self: *NativeSession, allocator: std.mem.Allocator) ![]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.scrollback.snapshot(allocator);
     }
 
@@ -255,8 +268,8 @@ pub const NativeSession = struct {
     }
 
     pub fn infoJson(self: *NativeSession, allocator: std.mem.Allocator) ![]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         var out: std.Io.Writer.Allocating = .init(allocator);
         errdefer out.deinit();
@@ -316,14 +329,14 @@ pub const NativeSession = struct {
                 self.markTerminated(status);
                 return;
             }
-            self.mutex.lock();
+            self.mutex.lockUncancelable(self.io);
             self.scrollback.append(read_buf[0..n]);
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             self.emitEvent(.{ .pane_output = .{
                 .pane_id = self.id,
                 .data = read_buf[0..n],
             } });
-            const now_ms = std.time.milliTimestamp();
+            const now_ms = self.nowMs();
             self.emitEvent(.{ .pane_activity = .{
                 .pane_id = self.id,
                 .last_activity_ms = now_ms,
@@ -338,11 +351,11 @@ pub const NativeSession = struct {
     }
 
     fn pollForegroundChange(self: *NativeSession) !void {
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = self.monotonicMs();
         if (now_ms < self.next_foreground_check_ms) return;
         self.next_foreground_check_ms = now_ms + foreground.poll_interval_ms;
 
-        var process = (try self.foreground_tracker.poll(self.allocator, self.handle.master_fd)) orelse return;
+        var process = (try self.foreground_tracker.poll(self.allocator, self.io, self.handle.master_fd)) orelse return;
         defer process.deinit();
 
         self.emitEvent(.{ .foreground_changed = .{
@@ -354,16 +367,16 @@ pub const NativeSession = struct {
     }
 
     fn emitEvent(self: *NativeSession, event: Event) void {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         const sink = self.event_sink;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
         const active = sink orelse return;
         active.emit(active.context, event);
     }
 
     pub fn setEventSink(self: *NativeSession, sink: ?EventSink) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.event_sink = sink;
     }
 
@@ -371,12 +384,28 @@ pub const NativeSession = struct {
         self.setEventSink(null);
     }
 
+    fn nowMs(self: *NativeSession) i64 {
+        return std.Io.Clock.real.now(self.io).toMilliseconds();
+    }
+
+    fn monotonicMs(self: *NativeSession) i64 {
+        return std.Io.Clock.awake.now(self.io).toMilliseconds();
+    }
+
+    fn sleepMs(self: *NativeSession, ms: i64) void {
+        // Plain threads are never canceled; ignoring error.Canceled is safe.
+        self.io.sleep(.fromMilliseconds(ms), .awake) catch {};
+    }
+
     fn reapExitedBriefly(self: *NativeSession) ?u32 {
+        const previous = self.io.swapCancelProtection(.blocked);
+        defer _ = self.io.swapCancelProtection(previous);
+
         var attempts: usize = 0;
         while (attempts < 50) : (attempts += 1) {
             if (self.reapExited()) |status| return status;
             if (self.handle.isReaped()) return null;
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            self.sleepMs(10);
         }
         return null;
     }
@@ -388,13 +417,13 @@ pub const NativeSession = struct {
             .session_id = self.id,
             .pid = pid,
             .exit_code = if (status) |value| if (std.posix.W.IFEXITED(value)) std.posix.W.EXITSTATUS(value) else null else null,
-            .signal = if (status) |value| if (std.posix.W.IFSIGNALED(value)) std.posix.W.TERMSIG(value) else null else null,
+            .signal = if (status) |value| if (std.posix.W.IFSIGNALED(value)) @backingInt(std.posix.W.TERMSIG(value)) else null else null,
         } });
     }
 
     fn markTerminated(self: *NativeSession, status: ?u32) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.state_value = .terminated;
         if (self.exit_status == null) {
             self.exit_status = if (status) |value| decodedExitStatus(value) else null;
@@ -402,9 +431,9 @@ pub const NativeSession = struct {
     }
 };
 
-fn decodedExitStatus(status: u32) u32 {
+pub fn decodedExitStatus(status: u32) u32 {
     if (std.posix.W.IFEXITED(status)) return std.posix.W.EXITSTATUS(status);
-    if (std.posix.W.IFSIGNALED(status)) return std.posix.W.TERMSIG(status);
+    if (std.posix.W.IFSIGNALED(status)) return @backingInt(std.posix.W.TERMSIG(status));
     return status;
 }
 
@@ -433,7 +462,7 @@ fn ctrlKeySequence(key: []const u8) ?[]const u8 {
     return &ctrl_key_sequences[index];
 }
 
-fn keySequence(key: []const u8) ?[]const u8 {
+pub fn keySequence(key: []const u8) ?[]const u8 {
     if (ctrlKeySequence(key)) |sequence| return sequence;
 
     if (keyEql(key, "Enter") or keyEql(key, "Return")) return "\r";

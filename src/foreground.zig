@@ -37,20 +37,23 @@ pub const Tracker = struct {
         return pgid != self.shell_pid;
     }
 
-    pub fn poll(self: *Tracker, allocator: Allocator, master_fd: posix.fd_t) !?ProcessInfo {
+    /// Report the PTY's foreground process group leader when it changed since
+    /// the last call and is not the shell itself. `io` is used to read
+    /// `/proc` on Linux.
+    pub fn poll(self: *Tracker, allocator: Allocator, io: std.Io, master_fd: posix.fd_t) !?ProcessInfo {
         const pgid = terminalForegroundPgrp(master_fd) catch |err| switch (err) {
             error.NotATerminal => return null,
             else => return err,
         };
         if (!self.shouldEmitForPgid(pgid)) return null;
-        return try resolveProcessInfo(allocator, pgid);
+        return try resolveProcessInfo(allocator, io, pgid);
     }
 };
 
-pub fn resolveProcessInfo(allocator: Allocator, pid: posix.pid_t) !ProcessInfo {
+pub fn resolveProcessInfo(allocator: Allocator, io: std.Io, pid: posix.pid_t) !ProcessInfo {
     return switch (builtin.os.tag) {
         .macos, .ios, .tvos, .watchos, .visionos => try resolveDarwinProcessInfo(allocator, pid),
-        .linux => try resolveLinuxProcessInfo(allocator, pid),
+        .linux => try resolveLinuxProcessInfo(allocator, io, pid),
         else => try resolveFallbackProcessInfo(allocator, pid),
     };
 }
@@ -89,12 +92,12 @@ const linux_cmdline_max_bytes: usize = 256 * 1024;
 /// between tcgetpgrp and this call, hidepid mounts) degrade to a
 /// `pid-<pid>` name and an empty argv. Only allocation failure propagates,
 /// so a foreground poll never fails because a process vanished.
-fn resolveLinuxProcessInfo(allocator: Allocator, pid: posix.pid_t) !ProcessInfo {
+fn resolveLinuxProcessInfo(allocator: Allocator, io: std.Io, pid: posix.pid_t) !ProcessInfo {
     var path_buffer: [64]u8 = undefined;
 
     const argv = argv: {
         const path = std.fmt.bufPrint(&path_buffer, "/proc/{d}/cmdline", .{pid}) catch unreachable;
-        const raw = try readProcFileBounded(allocator, path, linux_cmdline_max_bytes) orelse
+        const raw = try readProcFileBounded(allocator, io, path, linux_cmdline_max_bytes) orelse
             break :argv try allocator.alloc([]u8, 0);
         defer allocator.free(raw);
         break :argv try parseLinuxProcCmdline(allocator, raw);
@@ -103,7 +106,7 @@ fn resolveLinuxProcessInfo(allocator: Allocator, pid: posix.pid_t) !ProcessInfo 
 
     const comm = comm: {
         const path = std.fmt.bufPrint(&path_buffer, "/proc/{d}/comm", .{pid}) catch unreachable;
-        if (try readProcFileBounded(allocator, path, linux_comm_max_bytes)) |raw| {
+        if (try readProcFileBounded(allocator, io, path, linux_comm_max_bytes)) |raw| {
             defer allocator.free(raw);
             const name = parseLinuxProcComm(raw);
             if (name.len > 0) break :comm try allocator.dupe(u8, name);
@@ -127,9 +130,9 @@ fn resolveLinuxProcessInfo(allocator: Allocator, pid: posix.pid_t) !ProcessInfo 
 /// so this reads until EOF instead of trusting stat. Content past
 /// `max_bytes` is truncated. Returns null when the file cannot be opened or
 /// read; returns error.OutOfMemory only on allocation failure.
-fn readProcFileBounded(allocator: Allocator, path: []const u8, max_bytes: usize) Allocator.Error!?[]u8 {
-    var file = std.fs.openFileAbsolute(path, .{}) catch return null;
-    defer file.close();
+fn readProcFileBounded(allocator: Allocator, io: std.Io, path: []const u8, max_bytes: usize) Allocator.Error!?[]u8 {
+    var file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
+    defer file.close(io);
 
     var buffer = std.ArrayList(u8).empty;
     errdefer buffer.deinit(allocator);
@@ -137,9 +140,12 @@ fn readProcFileBounded(allocator: Allocator, path: []const u8, max_bytes: usize)
     var chunk: [4096]u8 = undefined;
     while (buffer.items.len < max_bytes) {
         const want = @min(chunk.len, max_bytes - buffer.items.len);
-        const n = file.read(chunk[0..want]) catch {
-            buffer.deinit(allocator);
-            return null;
+        const n = file.readStreaming(io, &.{chunk[0..want]}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => {
+                buffer.deinit(allocator);
+                return null;
+            },
         };
         if (n == 0) break;
         try buffer.appendSlice(allocator, chunk[0..n]);
@@ -151,7 +157,7 @@ fn readProcFileBounded(allocator: Allocator, path: []const u8, max_bytes: usize)
 /// Trims the trailing newline, carriage return, NUL, and blank padding from a
 /// raw /proc/<pid>/comm read. Returns an empty slice when nothing remains.
 pub fn parseLinuxProcComm(raw: []const u8) []const u8 {
-    return std.mem.trimRight(u8, raw, "\n\r\x00 \t");
+    return std.mem.trimEnd(u8, raw, "\n\r\x00 \t");
 }
 
 /// Splits a raw /proc/<pid>/cmdline read into owned argv strings. Arguments
@@ -159,7 +165,7 @@ pub fn parseLinuxProcComm(raw: []const u8) []const u8 {
 /// NUL padding (left behind by setproctitle-style rewrites) is dropped, while
 /// empty arguments between non-empty ones are preserved.
 pub fn parseLinuxProcCmdline(allocator: Allocator, raw: []const u8) ![][]u8 {
-    const trimmed = std.mem.trimRight(u8, raw, "\x00");
+    const trimmed = std.mem.trimEnd(u8, raw, "\x00");
     if (trimmed.len == 0) return allocator.alloc([]u8, 0);
 
     const count = std.mem.count(u8, trimmed, "\x00") + 1;
@@ -224,7 +230,7 @@ fn procArgsDarwin(allocator: Allocator, pid: posix.pid_t, fallback_path: []const
     return try parseProcArgsBuffer(allocator, buffer[0..procargs_len], fallback_path);
 }
 
-fn parseProcArgsBuffer(allocator: Allocator, buffer: []const u8, fallback_path: []const u8) ![][]u8 {
+pub fn parseProcArgsBuffer(allocator: Allocator, buffer: []const u8, fallback_path: []const u8) ![][]u8 {
     if (buffer.len < @sizeOf(u32)) return fallbackArgv(allocator, fallback_path);
 
     const argc_u32 = std.mem.readInt(u32, buffer[0..@sizeOf(u32)], builtin.cpu.arch.endian());
@@ -250,7 +256,9 @@ fn parseProcArgsBuffer(allocator: Allocator, buffer: []const u8, fallback_path: 
             continue;
         }
 
-        try argv.append(allocator, try allocator.dupe(u8, buffer[start..offset]));
+        const arg = try allocator.dupe(u8, buffer[start..offset]);
+        errdefer allocator.free(arg);
+        try argv.append(allocator, arg);
         remaining -= 1;
 
         while (offset < buffer.len and buffer[offset] == 0) : (offset += 1) {}
@@ -258,6 +266,7 @@ fn parseProcArgsBuffer(allocator: Allocator, buffer: []const u8, fallback_path: 
 
     if (argv.items.len == 0) {
         argv.deinit(allocator);
+        argv = .empty;
         return fallbackArgv(allocator, fallback_path);
     }
 
@@ -273,7 +282,7 @@ fn fallbackArgv(allocator: Allocator, fallback_path: []const u8) ![][]u8 {
     return argv;
 }
 
-fn freeArgv(allocator: Allocator, argv: [][]u8) void {
+pub fn freeArgv(allocator: Allocator, argv: [][]u8) void {
     for (argv) |arg| allocator.free(arg);
     allocator.free(argv);
 }
@@ -310,7 +319,7 @@ test "tracker deduplicates shell foreground and repeated pgids" {
 }
 
 test "parse proc args buffer extracts argv after exec path" {
-    var buffer: [128]u8 = [_]u8{0} ** 128;
+    var buffer: [128]u8 = @splat(0);
     std.mem.writeInt(u32, buffer[0..4], 3, builtin.cpu.arch.endian());
 
     var offset: usize = 4;
@@ -391,7 +400,7 @@ test "parseLinuxProcCmdline frees partial results on allocation failure" {
 test "resolveLinuxProcessInfo reads the current process" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
 
-    var info = try resolveLinuxProcessInfo(std.testing.allocator, std.c.getpid());
+    var info = try resolveLinuxProcessInfo(std.testing.allocator, std.testing.io, std.c.getpid());
     defer info.deinit();
     try std.testing.expect(info.comm.len > 0);
     try std.testing.expect(info.argv.len > 0);
@@ -403,7 +412,7 @@ test "resolveLinuxProcessInfo falls back for a missing pid" {
 
     // Above the kernel's PID_MAX_LIMIT (4194304), so /proc/<pid> never exists.
     const missing: posix.pid_t = 0x7fff_fff0;
-    var info = try resolveLinuxProcessInfo(std.testing.allocator, missing);
+    var info = try resolveLinuxProcessInfo(std.testing.allocator, std.testing.io, missing);
     defer info.deinit();
     try std.testing.expectEqualStrings("pid-2147483632", info.comm);
     try std.testing.expectEqual(@as(usize, 0), info.argv.len);

@@ -14,6 +14,17 @@ pub const native = @import("native.zig");
 pub const protocol = @import("protocol.zig");
 pub const pty = @import("pty.zig");
 pub const server = @import("server.zig");
+/// POSIX plumbing `std.Io` does not model (raw descriptors, `AF_UNIX`
+/// sockets, signals). Exported for the bundled executables and tests; it is
+/// not part of the stable embedding API.
+pub const sys = @import("sys.zig");
+
+/// Internal modules exposed for the repository's own test and fuzz suites;
+/// not part of the stable embedding API.
+pub const internal = struct {
+    pub const log = @import("log.zig");
+    pub const rpc_line_reader = @import("rpc_line_reader.zig");
+};
 
 pub const NativeSession = native.NativeSession;
 pub const NativeSessionOptions = native.NativeSessionOptions;
@@ -23,6 +34,11 @@ pub const SessionManager = mux.Manager;
 test {
     const std = @import("std");
     std.testing.refAllDecls(@This());
+    // Internal modules with their own tests that the public surface above
+    // does not re-export.
+    _ = @import("log.zig");
+    _ = @import("rpc_line_reader.zig");
+    _ = @import("sys.zig");
 }
 
 test "advertised top-level modules are exported" {
@@ -33,9 +49,32 @@ test "advertised top-level modules are exported" {
     try std.testing.expect(@hasDecl(@This(), "foreground"));
 }
 
+test "README library example compiles against the current API" {
+    const std = @import("std");
+    // Mirrors the README "Library use" snippet and checks the core stateful
+    // constructors; taking function addresses forces semantic analysis so a
+    // signature change breaks this test.
+    const Example = struct {
+        fn main(init: std.process.Init) !void {
+            var srv = try Server.init(init.gpa, init.io, "/tmp/zmux.sock", 60);
+            defer srv.deinit();
+            try srv.run();
+        }
+
+        fn standalone(allocator: std.mem.Allocator, io: std.Io) !void {
+            var manager = SessionManager.init(allocator, io, null);
+            defer manager.deinit();
+            const session = try NativeSession.create(allocator, io, .{ .id = "work" });
+            defer session.release();
+        }
+    };
+    _ = &Example.main;
+    _ = &Example.standalone;
+}
+
 test "README documents current public wire and lifecycle behavior" {
     const std = @import("std");
-    const readme = try std.fs.cwd().readFileAlloc(std.testing.allocator, "README.md", 256 * 1024);
+    const readme = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "README.md", std.testing.allocator, .limited(256 * 1024));
     defer std.testing.allocator.free(readme);
 
     try std.testing.expect(std.mem.indexOf(u8, readme, "one JSON document per physical line") != null);
@@ -49,7 +88,10 @@ test "README documents current public wire and lifecycle behavior" {
     try std.testing.expect(std.mem.indexOf(u8, readme, "`/proc/<pid>/comm`") != null);
     try std.testing.expect(std.mem.indexOf(u8, readme, "`/proc/<pid>/cmdline`") != null);
     try std.testing.expect(std.mem.indexOf(u8, readme, "--log-level <error|warn|info|debug>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "\"version\":\"0.2.0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, readme, "\"version\":\"0.3.0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, readme, "Zig **0.17.1**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, readme, "zmux.Server.init(init.gpa, init.io, \"/tmp/zmux.sock\", 60)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, readme, "0.15.2**") == null);
     try std.testing.expect(std.mem.indexOf(u8, readme, "zmuxd-linux-arm64.tar.gz") != null);
     try std.testing.expect(std.mem.indexOf(u8, readme, ".sha256") != null);
     try std.testing.expect(std.mem.indexOf(u8, readme, "$ZMUX_SOCKET") != null);

@@ -4,31 +4,33 @@ const builtin = @import("builtin");
 const log = @import("log.zig");
 const protocol = @import("protocol.zig");
 const server_mod = @import("server.zig");
+const sys = @import("sys.zig");
 
 const default_idle_timeout_seconds: i64 = 60 * 60;
 const startup_probe_timeout_ms: i64 = 2000;
 var shutdown_requested = std.atomic.Value(bool).init(false);
 
 const StartLock = struct {
-    file: std.fs.File,
+    io: std.Io,
+    file: std.Io.File,
     path: []u8,
     allocator: std.mem.Allocator,
 
     fn release(self: *StartLock) void {
-        self.file.close();
-        std.fs.deleteFileAbsolute(self.path) catch {};
+        self.file.close(self.io);
+        std.Io.Dir.deleteFileAbsolute(self.io, self.path) catch {};
         self.allocator.free(self.path);
     }
 };
 
-pub fn main() !void {
-    runMain() catch |err| {
+pub fn main(init: std.process.Init) void {
+    runMain(init) catch |err| {
         switch (err) {
             // Already reported with a specific message.
             error.InvalidArguments, error.SocketPathTooLong => {},
             else => {
                 var buf: [1024]u8 = undefined;
-                var w = std.fs.File.stderr().writer(&buf);
+                var w = std.Io.File.stderr().writerStreaming(init.io, &buf);
                 w.interface.print("zmuxd: {s}\n", .{@errorName(err)}) catch {};
                 w.interface.flush() catch {};
             },
@@ -37,65 +39,115 @@ pub fn main() !void {
     };
 }
 
-fn runMain() !void {
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    const allocator = debug_allocator.allocator();
-    defer _ = debug_allocator.deinit();
+pub const ParsedArgs = struct {
+    idle_timeout_seconds: i64 = default_idle_timeout_seconds,
+    explicit_socket_path: ?[]const u8 = null,
+    log_level: ?log.Level = null,
+    show_version: bool = false,
+    show_help: bool = false,
+};
 
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+pub const ParseArgsError = error{
+    MissingSocketValue,
+    MissingIdleSecondsValue,
+    InvalidIdleSecondsValue,
+    MissingLogLevelValue,
+    InvalidLogLevelValue,
+    UnknownFlag,
+};
 
-    // Environment first; an explicit --log-level below overrides it.
-    log.initFromEnv();
+pub const ParseArgsFailure = struct {
+    err: ParseArgsError,
+    arg: ?[]const u8 = null,
+    parse_err: ?anyerror = null,
+};
 
-    var idle_timeout_seconds = default_idle_timeout_seconds;
-    var explicit_socket_path: ?[]const u8 = null;
-
+pub fn parseArgs(argv: []const []const u8, failure: ?*ParseArgsFailure) ParseArgsError!ParsedArgs {
+    var parsed: ParsedArgs = .{};
     var i: usize = 1;
-    var show_version = false;
     while (i < argv.len) : (i += 1) {
         if (std.mem.eql(u8, argv[i], "--socket")) {
             i += 1;
-            if (i >= argv.len) return fail("missing value for --socket", .{});
-            explicit_socket_path = argv[i];
+            if (i >= argv.len) {
+                if (failure) |f| f.* = .{ .err = error.MissingSocketValue };
+                return error.MissingSocketValue;
+            }
+            parsed.explicit_socket_path = argv[i];
         } else if (std.mem.eql(u8, argv[i], "--idle-seconds")) {
             i += 1;
-            if (i >= argv.len) return fail("missing value for --idle-seconds", .{});
-            idle_timeout_seconds = std.fmt.parseInt(i64, argv[i], 10) catch |err| {
-                return fail("invalid idle timeout value: {s}", .{@errorName(err)});
+            if (i >= argv.len) {
+                if (failure) |f| f.* = .{ .err = error.MissingIdleSecondsValue };
+                return error.MissingIdleSecondsValue;
+            }
+            parsed.idle_timeout_seconds = std.fmt.parseInt(i64, argv[i], 10) catch |err| {
+                if (failure) |f| f.* = .{ .err = error.InvalidIdleSecondsValue, .arg = argv[i], .parse_err = err };
+                return error.InvalidIdleSecondsValue;
             };
         } else if (std.mem.eql(u8, argv[i], "--log-level")) {
             i += 1;
-            if (i >= argv.len) return fail("missing value for --log-level", .{});
-            const level = log.parseLevel(argv[i]) catch {
-                return fail("invalid log level: {s} (expected error, warn, info, or debug)", .{argv[i]});
+            if (i >= argv.len) {
+                if (failure) |f| f.* = .{ .err = error.MissingLogLevelValue };
+                return error.MissingLogLevelValue;
+            }
+            parsed.log_level = log.parseLevel(argv[i]) catch {
+                if (failure) |f| f.* = .{ .err = error.InvalidLogLevelValue, .arg = argv[i] };
+                return error.InvalidLogLevelValue;
             };
-            log.setLevel(level);
         } else if (std.mem.eql(u8, argv[i], "--version") or std.mem.eql(u8, argv[i], "-V")) {
-            show_version = true;
+            parsed.show_version = true;
         } else if (std.mem.eql(u8, argv[i], "--help") or std.mem.eql(u8, argv[i], "-h")) {
-            try printUsage();
-            return;
+            parsed.show_help = true;
+            return parsed;
         } else {
-            return fail("unknown flag: {s}", .{argv[i]});
+            if (failure) |f| f.* = .{ .err = error.UnknownFlag, .arg = argv[i] };
+            return error.UnknownFlag;
         }
     }
+    return parsed;
+}
 
-    if (show_version) {
-        try printVersion();
+fn runMain(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
+
+    // Environment first; an explicit --log-level below overrides it.
+    log.initFromEnv(init.environ_map);
+
+    var failure: ParseArgsFailure = .{ .err = error.UnknownFlag };
+    const parsed = parseArgs(argv, &failure) catch |err| switch (err) {
+        error.MissingSocketValue => return fail(io, "missing value for --socket", .{}),
+        error.MissingIdleSecondsValue => return fail(io, "missing value for --idle-seconds", .{}),
+        error.InvalidIdleSecondsValue => return fail(io, "invalid idle timeout value: {s}", .{@errorName(failure.parse_err.?)}),
+        error.MissingLogLevelValue => return fail(io, "missing value for --log-level", .{}),
+        error.InvalidLogLevelValue => return fail(io, "invalid log level: {s} (expected error, warn, info, or debug)", .{failure.arg.?}),
+        error.UnknownFlag => return fail(io, "unknown flag: {s}", .{failure.arg.?}),
+    };
+
+    if (parsed.log_level) |level| log.setLevel(level);
+    if (parsed.show_help) {
+        try printUsage(io);
         return;
     }
+    if (parsed.show_version) {
+        try printVersion(io);
+        return;
+    }
+
+    const idle_timeout_seconds = parsed.idle_timeout_seconds;
+    const explicit_socket_path = parsed.explicit_socket_path;
 
     const path = if (explicit_socket_path) |value|
         try allocator.dupe(u8, value)
     else
-        try socketPath(allocator);
+        try socketPath(allocator, init.environ_map);
     defer allocator.free(path);
 
     // Before the lock file or parent directory is created: a path bind(2) can
     // never accept must not leave anything behind.
     validateSocketPath(path) catch |err| {
-        reportSocketPathTooLong(path);
+        reportSocketPathTooLong(io, path);
         return err;
     };
 
@@ -103,18 +155,18 @@ fn runMain() !void {
     resetSigchldDisposition();
     installShutdownHandlers();
 
-    var start_lock: ?StartLock = try acquireStartLock(allocator, path);
+    var start_lock: ?StartLock = try acquireStartLock(allocator, io, path);
     defer if (start_lock) |*lock| lock.release();
 
     // If a server came up while we waited for the lock, this daemon instance
     // has nothing to do. Exiting successfully mirrors tmux's start-server
     // race behavior without unlinking another server's live socket.
-    if (socketPathExists(path) and waitForSocketAcceptsConnection(path, startup_probe_timeout_ms)) {
+    if (socketPathExists(io, path) and waitForSocketAcceptsConnection(io, path, startup_probe_timeout_ms)) {
         log.info("daemon_already_running", .{ .socket_path = path });
         return;
     }
 
-    var server = try server_mod.Server.init(allocator, path, idle_timeout_seconds);
+    var server = try server_mod.Server.init(allocator, io, path, idle_timeout_seconds);
     defer server.deinit();
     if (start_lock) |*lock| {
         lock.release();
@@ -125,7 +177,7 @@ fn runMain() !void {
     defer if (pid_file_path) |pid_path| allocator.free(pid_path);
     var pid_file_written = false;
     if (pid_file_path) |pid_path| {
-        if (writePidFile(allocator, pid_path)) {
+        if (writePidFile(allocator, io, pid_path)) {
             pid_file_written = true;
         } else |err| {
             // The pid file is advisory; failing after the socket is bound
@@ -136,7 +188,7 @@ fn runMain() !void {
         }
     }
     defer if (pid_file_written) {
-        if (pid_file_path) |pid_path| deletePidFile(pid_path);
+        if (pid_file_path) |pid_path| deletePidFile(io, pid_path);
     };
 
     log.info("daemon_start", .{
@@ -187,22 +239,25 @@ fn socketPathTooLongMessage(buf: []u8, socket_path: []const u8) []const u8 {
     ) catch "zmuxd: socket path is too long for a Unix socket\n";
 }
 
-fn reportSocketPathTooLong(socket_path: []const u8) void {
+fn reportSocketPathTooLong(io: std.Io, socket_path: []const u8) void {
     log.err("socket_path_too_long", .{
         .socket_path_len = socket_path.len,
         .max_socket_path_len = server_mod.max_socket_path_len,
     });
     var buf: [std.fs.max_path_bytes + 256]u8 = undefined;
-    std.fs.File.stderr().writeAll(socketPathTooLongMessage(&buf, socket_path)) catch {};
+    std.Io.File.stderr().writeStreamingAll(io, socketPathTooLongMessage(&buf, socket_path)) catch {};
 }
 
-pub fn socketPath(allocator: std.mem.Allocator) ![]u8 {
+/// Default socket path: `$ZMUX_SOCKET`, `$SMITHERS_SESSION_SOCKET`,
+/// `$XDG_RUNTIME_DIR/smithers-sessions.sock`, `$HOME/.smithers/sessions.sock`,
+/// then `/tmp/zmux-<euid>/sessions.sock`. Pass `std.process.Init.environ_map`.
+pub fn socketPath(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]u8 {
     return socketPathFromEnv(
         allocator,
-        std.posix.getenv("ZMUX_SOCKET"),
-        std.posix.getenv("SMITHERS_SESSION_SOCKET"),
-        std.posix.getenv("XDG_RUNTIME_DIR"),
-        std.posix.getenv("HOME"),
+        environ.get("ZMUX_SOCKET"),
+        environ.get("SMITHERS_SESSION_SOCKET"),
+        environ.get("XDG_RUNTIME_DIR"),
+        environ.get("HOME"),
     );
 }
 
@@ -226,7 +281,7 @@ fn socketPathFromEnv(
         if (home_path.len > 0) return std.fs.path.join(allocator, &.{ home_path, ".smithers", "sessions.sock" });
     }
 
-    const fallback_dir = try std.fmt.allocPrint(allocator, "/tmp/zmux-{d}", .{std.posix.geteuid()});
+    const fallback_dir = try std.fmt.allocPrint(allocator, "/tmp/zmux-{d}", .{sys.geteuid()});
     defer allocator.free(fallback_dir);
     return std.fs.path.join(allocator, &.{ fallback_dir, "sessions.sock" });
 }
@@ -235,61 +290,59 @@ fn pidPath(allocator: std.mem.Allocator, active_socket_path: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}.pid", .{active_socket_path});
 }
 
-fn writePidFile(allocator: std.mem.Allocator, path: []const u8) !void {
-    if (std.fs.path.dirname(path)) |parent| {
-        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
-    }
+fn writePidFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    try ensureParent(io, path);
 
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp.{}", .{ path, std.c.getpid() });
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp.{}", .{ path, sys.getpid() });
     defer allocator.free(tmp_path);
-    errdefer std.fs.deleteFileAbsolute(tmp_path) catch {};
+    errdefer std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
 
-    var file = try std.fs.createFileAbsolute(tmp_path, .{
+    var file = try std.Io.Dir.createFileAbsolute(io, tmp_path, .{
         .truncate = true,
         .exclusive = true,
-        .mode = 0o600,
+        .permissions = .fromMode(0o600),
     });
     var file_open = true;
-    defer if (file_open) file.close();
+    defer if (file_open) file.close(io);
 
-    const text = try std.fmt.allocPrint(allocator, "{}\n", .{std.c.getpid()});
+    const text = try std.fmt.allocPrint(allocator, "{}\n", .{sys.getpid()});
     defer allocator.free(text);
-    try file.writeAll(text);
-    try file.sync();
-    file.close();
+    try file.writeStreamingAll(io, text);
+    try file.sync(io);
+    file.close(io);
     file_open = false;
-    try std.fs.renameAbsolute(tmp_path, path);
+    try std.Io.Dir.renameAbsolute(tmp_path, path, io);
 }
 
-fn deletePidFile(path: []const u8) void {
-    std.fs.deleteFileAbsolute(path) catch {};
+fn deletePidFile(io: std.Io, path: []const u8) void {
+    std.Io.Dir.deleteFileAbsolute(io, path) catch {};
 }
 
-fn acquireStartLock(allocator: std.mem.Allocator, socket_path: []const u8) !StartLock {
+fn acquireStartLock(allocator: std.mem.Allocator, io: std.Io, socket_path: []const u8) !StartLock {
     const lock_path = try std.fmt.allocPrint(allocator, "{s}.lock", .{socket_path});
     errdefer allocator.free(lock_path);
 
-    try ensureParent(lock_path);
-    const file = try std.fs.createFileAbsolute(lock_path, .{
+    try ensureParent(io, lock_path);
+    const file = try std.Io.Dir.createFileAbsolute(io, lock_path, .{
         .truncate = false,
-        .mode = 0o600,
+        .permissions = .fromMode(0o600),
         .lock = .exclusive,
     });
-    errdefer file.close();
+    errdefer file.close(io);
 
     return .{
+        .io = io,
         .file = file,
         .path = lock_path,
         .allocator = allocator,
     };
 }
 
-fn ensureParent(path: []const u8) !void {
+fn ensureParent(io: std.Io, path: []const u8) !void {
     const parent = std.fs.path.dirname(path) orelse return;
-    std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+    // 0755 matches Zig 0.15 `std.fs.makeDirAbsolute`; Zig 0.17's `.default_dir`
+    // is 0777 and would leave the directory world-writable under umask 0.
+    std.Io.Dir.createDirAbsolute(io, parent, .fromMode(0o755)) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -307,11 +360,11 @@ const SocketProbe = enum {
 };
 
 fn probeSocketConnection(socket_path: []const u8) SocketProbe {
-    const fd = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0) catch return .retry;
-    defer std.posix.close(fd);
+    const address = sys.UnixAddress.init(socket_path) catch return .dead;
+    const fd = sys.unixStreamSocket() catch return .retry;
+    defer sys.close(fd);
 
-    const address = std.net.Address.initUnix(socket_path) catch return .dead;
-    std.posix.connect(fd, &address.any, address.getOsSockLen()) catch |err| switch (err) {
+    sys.connect(fd, &address) catch |err| switch (err) {
         // ECONNREFUSED / ENOENT: the daemon that bound this socket is gone or
         // the file vanished. Both are definitive stale-socket signals.
         error.ConnectionRefused, error.FileNotFound => return .dead,
@@ -324,8 +377,8 @@ fn socketAcceptsConnection(socket_path: []const u8) bool {
     return probeSocketConnection(socket_path) == .live;
 }
 
-fn waitForSocketAcceptsConnection(socket_path: []const u8, timeout_ms: i64) bool {
-    const deadline_ms = std.time.milliTimestamp() + timeout_ms;
+fn waitForSocketAcceptsConnection(io: std.Io, socket_path: []const u8, timeout_ms: i64) bool {
+    const deadline = std.Io.Clock.awake.now(io).addDuration(.fromMilliseconds(timeout_ms));
     while (true) {
         switch (probeSocketConnection(socket_path)) {
             .live => return true,
@@ -335,20 +388,18 @@ fn waitForSocketAcceptsConnection(socket_path: []const u8, timeout_ms: i64) bool
             .dead => return false,
             .retry => {},
         }
-        if (std.time.milliTimestamp() >= deadline_ms) return false;
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        if (std.Io.Clock.awake.now(io).compare(.gte, deadline)) return false;
+        io.sleep(.fromMilliseconds(50), .awake) catch return false;
     }
 }
 
-fn socketPathExists(socket_path: []const u8) bool {
-    std.fs.accessAbsolute(socket_path, .{}) catch return false;
+fn socketPathExists(io: std.Io, socket_path: []const u8) bool {
+    std.Io.Dir.accessAbsolute(io, socket_path, .{}) catch return false;
     return true;
 }
 
-fn printUsage() !void {
-    var buffer: [1024]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&buffer);
-    try stdout.interface.writeAll(
+fn printUsage(io: std.Io) !void {
+    try std.Io.File.stdout().writeStreamingAll(io,
         \\Usage: zmuxd [--socket PATH] [--idle-seconds SECONDS] [--log-level LEVEL]
         \\       smithers-session-daemon [--socket PATH] [--idle-seconds SECONDS] [--log-level LEVEL]
         \\
@@ -362,19 +413,15 @@ fn printUsage() !void {
         \\  -h, --help              Print this help and exit
         \\
     );
-    try stdout.interface.flush();
 }
 
-fn printVersion() !void {
-    var buf: [64]u8 = undefined;
-    var out = std.fs.File.stdout().writer(&buf);
-    try out.interface.print("zmuxd {s}\n", .{protocol.version});
-    try out.interface.flush();
+fn printVersion(io: std.Io) !void {
+    try std.Io.File.stdout().writeStreamingAll(io, "zmuxd " ++ protocol.version ++ "\n");
 }
 
-fn fail(comptime fmt: []const u8, args: anytype) error{InvalidArguments} {
+fn fail(io: std.Io, comptime fmt: []const u8, args: anytype) error{InvalidArguments} {
     var buf: [1024]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.Io.File.stderr().writerStreaming(io, &buf);
     w.interface.print("zmuxd: " ++ fmt ++ "\n", args) catch {};
     w.interface.print("Try 'zmuxd --help' for usage.\n", .{}) catch {};
     w.interface.flush() catch {};
@@ -385,7 +432,7 @@ fn shutdownRequested() bool {
     return shutdown_requested.load(.seq_cst);
 }
 
-fn shutdownSignalHandler(_: c_int) callconv(.c) void {
+fn shutdownSignalHandler(_: std.posix.SIG) callconv(.c) void {
     shutdown_requested.store(true, .seq_cst);
 }
 
@@ -395,30 +442,41 @@ fn detachFromControllingTerminal() void {
 }
 
 fn resetSigchldDisposition() void {
-    var act: std.posix.Sigaction = undefined;
-    @memset(std.mem.asBytes(&act), 0);
-    act.handler = .{ .handler = null };
-    act.mask = std.mem.zeroes(std.posix.sigset_t);
-    act.flags = 0;
-    std.posix.sigaction(std.c.SIG.CHLD, &act, null);
+    const act: std.posix.Sigaction = .{
+        .handler = .{ .handler = std.posix.SIG.DFL },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.CHLD, &act, null);
 }
 
 fn installShutdownHandlers() void {
-    var act: std.posix.Sigaction = undefined;
-    @memset(std.mem.asBytes(&act), 0);
-    act.handler = .{ .handler = shutdownSignalHandler };
-    act.mask = std.mem.zeroes(std.posix.sigset_t);
-    act.flags = 0;
-    std.posix.sigaction(std.c.SIG.TERM, &act, null);
-    std.posix.sigaction(std.c.SIG.INT, &act, null);
+    const act: std.posix.Sigaction = .{
+        .handler = .{ .handler = shutdownSignalHandler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.TERM, &act, null);
+    std.posix.sigaction(.INT, &act, null);
 
-    var ignore_hup: std.posix.Sigaction = undefined;
-    @memset(std.mem.asBytes(&ignore_hup), 0);
-    ignore_hup.handler = .{ .handler = std.posix.SIG.IGN };
-    ignore_hup.mask = std.mem.zeroes(std.posix.sigset_t);
-    ignore_hup.flags = 0;
-    std.posix.sigaction(std.c.SIG.HUP, &ignore_hup, null);
+    const ignore_hup: std.posix.Sigaction = .{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.HUP, &ignore_hup, null);
 }
+
+const test_io = std.testing.io;
+
+/// Internal hooks exposed for the repository's own fuzz suites.
+pub const fuzz_hooks = struct {
+    pub const socketPathFromEnvFn = socketPathFromEnv;
+    pub const validateSocketPathFn = validateSocketPath;
+    pub const socketPathTooLongMessageFn = socketPathTooLongMessage;
+    pub const pidPathFn = pidPath;
+    pub const parseArgsFn = parseArgs;
+};
 
 test "socket path falls back to HOME/.smithers when HOME is provided" {
     const path = try socketPathFromEnv(std.testing.allocator, null, null, null, "/tmp/daemon-home-sim");
@@ -430,7 +488,7 @@ test "socket path falls back to HOME/.smithers when HOME is provided" {
 test "socket path falls back to uid-scoped /tmp directory when HOME is unavailable" {
     const path = try socketPathFromEnv(std.testing.allocator, null, null, null, null);
     defer std.testing.allocator.free(path);
-    const expected = try std.fmt.allocPrint(std.testing.allocator, "/tmp/zmux-{d}/sessions.sock", .{std.posix.geteuid()});
+    const expected = try std.fmt.allocPrint(std.testing.allocator, "/tmp/zmux-{d}/sessions.sock", .{sys.geteuid()});
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, path);
 }
@@ -441,7 +499,7 @@ test "stale unix socket is rejected immediately during startup probe" {
     const allocator = std.testing.allocator;
     const seed = try std.testing.allocator.alloc(u8, 16);
     defer allocator.free(seed);
-    std.crypto.random.bytes(seed);
+    test_io.random(seed);
     const nonce = std.mem.readInt(u64, seed[0..8], .little);
     const root = switch (builtin.os.tag) {
         .macos, .ios, .tvos, .watchos, .visionos => "/private/tmp",
@@ -449,24 +507,24 @@ test "stale unix socket is rejected immediately during startup probe" {
     };
     const path = try std.fmt.allocPrint(allocator, "{s}/zmx-stale-{x:0>16}.sock", .{ root, nonce });
     defer allocator.free(path);
-    defer std.fs.deleteFileAbsolute(path) catch {};
-    std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
+    defer std.Io.Dir.deleteFileAbsolute(test_io, path) catch {};
+    std.Io.Dir.deleteFileAbsolute(test_io, path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
 
-    const address = try std.net.Address.initUnix(path);
-    const listener = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
-    std.posix.bind(listener, &address.any, address.getOsSockLen()) catch |err| switch (err) {
+    const address = try sys.UnixAddress.init(path);
+    const listener = try sys.unixStreamSocket();
+    sys.bind(listener, &address) catch |err| switch (err) {
         error.AccessDenied => return error.SkipZigTest,
         else => return err,
     };
-    try std.posix.listen(listener, 1);
-    std.posix.close(listener);
+    try sys.listen(listener, 1);
+    sys.close(listener);
 
-    const start = std.time.milliTimestamp();
-    try std.testing.expect(!waitForSocketAcceptsConnection(path, startup_probe_timeout_ms));
-    const elapsed_ms = std.time.milliTimestamp() - start;
+    const start = std.Io.Clock.awake.now(test_io);
+    try std.testing.expect(!waitForSocketAcceptsConnection(test_io, path, startup_probe_timeout_ms));
+    const elapsed_ms = start.untilNow(test_io, .awake).toMilliseconds();
     try std.testing.expect(elapsed_ms < 500);
 }
 
@@ -474,7 +532,7 @@ test "socketAcceptsConnection detects a listening unix socket" {
     if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
 
     var seed: [8]u8 = undefined;
-    std.crypto.random.bytes(&seed);
+    test_io.random(&seed);
     const nonce = std.mem.readInt(u64, &seed, .little);
     const root = switch (builtin.os.tag) {
         .macos, .ios, .tvos, .watchos, .visionos => "/private/tmp",
@@ -482,24 +540,29 @@ test "socketAcceptsConnection detects a listening unix socket" {
     };
     const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/zmx-live-{x:0>16}.sock", .{ root, nonce });
     defer std.testing.allocator.free(path);
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(test_io, path) catch {};
 
-    const address = try std.net.Address.initUnix(path);
-    const listener = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
-    defer std.posix.close(listener);
-    std.posix.bind(listener, &address.any, address.getOsSockLen()) catch |err| switch (err) {
+    const address = try sys.UnixAddress.init(path);
+    const listener = try sys.unixStreamSocket();
+    defer sys.close(listener);
+    sys.bind(listener, &address) catch |err| switch (err) {
         error.AccessDenied => return error.SkipZigTest,
         else => return err,
     };
-    try std.posix.listen(listener, 1);
+    try sys.listen(listener, 1);
 
     try std.testing.expect(socketAcceptsConnection(path));
 }
 
+/// Comptime `[n]u8` filled with `byte` (Zig 0.17 removed the `**` operator).
+fn repeatedByte(comptime byte: u8, comptime n: usize) [n]u8 {
+    return @splat(byte);
+}
+
 test "validateSocketPath accepts the sun_path limit and rejects one byte more" {
     const max = server_mod.max_socket_path_len;
-    const at_limit = "/" ++ "s" ** (max - 1);
-    const too_long = "/" ++ "s" ** max;
+    const at_limit = "/" ++ repeatedByte('s', max - 1);
+    const too_long = "/" ++ repeatedByte('s', max);
     try std.testing.expectEqual(max, at_limit.len);
     try validateSocketPath(at_limit);
     try validateSocketPath("/tmp/zmux-test.sock");
@@ -508,7 +571,7 @@ test "validateSocketPath accepts the sun_path limit and rejects one byte more" {
 
 test "socket path too long message states the actual and maximum byte lengths" {
     const max = server_mod.max_socket_path_len;
-    const too_long = "/" ++ "s" ** (max + 20);
+    const too_long = "/" ++ repeatedByte('s', max + 20);
     var buf: [std.fs.max_path_bytes + 256]u8 = undefined;
     const message = socketPathTooLongMessage(&buf, too_long);
 
@@ -521,7 +584,7 @@ test "socket path too long message states the actual and maximum byte lengths" {
 
 test "derived lock and pid paths stay within PATH_MAX for any valid socket path" {
     const max = server_mod.max_socket_path_len;
-    const at_limit = "/" ++ "s" ** (max - 1);
+    const at_limit = "/" ++ repeatedByte('s', max - 1);
     const pid_path = try pidPath(std.testing.allocator, at_limit);
     defer std.testing.allocator.free(pid_path);
     try std.testing.expect(pid_path.len + ".tmp.".len + 20 < std.fs.max_path_bytes);
@@ -532,17 +595,17 @@ test "pid file write failure is reported as an error instead of being swallowed"
     if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
 
     var seed: [8]u8 = undefined;
-    std.crypto.random.bytes(&seed);
+    test_io.random(&seed);
     const nonce = std.mem.readInt(u64, &seed, .little);
     // The parent is a regular file, so neither mkdir nor create can succeed.
     const blocker = try std.fmt.allocPrint(std.testing.allocator, "/tmp/zmx-pid-blocker-{x:0>16}", .{nonce});
     defer std.testing.allocator.free(blocker);
-    defer std.fs.deleteFileAbsolute(blocker) catch {};
-    (try std.fs.createFileAbsolute(blocker, .{})).close();
+    defer std.Io.Dir.deleteFileAbsolute(test_io, blocker) catch {};
+    (try std.Io.Dir.createFileAbsolute(test_io, blocker, .{})).close(test_io);
 
     const pid_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/sessions.sock.pid", .{blocker});
     defer std.testing.allocator.free(pid_path);
-    if (writePidFile(std.testing.allocator, pid_path)) {
+    if (writePidFile(std.testing.allocator, test_io, pid_path)) {
         return error.TestExpectedError;
     } else |_| {}
 }
@@ -557,7 +620,7 @@ test "pid file write is atomic and cleanly removable" {
     if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
 
     var seed: [8]u8 = undefined;
-    std.crypto.random.bytes(&seed);
+    test_io.random(&seed);
     const nonce = std.mem.readInt(u64, &seed, .little);
     const root = switch (builtin.os.tag) {
         .macos, .ios, .tvos, .watchos, .visionos => "/private/tmp",
@@ -565,41 +628,39 @@ test "pid file write is atomic and cleanly removable" {
     };
     const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/zmx-pid-{x:0>16}.sock.pid", .{ root, nonce });
     defer std.testing.allocator.free(path);
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(test_io, path) catch {};
 
-    try writePidFile(std.testing.allocator, path);
-    var file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
-    const text = try file.readToEndAlloc(std.testing.allocator, 64);
+    try writePidFile(std.testing.allocator, test_io, path);
+    const text = try std.Io.Dir.cwd().readFileAlloc(test_io, path, std.testing.allocator, .limited(64));
     defer std.testing.allocator.free(text);
 
-    const expected = try std.fmt.allocPrint(std.testing.allocator, "{}\n", .{std.c.getpid()});
+    const expected = try std.fmt.allocPrint(std.testing.allocator, "{}\n", .{sys.getpid()});
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, text);
 
-    deletePidFile(path);
-    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(path, .{}));
+    deletePidFile(test_io, path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(test_io, path, .{}));
 }
 
 test "resetSigchldDisposition restores default SIGCHLD handling" {
     if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
 
     var old_action: std.posix.Sigaction = undefined;
-    std.posix.sigaction(std.c.SIG.CHLD, null, &old_action);
-    defer std.posix.sigaction(std.c.SIG.CHLD, &old_action, null);
+    std.posix.sigaction(.CHLD, null, &old_action);
+    defer std.posix.sigaction(.CHLD, &old_action, null);
 
-    var ignored: std.posix.Sigaction = undefined;
-    @memset(std.mem.asBytes(&ignored), 0);
-    ignored.handler = .{ .handler = std.posix.SIG.IGN };
-    ignored.mask = std.mem.zeroes(std.posix.sigset_t);
-    ignored.flags = 0;
-    std.posix.sigaction(std.c.SIG.CHLD, &ignored, null);
+    const ignored: std.posix.Sigaction = .{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.CHLD, &ignored, null);
 
     resetSigchldDisposition();
 
     var current: std.posix.Sigaction = undefined;
-    std.posix.sigaction(std.c.SIG.CHLD, null, &current);
-    try std.testing.expect(current.handler.handler == null);
+    std.posix.sigaction(.CHLD, null, &current);
+    try std.testing.expect(current.handler.handler == std.posix.SIG.DFL);
 }
 
 test {
@@ -610,4 +671,5 @@ test {
     std.testing.refAllDecls(@import("protocol.zig"));
     std.testing.refAllDecls(@import("pty.zig"));
     std.testing.refAllDecls(@import("server.zig"));
+    std.testing.refAllDecls(@import("sys.zig"));
 }

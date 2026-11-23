@@ -398,8 +398,11 @@ const RemovedItems = struct {
 
 pub const Manager = struct {
     allocator: Allocator,
+    /// Shared with every spawned `NativeSession`; supplies mutexes, clocks,
+    /// and sleeps.
+    io: std.Io,
     event_sink: ?native_mod.EventSink = null,
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
     sessions: std.ArrayList(*Session) = .empty,
     clients: std.ArrayList(*Client) = .empty,
     key_bindings: std.ArrayList(KeyBinding) = .empty,
@@ -409,8 +412,8 @@ pub const Manager = struct {
     next_split_id: usize = 0,
     next_client_id: usize = 0,
 
-    pub fn init(allocator: Allocator, event_sink: ?native_mod.EventSink) Manager {
-        return .{ .allocator = allocator, .event_sink = event_sink };
+    pub fn init(allocator: Allocator, io: std.Io, event_sink: ?native_mod.EventSink) Manager {
+        return .{ .allocator = allocator, .io = io, .event_sink = event_sink };
     }
 
     pub fn deinit(self: *Manager) void {
@@ -422,8 +425,8 @@ pub const Manager = struct {
     }
 
     pub fn count(self: *Manager) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         var total: usize = 0;
         for (self.sessions.items) |session| {
             for (session.windows.items) |window| {
@@ -436,14 +439,14 @@ pub const Manager = struct {
     }
 
     pub fn sessionCount(self: *Manager) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.sessions.items.len;
     }
 
     pub fn paneCount(self: *Manager) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.paneSlotCountLocked();
     }
 
@@ -455,8 +458,8 @@ pub const Manager = struct {
     }
 
     pub fn createSessionPane(self: *Manager, opts: CreateOptions) !*Pane {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         const session_id = try self.nextIdLocked("sess", &self.next_session_id);
         errdefer self.allocator.free(session_id);
@@ -516,8 +519,8 @@ pub const Manager = struct {
     }
 
     pub fn newWindow(self: *Manager, session_id: []const u8, opts: CreateOptions) !*Pane {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         const session = self.findSessionLocked(session_id) orelse return error.SessionNotFound;
         const window_id = try self.nextIdLocked("win", &self.next_window_id);
@@ -567,8 +570,8 @@ pub const Manager = struct {
     }
 
     pub fn splitPane(self: *Manager, target_pane_id: []const u8, axis: Axis, opts: CreateOptions) !*Pane {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         const found = self.findPaneWithParentsLocked(target_pane_id) orelse return error.PaneNotFound;
         const pane_id = try self.nextIdLocked("pane", &self.next_pane_id);
@@ -603,8 +606,8 @@ pub const Manager = struct {
     }
 
     pub fn selectPane(self: *Manager, pane_id: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         const found = self.findPaneWithParentsLocked(pane_id) orelse return error.PaneNotFound;
         try replaceOwnedString(self.allocator, &found.window.active_pane_id, found.pane.id);
@@ -612,30 +615,30 @@ pub const Manager = struct {
     }
 
     pub fn selectWindow(self: *Manager, window_id: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         const found = self.findWindowWithParentLocked(window_id) orelse return error.WindowNotFound;
         try replaceOwnedString(self.allocator, &found.session.active_window_id, found.window.id);
     }
 
     pub fn renameSession(self: *Manager, session_id: []const u8, title: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const session = self.resolveTargetSessionLocked(session_id) orelse return error.SessionNotFound;
         try replaceOwnedString(self.allocator, &session.name, title);
     }
 
     pub fn renameWindow(self: *Manager, window_id: []const u8, title: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const found = self.findWindowWithParentLocked(window_id) orelse return error.WindowNotFound;
         try replaceOwnedString(self.allocator, &found.window.name, title);
     }
 
     pub fn renamePane(self: *Manager, pane_id: []const u8, title: []const u8, custom: bool) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const pane = self.findPaneLocked(pane_id) orelse return error.PaneNotFound;
         try replaceOwnedString(self.allocator, &pane.title, title);
         pane.has_custom_title = custom;
@@ -645,14 +648,14 @@ pub const Manager = struct {
         var old_native: *NativeSession = undefined;
         var new_native: *NativeSession = undefined;
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         {
             const pane = self.findPaneLocked(pane_id) orelse {
-                self.mutex.unlock();
+                self.mutex.unlock(self.io);
                 return error.PaneNotFound;
             };
-            new_native = NativeSession.create(self.allocator, pane.spawn.nativeOptions(pane.id, self.event_sink)) catch |err| {
-                self.mutex.unlock();
+            new_native = NativeSession.create(self.allocator, self.io, pane.spawn.nativeOptions(pane.id, self.event_sink)) catch |err| {
+                self.mutex.unlock(self.io);
                 return err;
             };
             old_native = pane.native;
@@ -660,21 +663,21 @@ pub const Manager = struct {
             pane.alerts.exited = false;
             new_native.retain();
         }
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
 
         old_native.stopForOwnerRelease();
         old_native.destroy();
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         if (self.findPaneLocked(pane_id)) |pane| {
             if (pane.native == new_native) pane.alerts.exited = false;
         }
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
         return new_native;
     }
 
     pub fn attachClient(self: *Manager, target_pane_id: []const u8, rows: u16, cols: u16) !ClientSnapshot {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         const found = self.resolveTargetPaneLocked(target_pane_id) orelse return error.PaneNotFound;
         try found.pane.native.resize(cols, rows);
@@ -726,9 +729,9 @@ pub const Manager = struct {
     }
 
     pub fn reapExitedPanes(self: *Manager) void {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         const natives = self.allocator.alloc(*NativeSession, self.paneSlotCountLocked()) catch {
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             return;
         };
         var count_used: usize = 0;
@@ -741,7 +744,7 @@ pub const Manager = struct {
                 }
             }
         }
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
         defer self.allocator.free(natives);
 
         for (natives[0..count_used]) |native| {
@@ -751,21 +754,21 @@ pub const Manager = struct {
     }
 
     pub fn paneScrollbackSnapshot(self: *Manager, allocator: Allocator, pane_id: []const u8) ![]u8 {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         const pane = self.findPaneLocked(pane_id) orelse {
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             return error.PaneNotFound;
         };
         const native = pane.native;
         native.retain();
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
         defer native.release();
         return native.scrollbackSnapshot(allocator);
     }
 
     pub fn detachClient(self: *Manager, client_id: []const u8) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         for (self.clients.items, 0..) |client, index| {
             if (std.mem.eql(u8, client.id, client_id)) {
@@ -778,8 +781,8 @@ pub const Manager = struct {
     }
 
     pub fn switchClient(self: *Manager, client_id: []const u8, pane_id: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         const client = self.findClientLocked(client_id) orelse return error.ClientNotFound;
         const found = self.findPaneWithParentsLocked(pane_id) orelse return error.PaneNotFound;
@@ -790,30 +793,36 @@ pub const Manager = struct {
     }
 
     pub fn bindKey(self: *Manager, table: []const u8, key: []const u8, command: []const u8, repeat: bool) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         for (self.key_bindings.items) |*binding| {
             if (std.mem.eql(u8, binding.table, table) and std.mem.eql(u8, binding.key, key)) {
-                self.allocator.free(binding.command);
-                binding.command = try self.allocator.dupe(u8, command);
+                try replaceOwnedString(self.allocator, &binding.command, command);
                 binding.repeat = repeat;
                 return;
             }
         }
 
+        const owned_table = try self.allocator.dupe(u8, table);
+        errdefer self.allocator.free(owned_table);
+        const owned_key = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(owned_key);
+        const owned_command = try self.allocator.dupe(u8, command);
+        errdefer self.allocator.free(owned_command);
+
         try self.key_bindings.append(self.allocator, .{
-            .table = try self.allocator.dupe(u8, table),
-            .key = try self.allocator.dupe(u8, key),
-            .command = try self.allocator.dupe(u8, command),
+            .table = owned_table,
+            .key = owned_key,
+            .command = owned_command,
             .repeat = repeat,
         });
     }
 
     pub fn executeBinding(self: *Manager, table: []const u8, key: []const u8, target_pane_id: []const u8) !?[]u8 {
         const command = blk: {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             for (self.key_bindings.items) |binding| {
                 if (std.mem.eql(u8, binding.table, table) and std.mem.eql(u8, binding.key, key)) {
                     break :blk try self.allocator.dupe(u8, binding.command);
@@ -826,12 +835,39 @@ pub const Manager = struct {
         return command;
     }
 
-    pub fn executeCommandLine(self: *Manager, line: []const u8, target_pane_id: []const u8) !void {
+    pub const ParsedCommand = union(enum) {
+        noop,
+        split_window: struct {
+            axis: Axis,
+            command: ?[]u8,
+        },
+        new_window: struct {
+            title: ?[]u8,
+            command: ?[]u8,
+        },
+        respawn_pane,
+
+        pub fn deinit(self: *ParsedCommand, allocator: Allocator) void {
+            switch (self.*) {
+                .noop, .respawn_pane => {},
+                .split_window => |split| {
+                    if (split.command) |cmd| allocator.free(cmd);
+                },
+                .new_window => |nw| {
+                    if (nw.title) |t| allocator.free(t);
+                    if (nw.command) |cmd| allocator.free(cmd);
+                },
+            }
+            self.* = .noop;
+        }
+    };
+
+    pub fn parseCommandLine(allocator: Allocator, line: []const u8) !ParsedCommand {
         var iter = std.mem.tokenizeScalar(u8, line, ' ');
-        const command = iter.next() orelse return;
+        const command = iter.next() orelse return .noop;
         if (std.mem.eql(u8, command, "split-window") or std.mem.eql(u8, command, "splitw")) {
             var axis: Axis = .vertical;
-            var command_buffer: std.Io.Writer.Allocating = .init(self.allocator);
+            var command_buffer: std.Io.Writer.Allocating = .init(allocator);
             defer command_buffer.deinit();
             var collecting_command = false;
             while (iter.next()) |token| {
@@ -847,14 +883,15 @@ pub const Manager = struct {
                 collecting_command = true;
                 try appendCommandToken(&command_buffer.writer, token);
             }
-            _ = try self.splitPane(target_pane_id, axis, .{
-                .command = if (command_buffer.written().len > 0) command_buffer.written() else null,
-            });
-            return;
+            const owned_cmd: ?[]u8 = if (command_buffer.written().len > 0)
+                try command_buffer.toOwnedSlice()
+            else
+                null;
+            return .{ .split_window = .{ .axis = axis, .command = owned_cmd } };
         }
         if (std.mem.eql(u8, command, "new-window") or std.mem.eql(u8, command, "neww")) {
             var title: ?[]const u8 = null;
-            var command_buffer: std.Io.Writer.Allocating = .init(self.allocator);
+            var command_buffer: std.Io.Writer.Allocating = .init(allocator);
             defer command_buffer.deinit();
             var collecting_command = false;
             while (iter.next()) |token| {
@@ -866,49 +903,134 @@ pub const Manager = struct {
                 collecting_command = true;
                 try appendCommandToken(&command_buffer.writer, token);
             }
-            const found = blk: {
-                self.mutex.lock();
-                defer self.mutex.unlock();
-                const found = self.findPaneWithParentsLocked(target_pane_id) orelse return error.PaneNotFound;
-                break :blk try self.allocator.dupe(u8, found.session.id);
-            };
-            defer self.allocator.free(found);
-            _ = try self.newWindow(found, .{
-                .title = title,
-                .command = if (command_buffer.written().len > 0) command_buffer.written() else null,
-            });
-            return;
+            const owned_title: ?[]u8 = if (title) |t| try allocator.dupe(u8, t) else null;
+            errdefer if (owned_title) |t| allocator.free(t);
+            const owned_cmd: ?[]u8 = if (command_buffer.written().len > 0)
+                try command_buffer.toOwnedSlice()
+            else
+                null;
+            return .{ .new_window = .{ .title = owned_title, .command = owned_cmd } };
         }
         if (std.mem.eql(u8, command, "respawn-pane") or std.mem.eql(u8, command, "respawnp")) {
             if (iter.next() != null) return error.UnsupportedCommand;
-            const native = try self.respawnPane(target_pane_id);
-            native.release();
-            return;
+            return .respawn_pane;
         }
         return error.UnsupportedCommand;
     }
 
+    pub fn executeCommandLine(self: *Manager, line: []const u8, target_pane_id: []const u8) !void {
+        var parsed = try parseCommandLine(self.allocator, line);
+        defer parsed.deinit(self.allocator);
+        switch (parsed) {
+            .noop => return,
+            .split_window => |split| {
+                _ = try self.splitPane(target_pane_id, split.axis, .{
+                    .command = split.command,
+                });
+            },
+            .new_window => |nw| {
+                const found = blk: {
+                    self.mutex.lockUncancelable(self.io);
+                    defer self.mutex.unlock(self.io);
+                    const found = self.findPaneWithParentsLocked(target_pane_id) orelse return error.PaneNotFound;
+                    break :blk try self.allocator.dupe(u8, found.session.id);
+                };
+                defer self.allocator.free(found);
+                _ = try self.newWindow(found, .{
+                    .title = nw.title,
+                    .command = nw.command,
+                });
+            },
+            .respawn_pane => {
+                const native = try self.respawnPane(target_pane_id);
+                native.release();
+            },
+        }
+    }
+
+    /// Assert all internal structural invariants of the mux state graph.
+    /// Intended for stateful fuzz and model-checking suites.
+    pub fn checkInvariants(self: *Manager, allocator: Allocator) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        var seen_sessions = std.StringHashMap(void).init(allocator);
+        defer seen_sessions.deinit();
+        var seen_windows = std.StringHashMap(void).init(allocator);
+        defer seen_windows.deinit();
+        var seen_panes = std.StringHashMap(void).init(allocator);
+        defer seen_panes.deinit();
+        var seen_clients = std.StringHashMap(void).init(allocator);
+        defer seen_clients.deinit();
+
+        for (self.sessions.items) |session| {
+            if ((try seen_sessions.fetchPut(session.id, {})) != null) return error.DuplicateSessionId;
+            if (session.windows.items.len == 0) return error.EmptySession;
+
+            var active_window_found = false;
+            for (session.windows.items) |window| {
+                if ((try seen_windows.fetchPut(window.id, {})) != null) return error.DuplicateWindowId;
+                if (!std.mem.eql(u8, window.session_id, session.id)) return error.WindowSessionMismatch;
+                if (std.mem.eql(u8, window.id, session.active_window_id)) active_window_found = true;
+                if (window.panes.items.len == 0) return error.EmptyWindow;
+
+                var layout_leaves = std.StringHashMap(void).init(allocator);
+                defer layout_leaves.deinit();
+                try collectLayoutLeaves(window.layout, &layout_leaves);
+
+                var active_pane_found = false;
+                for (window.panes.items) |pane| {
+                    if ((try seen_panes.fetchPut(pane.id, {})) != null) return error.DuplicatePaneId;
+                    if (!std.mem.eql(u8, pane.session_id, session.id)) return error.PaneSessionMismatch;
+                    if (!std.mem.eql(u8, pane.window_id, window.id)) return error.PaneWindowMismatch;
+                    if (!std.mem.eql(u8, pane.native.id, pane.id)) return error.PaneNativeIdMismatch;
+                    if (std.mem.eql(u8, pane.id, window.active_pane_id)) active_pane_found = true;
+                    if (!layout_leaves.contains(pane.id)) return error.PaneMissingFromLayout;
+                }
+                if (!active_pane_found) return error.DanglingActivePane;
+                if (layout_leaves.count() != window.panes.items.len) return error.LayoutPaneCountMismatch;
+            }
+            if (!active_window_found) return error.DanglingActiveWindow;
+        }
+
+        for (self.clients.items) |client| {
+            if ((try seen_clients.fetchPut(client.id, {})) != null) return error.DuplicateClientId;
+        }
+    }
+
+    fn collectLayoutLeaves(node: *const LayoutNode, leaves: *std.StringHashMap(void)) !void {
+        switch (node.*) {
+            .leaf => |pane_id| {
+                if ((try leaves.fetchPut(pane_id, {})) != null) return error.DuplicateLayoutLeaf;
+            },
+            .split => |split| {
+                try collectLayoutLeaves(split.first, leaves);
+                try collectLayoutLeaves(split.second, leaves);
+            },
+        }
+    }
+
     pub fn markActivity(self: *Manager, pane_id: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.findPaneLocked(pane_id)) |pane| {
             pane.alerts.activity = true;
-            pane.alerts.last_activity_ms = std.time.milliTimestamp();
+            pane.alerts.last_activity_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
         }
     }
 
     pub fn markBell(self: *Manager, pane_id: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.findPaneLocked(pane_id)) |pane| {
             pane.alerts.bell = true;
-            pane.alerts.last_bell_ms = std.time.milliTimestamp();
+            pane.alerts.last_bell_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
         }
     }
 
     pub fn markExited(self: *Manager, pane_id: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.resolveTargetPaneLocked(pane_id)) |found| {
             const pane = found.pane;
             pane.alerts.exited = true;
@@ -916,15 +1038,15 @@ pub const Manager = struct {
     }
 
     pub fn find(self: *Manager, id: []const u8) ?*NativeSession {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const pane = (self.resolveTargetPaneLocked(id) orelse return null).pane;
         pane.native.retain();
         return pane.native;
     }
 
     pub fn terminate(self: *Manager, id: []const u8) bool {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         const removed = if (self.findPaneWithParentsLocked(id)) |found|
             if (found.window.panes.items.len == 1 and found.session.windows.items.len == 1)
                 self.takeSessionLocked(found.session.id)
@@ -933,28 +1055,28 @@ pub const Manager = struct {
         else if (self.findSessionLocked(id)) |session|
             self.takeSessionLocked(session.id)
         else {
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             return false;
         };
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
 
         removed.deinit(self.allocator);
         return true;
     }
 
     pub fn terminateAll(self: *Manager) void {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         var sessions = self.sessions;
         self.sessions = .empty;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
 
         for (sessions.items) |session| session.deinit(self.allocator);
         sessions.deinit(self.allocator);
     }
 
     pub fn listJson(self: *Manager, allocator: Allocator) ![]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         var out: std.Io.Writer.Allocating = .init(allocator);
         errdefer out.deinit();
@@ -980,8 +1102,8 @@ pub const Manager = struct {
     }
 
     pub fn snapshotJson(self: *Manager, allocator: Allocator) ![]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         var out: std.Io.Writer.Allocating = .init(allocator);
         errdefer out.deinit();
@@ -999,8 +1121,8 @@ pub const Manager = struct {
     }
 
     pub fn clientsJson(self: *Manager, allocator: Allocator) ![]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         var out: std.Io.Writer.Allocating = .init(allocator);
         errdefer out.deinit();
@@ -1009,8 +1131,8 @@ pub const Manager = struct {
     }
 
     pub fn keysJson(self: *Manager, allocator: Allocator) ![]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         var out: std.Io.Writer.Allocating = .init(allocator);
         errdefer out.deinit();
@@ -1033,7 +1155,7 @@ pub const Manager = struct {
         const owned_session_id = try self.allocator.dupe(u8, session.id);
         errdefer self.allocator.free(owned_session_id);
 
-        const native = try NativeSession.create(self.allocator, spawn.nativeOptions(pane_id, self.event_sink));
+        const native = try NativeSession.create(self.allocator, self.io, spawn.nativeOptions(pane_id, self.event_sink));
 
         pane.* = .{
             .id = owned_pane_id,
@@ -1050,7 +1172,7 @@ pub const Manager = struct {
 
     fn nextIdLocked(self: *Manager, prefix: []const u8, next: *usize) ![]u8 {
         next.* += 1;
-        return std.fmt.allocPrint(self.allocator, "{s}-{d}-{x}", .{ prefix, next.*, std.time.nanoTimestamp() });
+        return std.fmt.allocPrint(self.allocator, "{s}-{d}-{x}", .{ prefix, next.*, std.Io.Clock.real.now(self.io).nanoseconds });
     }
 
     fn findSessionLocked(self: *Manager, id: []const u8) ?*Session {
@@ -1302,7 +1424,7 @@ fn appendCommandToken(writer: *std.Io.Writer, token: []const u8) !void {
 }
 
 fn createNewWindowAndSplitForFailureTest(allocator: Allocator) !void {
-    var manager = Manager.init(allocator, null);
+    var manager = Manager.init(allocator, std.testing.io, null);
     defer manager.deinit();
 
     const opts: CreateOptions = .{
@@ -1316,7 +1438,7 @@ fn createNewWindowAndSplitForFailureTest(allocator: Allocator) !void {
 }
 
 fn attachClientForFailureTest(allocator: Allocator) !void {
-    var manager = Manager.init(allocator, null);
+    var manager = Manager.init(allocator, std.testing.io, null);
     defer manager.deinit();
 
     const pane = try manager.createSessionPane(.{
@@ -1329,7 +1451,7 @@ fn attachClientForFailureTest(allocator: Allocator) !void {
 }
 
 fn respawnPaneForFailureTest(allocator: Allocator) !void {
-    var manager = Manager.init(allocator, null);
+    var manager = Manager.init(allocator, std.testing.io, null);
     defer manager.deinit();
 
     const pane = try manager.createSessionPane(.{
@@ -1352,7 +1474,7 @@ fn layoutContainsPane(node: *const LayoutNode, pane_id: []const u8) bool {
 }
 
 test "mux manager creates session window and pane state" {
-    var manager = Manager.init(std.testing.allocator, null);
+    var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
     const pane = try manager.createSessionPane(.{ .title = "one", .shell = "/bin/sh", .command = "cat" });
@@ -1367,7 +1489,7 @@ test "mux manager creates session window and pane state" {
 }
 
 test "mux manager splits panes and records layout" {
-    var manager = Manager.init(std.testing.allocator, null);
+    var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
     const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
@@ -1383,7 +1505,7 @@ test "mux manager splits panes and records layout" {
 }
 
 test "removing a nested pane keeps the surviving sibling subtree in layout" {
-    var manager = Manager.init(std.testing.allocator, null);
+    var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
     const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
@@ -1399,8 +1521,8 @@ test "removing a nested pane keeps the surviving sibling subtree in layout" {
     try std.testing.expect(manager.terminate(first_id));
 
     {
-        manager.mutex.lock();
-        defer manager.mutex.unlock();
+        manager.mutex.lockUncancelable(manager.io);
+        defer manager.mutex.unlock(manager.io);
         const window = manager.sessions.items[0].windows.items[0];
         try std.testing.expect(window.layout.* == .split);
         try std.testing.expect(!layoutContainsPane(window.layout, first_id));
@@ -1413,7 +1535,7 @@ test "removing a nested pane keeps the surviving sibling subtree in layout" {
 }
 
 test "attachClient resolves a session name to its active pane" {
-    var manager = Manager.init(std.testing.allocator, null);
+    var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
     const pane = try manager.createSessionPane(.{
@@ -1430,7 +1552,7 @@ test "attachClient resolves a session name to its active pane" {
 }
 
 test "attachClient still resolves an explicit pane id" {
-    var manager = Manager.init(std.testing.allocator, null);
+    var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
     const pane = try manager.createSessionPane(.{
@@ -1447,7 +1569,7 @@ test "attachClient still resolves an explicit pane id" {
 }
 
 test "attachClient on an unknown name returns PaneNotFound" {
-    var manager = Manager.init(std.testing.allocator, null);
+    var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
     _ = try manager.createSessionPane(.{
@@ -1459,7 +1581,7 @@ test "attachClient on an unknown name returns PaneNotFound" {
 }
 
 test "session-targeted APIs resolve pane id session id and session name" {
-    var manager = Manager.init(std.testing.allocator, null);
+    var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
     const pane = try manager.createSessionPane(.{
@@ -1487,7 +1609,7 @@ test "session-targeted APIs resolve pane id session id and session name" {
 }
 
 test "terminate by session id removes the whole session" {
-    var manager = Manager.init(std.testing.allocator, null);
+    var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
     const first = try manager.createSessionPane(.{ .title = "work", .shell = "/bin/sh", .command = "cat" });
@@ -1505,7 +1627,7 @@ test "terminate by session id removes the whole session" {
 }
 
 test "mux key binding executes tmux-like split command" {
-    var manager = Manager.init(std.testing.allocator, null);
+    var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
     const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
@@ -1519,7 +1641,7 @@ test "mux key binding executes tmux-like split command" {
 }
 
 test "command exec split-window passes trailing shell command to new pane" {
-    var manager = Manager.init(std.testing.allocator, null);
+    var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
     const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
@@ -1529,8 +1651,8 @@ test "command exec split-window passes trailing shell command to new pane" {
     try manager.executeCommandLine("split-window -h /bin/echo SPLIT_CMD_RAN", first_id);
 
     {
-        manager.mutex.lock();
-        defer manager.mutex.unlock();
+        manager.mutex.lockUncancelable(manager.io);
+        defer manager.mutex.unlock(manager.io);
         const window = manager.sessions.items[0].windows.items[0];
         const active = manager.findPaneLocked(window.active_pane_id) orelse return error.MissingPane;
         try std.testing.expectEqualStrings("/bin/echo SPLIT_CMD_RAN", active.spawn.command.?);
@@ -1540,7 +1662,7 @@ test "command exec split-window passes trailing shell command to new pane" {
 }
 
 test "command exec new-window honors name and shell command" {
-    var manager = Manager.init(std.testing.allocator, null);
+    var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
     const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
@@ -1550,8 +1672,8 @@ test "command exec new-window honors name and shell command" {
     try manager.executeCommandLine("new-window -n logs /bin/echo NEW_CMD_RAN", first_id);
 
     {
-        manager.mutex.lock();
-        defer manager.mutex.unlock();
+        manager.mutex.lockUncancelable(manager.io);
+        defer manager.mutex.unlock(manager.io);
         const session = manager.sessions.items[0];
         const found = manager.findWindowWithParentLocked(session.active_window_id) orelse return error.MissingWindow;
         try std.testing.expectEqualStrings("logs", found.window.name);
@@ -1560,7 +1682,7 @@ test "command exec new-window honors name and shell command" {
 }
 
 test "command exec rejects unsupported flags instead of dropping them" {
-    var manager = Manager.init(std.testing.allocator, null);
+    var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
     const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
@@ -1574,7 +1696,7 @@ test "command exec rejects unsupported flags instead of dropping them" {
 }
 
 test "switchClient moves a logical client to another pane" {
-    var manager = Manager.init(std.testing.allocator, null);
+    var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
     const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
@@ -1598,7 +1720,7 @@ test "switchClient moves a logical client to another pane" {
 }
 
 test "snapshot omits dead pane silence field and reports attached clients active" {
-    var manager = Manager.init(std.testing.allocator, null);
+    var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
     const pane = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
@@ -1612,7 +1734,7 @@ test "snapshot omits dead pane silence field and reports attached clients active
 }
 
 test "terminating a split pane collapses layout and keeps the remaining pane" {
-    var manager = Manager.init(std.testing.allocator, null);
+    var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
     const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
@@ -1634,7 +1756,7 @@ test "terminating a split pane collapses layout and keeps the remaining pane" {
 }
 
 test "manager create returns a retained native that survives concurrent removal" {
-    var manager = Manager.init(std.testing.allocator, null);
+    var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
     const native = try manager.create(.{ .shell = "/bin/sh", .command = "cat" });
@@ -1650,7 +1772,7 @@ test "manager create returns a retained native that survives concurrent removal"
 }
 
 test "attachClient returns an owned snapshot that survives detach" {
-    var manager = Manager.init(std.testing.allocator, null);
+    var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
     const pane = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
@@ -1664,16 +1786,17 @@ test "attachClient returns an owned snapshot that survives detach" {
 }
 
 test "manager count ignores terminated panes for idle accounting" {
-    var manager = Manager.init(std.testing.allocator, null);
+    var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
     _ = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "true" });
 
-    const deadline = std.time.milliTimestamp() + 2_000;
-    while (std.time.milliTimestamp() < deadline) {
+    const io = std.testing.io;
+    const deadline = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(2));
+    while (std.Io.Clock.awake.now(io).compare(.lt, deadline)) {
         manager.reapExitedPanes();
         if (manager.count() == 0) return;
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
     return error.PaneStillCountedAsLive;
 }
