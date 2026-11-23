@@ -105,23 +105,47 @@ pub const ClientDetachedParams = struct {
     reason: []const u8,
 };
 
-/// Phase 0 stub (T1 owns): depth/node pre-scan, `jsonrpc` validation, batch
-/// and id-type rejection are not enforced yet. std.json syntax failures map to
-/// `error.ParseError`.
+/// Parse one JSON-RPC 2.0 request line.
+///
+/// The raw bytes are pre-scanned for container depth (`max_json_depth`) and
+/// value count (`max_json_nodes`) before any value tree is built, so a deeply
+/// nested or node-heavy request inside the line-size limit cannot exhaust the
+/// stack or the heap. Either bound returns `error.NestingTooDeep`.
+///
+/// Envelope rules:
+///   * A top-level array is a batch and returns `error.BatchUnsupported`.
+///   * `"jsonrpc"` may be absent (legacy clients); any value other than the
+///     string `"2.0"` returns `error.InvalidRequest`.
+///   * `"method"` must be a string.
+///   * `"id"` may be a string, an integer, or null. Floats, bools, arrays and
+///     objects return `error.InvalidId`. Integer ids are copied byte-exact
+///     from the request, so ids beyond the i64 range round-trip unchanged.
+///   * An absent `"id"` is a notification (`has_id == false`, `id_json ==
+///     "null"`). `"id":null` is a request with `has_id == true`.
+///
+/// std.json syntax failures map to `error.ParseError`.
 pub fn parseRequest(allocator: Allocator, line: []const u8) ParseRequestError!Request {
+    try prescan(line);
+
     var parsed = std.json.parseFromSlice(Value, allocator, line, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.ParseError,
     };
     errdefer parsed.deinit();
 
+    if (parsed.value == .array) return error.BatchUnsupported;
     if (parsed.value != .object) return error.InvalidRequest;
-    const method_value = parsed.value.object.get("method") orelse return error.InvalidRequest;
+    const object = parsed.value.object;
+
+    if (object.get("jsonrpc")) |version_value| {
+        if (version_value != .string or !std.mem.eql(u8, version_value.string, "2.0")) return error.InvalidRequest;
+    }
+
+    const method_value = object.get("method") orelse return error.InvalidRequest;
     if (method_value != .string) return error.InvalidRequest;
 
-    const has_id = parsed.value.object.get("id") != null;
-    const id_value = parsed.value.object.get("id") orelse Value.null;
-    const id_json = jsonValueAlloc(allocator, id_value) catch return error.OutOfMemory;
+    const id_value = object.get("id");
+    const id_json = try idJsonAlloc(allocator, id_value orelse Value.null);
     errdefer allocator.free(id_json);
 
     const method = try allocator.dupe(u8, method_value.string);
@@ -132,7 +156,79 @@ pub fn parseRequest(allocator: Allocator, line: []const u8) ParseRequestError!Re
         .parsed = parsed,
         .id_json = id_json,
         .method = method,
-        .has_id = has_id,
+        .has_id = id_value != null,
+    };
+}
+
+/// Serialize a validated id. Only string, integer and null ids are accepted.
+fn idJsonAlloc(allocator: Allocator, id: Value) error{ InvalidId, OutOfMemory }![]u8 {
+    switch (id) {
+        .null => return allocator.dupe(u8, "null"),
+        .integer => |n| return std.fmt.allocPrint(allocator, "{d}", .{n}),
+        // std.json keeps integers outside the i64 range as their source text.
+        .number_string => |text| {
+            if (!isIntegerToken(text)) return error.InvalidId;
+            return allocator.dupe(u8, text);
+        },
+        .string => |text| {
+            var out: std.Io.Writer.Allocating = .init(allocator);
+            errdefer out.deinit();
+            writeJsonStringLossy(&out.writer, text) catch return error.OutOfMemory;
+            return out.toOwnedSlice() catch return error.OutOfMemory;
+        },
+        .float, .bool, .array, .object => return error.InvalidId,
+    }
+}
+
+fn isIntegerToken(text: []const u8) bool {
+    const digits = if (text.len > 0 and text[0] == '-') text[1..] else text;
+    if (digits.len == 0) return false;
+    for (digits) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
+/// Reject a top-level batch and enforce `max_json_depth` / `max_json_nodes`
+/// on the raw bytes. Malformed input is left for std.json to report; the
+/// scanner only has to be exact about string boundaries so brackets inside
+/// strings are not counted.
+fn prescan(line: []const u8) error{ NestingTooDeep, BatchUnsupported }!void {
+    const first = std.mem.indexOfNone(u8, line, " \t\r\n") orelse return;
+    if (line[first] == '[') return error.BatchUnsupported;
+
+    var depth: usize = 0;
+    var nodes: usize = 0;
+    var i: usize = first;
+    while (i < line.len) : (i += 1) {
+        switch (line[i]) {
+            '{', '[' => {
+                depth += 1;
+                if (depth > max_json_depth) return error.NestingTooDeep;
+                nodes += 1;
+            },
+            '}', ']' => depth -|= 1,
+            '"' => {
+                // Count string values and object keys alike: both cost a
+                // node's worth of allocation in the parsed tree.
+                nodes += 1;
+                i += 1;
+                while (i < line.len and line[i] != '"') : (i += 1) {
+                    if (line[i] == '\\') i += 1;
+                }
+            },
+            '-', '0'...'9', 't', 'f', 'n' => {
+                nodes += 1;
+                while (i + 1 < line.len and isScalarByte(line[i + 1])) i += 1;
+            },
+            else => {},
+        }
+        if (nodes > max_json_nodes) return error.NestingTooDeep;
+    }
+}
+
+fn isScalarByte(c: u8) bool {
+    return switch (c) {
+        '0'...'9', 'a'...'z', 'A'...'Z', '-', '+', '.' => true,
+        else => false,
     };
 }
 
@@ -263,8 +359,8 @@ pub fn resultRaw(allocator: Allocator, id_json: []const u8, raw_json: []const u8
 pub fn notification(allocator: Allocator, method: []const u8, params: anytype) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
-    try out.writer.print("{{\"jsonrpc\":\"2.0\",\"method\":", .{});
-    try std.json.Stringify.value(method, .{}, &out.writer);
+    try out.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":");
+    try writeJsonStringLossy(&out.writer, method);
     try out.writer.writeAll(",\"params\":");
     try std.json.Stringify.value(params, .{}, &out.writer);
     try out.writer.writeAll("}\n");
@@ -278,7 +374,7 @@ pub fn @"error"(allocator: Allocator, id_json: []const u8, code: i32, message: [
         "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"error\":{{\"code\":{},\"message\":",
         .{ id_json, code },
     );
-    try std.json.Stringify.value(message, .{}, &out.writer);
+    try writeJsonStringLossy(&out.writer, message);
     try out.writer.writeAll("}}\n");
     return out.toOwnedSlice();
 }
@@ -356,4 +452,237 @@ test "format JSON-RPC notification" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"method\":\"foreground_changed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"session_id\":\"sess-1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"argv\":[\"git\",\"status\"]") != null);
+}
+
+fn nestedRequestAlloc(allocator: Allocator, params_depth: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"id\":1,\"method\":\"x\",\"params\":");
+    try out.appendNTimes(allocator, '[', params_depth);
+    try out.appendNTimes(allocator, ']', params_depth);
+    try out.appendSlice(allocator, "}\n");
+    return out.toOwnedSlice(allocator);
+}
+
+test "parseRequest rejects a 100k-deep id without crashing" {
+    const depth = 100_000;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try out.appendSlice(std.testing.allocator, "{\"method\":\"x\",\"id\":");
+    try out.appendNTimes(std.testing.allocator, '[', depth);
+    try out.appendNTimes(std.testing.allocator, ']', depth);
+    try out.appendSlice(std.testing.allocator, "}\n");
+    try std.testing.expectError(error.NestingTooDeep, parseRequest(std.testing.allocator, out.items));
+}
+
+test "parseRequest accepts depth max_json_depth and rejects one more" {
+    // The request object itself is one level.
+    const ok_line = try nestedRequestAlloc(std.testing.allocator, max_json_depth - 1);
+    defer std.testing.allocator.free(ok_line);
+    var ok = try parseRequest(std.testing.allocator, ok_line);
+    ok.deinit();
+
+    const deep_line = try nestedRequestAlloc(std.testing.allocator, max_json_depth);
+    defer std.testing.allocator.free(deep_line);
+    try std.testing.expectError(error.NestingTooDeep, parseRequest(std.testing.allocator, deep_line));
+}
+
+test "parseRequest ignores brackets inside strings when measuring depth" {
+    const brackets: [4 * max_json_depth]u8 = @splat('[');
+    const line = "{\"id\":1,\"method\":\"session.send\",\"params\":{\"data\":\"" ++ brackets ++ "\\\"[{\"}}\n";
+    var req = try parseRequest(std.testing.allocator, line);
+    defer req.deinit();
+    try std.testing.expectEqualStrings("session.send", req.method);
+}
+
+test "parseRequest enforces max_json_nodes" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try out.appendSlice(std.testing.allocator, "{\"id\":1,\"method\":\"x\",\"params\":[");
+    for (0..max_json_nodes + 1) |i| {
+        if (i != 0) try out.append(std.testing.allocator, ',');
+        try out.append(std.testing.allocator, '0');
+    }
+    try out.appendSlice(std.testing.allocator, "]}\n");
+    try std.testing.expectError(error.NestingTooDeep, parseRequest(std.testing.allocator, out.items));
+}
+
+test "parseRequest accepts only string, integer, and null ids" {
+    const invalid = [_][]const u8{
+        "{\"id\":{},\"method\":\"x\"}",
+        "{\"id\":[1],\"method\":\"x\"}",
+        "{\"id\":true,\"method\":\"x\"}",
+        "{\"id\":false,\"method\":\"x\"}",
+        "{\"id\":1.5,\"method\":\"x\"}",
+        "{\"id\":1e3,\"method\":\"x\"}",
+        "{\"id\":-0.0,\"method\":\"x\"}",
+    };
+    for (invalid) |line| {
+        try std.testing.expectError(error.InvalidId, parseRequest(std.testing.allocator, line));
+    }
+
+    const valid = [_]struct { line: []const u8, id_json: []const u8 }{
+        .{ .line = "{\"id\":-42,\"method\":\"x\"}", .id_json = "-42" },
+        .{ .line = "{\"id\":123456789012345678901234567890,\"method\":\"x\"}", .id_json = "123456789012345678901234567890" },
+        .{ .line = "{\"id\":\"a\\\"b\",\"method\":\"x\"}", .id_json = "\"a\\\"b\"" },
+        .{ .line = "{\"id\":null,\"method\":\"x\"}", .id_json = "null" },
+    };
+    for (valid) |case| {
+        var req = try parseRequest(std.testing.allocator, case.line);
+        defer req.deinit();
+        try std.testing.expectEqualStrings(case.id_json, req.id_json);
+        try std.testing.expect(req.has_id);
+    }
+}
+
+test "parseRequest distinguishes absent id from null id" {
+    var absent = try parseRequest(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"method\":\"x\"}");
+    defer absent.deinit();
+    try std.testing.expect(!absent.has_id);
+    try std.testing.expect(isNotification(&absent));
+    try std.testing.expectEqualStrings("null", absent.id_json);
+
+    var explicit_null = try parseRequest(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"x\"}");
+    defer explicit_null.deinit();
+    try std.testing.expect(explicit_null.has_id);
+    try std.testing.expect(!isNotification(&explicit_null));
+}
+
+test "parseRequest validates the jsonrpc member" {
+    var legacy = try parseRequest(std.testing.allocator, "{\"id\":1,\"method\":\"x\"}");
+    legacy.deinit();
+    var current = try parseRequest(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"x\"}");
+    current.deinit();
+
+    const bad = [_][]const u8{
+        "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"x\"}",
+        "{\"jsonrpc\":2.0,\"id\":1,\"method\":\"x\"}",
+        "{\"jsonrpc\":null,\"id\":1,\"method\":\"x\"}",
+        "{\"jsonrpc\":\"2.0 \",\"id\":1,\"method\":\"x\"}",
+    };
+    for (bad) |line| try std.testing.expectError(error.InvalidRequest, parseRequest(std.testing.allocator, line));
+}
+
+test "parseRequest rejects batches and non-object requests" {
+    try std.testing.expectError(error.BatchUnsupported, parseRequest(std.testing.allocator, "[]"));
+    try std.testing.expectError(error.BatchUnsupported, parseRequest(std.testing.allocator, " \t[{\"id\":1,\"method\":\"x\"}]\n"));
+    try std.testing.expectError(error.InvalidRequest, parseRequest(std.testing.allocator, "\"x\""));
+    try std.testing.expectError(error.InvalidRequest, parseRequest(std.testing.allocator, "7"));
+    try std.testing.expectError(error.ParseError, parseRequest(std.testing.allocator, "{\"id\":1,"));
+    try std.testing.expectError(error.ParseError, parseRequest(std.testing.allocator, "not json"));
+}
+
+fn parseRequestForAllocTest(allocator: Allocator, line: []const u8) !void {
+    var req = try parseRequest(allocator, line);
+    req.deinit();
+}
+
+test "parseRequest frees partial results on allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        parseRequestForAllocTest,
+        .{"{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"method\":\"session.create\",\"params\":{\"argv\":[\"sh\"]}}"},
+    );
+}
+
+test "errorCodeFor maps every K0 error name" {
+    const Case = struct { err: anyerror, code: i32, kind: ErrorKind };
+    const cases = [_]Case{
+        .{ .err = error.ParseError, .code = -32700, .kind = .parse },
+        .{ .err = error.SyntaxError, .code = -32700, .kind = .parse },
+        .{ .err = error.UnexpectedEndOfInput, .code = -32700, .kind = .parse },
+        .{ .err = error.InvalidRequest, .code = -32600, .kind = .invalid_request },
+        .{ .err = error.InvalidId, .code = -32600, .kind = .invalid_request },
+        .{ .err = error.NestingTooDeep, .code = -32600, .kind = .invalid_request },
+        .{ .err = error.BatchUnsupported, .code = -32600, .kind = .invalid_request },
+        .{ .err = error.MessageTooLarge, .code = -32600, .kind = .invalid_request },
+        .{ .err = error.TruncatedFrame, .code = -32600, .kind = .invalid_request },
+        .{ .err = error.MethodNotFound, .code = -32601, .kind = .method_not_found },
+        .{ .err = error.InvalidParams, .code = -32602, .kind = .invalid_params },
+        .{ .err = error.InvalidSpawnArgument, .code = -32602, .kind = .invalid_params },
+        .{ .err = error.UnknownKey, .code = -32602, .kind = .invalid_params },
+        .{ .err = error.ScrollbackBytesTooLarge, .code = -32602, .kind = .invalid_params },
+        .{ .err = error.InvalidName, .code = -32602, .kind = .invalid_params },
+        .{ .err = error.InvalidAxis, .code = -32602, .kind = .invalid_params },
+        .{ .err = error.InvalidDimensions, .code = -32602, .kind = .invalid_params },
+        .{ .err = error.SessionNotFound, .code = -32000, .kind = .not_found },
+        .{ .err = error.WindowNotFound, .code = -32000, .kind = .not_found },
+        .{ .err = error.PaneNotFound, .code = -32000, .kind = .not_found },
+        .{ .err = error.ClientNotFound, .code = -32000, .kind = .not_found },
+        .{ .err = error.SessionTerminated, .code = -32000, .kind = .terminated },
+        .{ .err = error.DuplicateSessionName, .code = -32000, .kind = .conflict },
+        .{ .err = error.NameShadowsId, .code = -32000, .kind = .conflict },
+        .{ .err = error.PaneRunning, .code = -32000, .kind = .conflict },
+        .{ .err = error.LimitExceeded, .code = -32000, .kind = .limit },
+        .{ .err = error.OpenPtyFailed, .code = -32000, .kind = .spawn_failed },
+        .{ .err = error.ForkFailed, .code = -32000, .kind = .spawn_failed },
+        .{ .err = error.ChildSetupFailed, .code = -32000, .kind = .spawn_failed },
+        .{ .err = error.SpawnFailed, .code = -32000, .kind = .spawn_failed },
+        .{ .err = error.InputTimeout, .code = -32000, .kind = .io },
+        .{ .err = error.InputClosed, .code = -32000, .kind = .io },
+        .{ .err = error.BrokenPipe, .code = -32000, .kind = .io },
+        .{ .err = error.InputOutput, .code = -32000, .kind = .io },
+        .{ .err = error.WriteZero, .code = -32000, .kind = .io },
+        .{ .err = error.OutOfMemory, .code = -32603, .kind = .internal },
+        .{ .err = error.SomethingNobodyMapped, .code = -32603, .kind = .internal },
+    };
+    for (cases) |case| {
+        const mapping = errorCodeFor(case.err);
+        errdefer std.debug.print("error.{s}\n", .{@errorName(case.err)});
+        try std.testing.expectEqual(case.code, mapping.code);
+        try std.testing.expectEqual(case.kind, mapping.kind);
+    }
+}
+
+test "errorWithKind emits the documented envelope" {
+    const json = try errorWithKind(std.testing.allocator, "7", -32000, "PaneNotFound", .not_found);
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":-32000,\"message\":\"PaneNotFound\",\"data\":{\"kind\":\"not_found\"}}}\n",
+        json,
+    );
+    var parsed = try std.json.parseFromSlice(Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+}
+
+test "writeJsonStringLossy replaces invalid UTF-8 and stays a JSON string" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeJsonStringLossy(&out.writer, "\xff\xfe");
+    try std.testing.expectEqualStrings("\"\u{FFFD}\u{FFFD}\"", out.written());
+
+    out.clearRetainingCapacity();
+    try writeJsonStringLossy(&out.writer, "a\"\\\n\x01\xc3\xa9\xe2\x82");
+    var parsed = try std.json.parseFromSlice(Value, std.testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("a\"\\\n\x01\u{e9}\u{FFFD}\u{FFFD}", parsed.value.string);
+
+    out.clearRetainingCapacity();
+    // Encoded surrogate and overlong NUL are invalid UTF-8.
+    try writeJsonStringLossy(&out.writer, "\xed\xa0\x80\xc0\x80");
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out.written()));
+}
+
+test "sanitizeUtf8Alloc keeps valid text and replaces invalid bytes" {
+    const valid = try sanitizeUtf8Alloc(std.testing.allocator, "h\u{e9}llo");
+    defer std.testing.allocator.free(valid);
+    try std.testing.expectEqualStrings("h\u{e9}llo", valid);
+
+    const fixed = try sanitizeUtf8Alloc(std.testing.allocator, "a\xffb\xc3");
+    defer std.testing.allocator.free(fixed);
+    try std.testing.expectEqualStrings("a\u{FFFD}b\u{FFFD}", fixed);
+}
+
+test "error and notification never emit integer arrays for invalid UTF-8" {
+    const err_json = try @"error"(std.testing.allocator, "1", ErrorCode.internal_error, "bad\xff");
+    defer std.testing.allocator.free(err_json);
+    var parsed_err = try std.json.parseFromSlice(Value, std.testing.allocator, err_json, .{});
+    defer parsed_err.deinit();
+    try std.testing.expect(parsed_err.value.object.get("error").?.object.get("message").? == .string);
+
+    const note = try notification(std.testing.allocator, "m\xff", .{});
+    defer std.testing.allocator.free(note);
+    var parsed_note = try std.json.parseFromSlice(Value, std.testing.allocator, note, .{});
+    defer parsed_note.deinit();
+    try std.testing.expect(parsed_note.value.object.get("method").? == .string);
 }

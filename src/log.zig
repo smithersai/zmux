@@ -32,10 +32,32 @@ pub const max_line_bytes: usize = 1024;
 pub const min_buffer_len: usize = 128;
 
 /// Shared state for `warnRateLimited`: at most one line per `interval_ms`.
+/// Lock-free; safe to share between threads.
 pub const RateLimiter = struct {
     interval_ms: i64,
+    /// Monotonic time of the last emitted line; 0 means never.
     last_ms: std.atomic.Value(i64) = .init(0),
     suppressed: std.atomic.Value(u64) = .init(0),
+
+    /// Decide whether a call at `now_ms` (monotonic) may emit. Returns the
+    /// number of calls suppressed since the previous emit, or null when this
+    /// call is suppressed and counted. Pure apart from the atomics, so tests
+    /// can drive it with a fake clock.
+    pub fn admit(self: *RateLimiter, now_ms: i64) ?u64 {
+        // 0 is the "never emitted" sentinel.
+        const stamp = if (now_ms == 0) 1 else now_ms;
+        const last = self.last_ms.load(.monotonic);
+        if (last != 0 and stamp -| last < self.interval_ms) {
+            _ = self.suppressed.fetchAdd(1, .monotonic);
+            return null;
+        }
+        if (self.last_ms.cmpxchgStrong(last, stamp, .monotonic, .monotonic) != null) {
+            // Another thread won this interval.
+            _ = self.suppressed.fetchAdd(1, .monotonic);
+            return null;
+        }
+        return self.suppressed.swap(0, .monotonic);
+    }
 };
 
 var current_level = std.atomic.Value(u8).init(@backingInt(default_level));
@@ -112,22 +134,19 @@ pub fn warn(comptime event: []const u8, fields: anytype) void {
 }
 
 /// Emit a warning at most once per `limiter.interval_ms`, counting the
-/// suppressed calls. Phase 0 stub (T1 owns): the count is reported on a
-/// separate `<event>_suppressed` line instead of a `"suppressed"` field.
+/// suppressed calls. When calls were suppressed since the previous line, the
+/// next line carries `"suppressed":N` right after `"event"`, so the count
+/// survives field truncation. Calls below the configured level neither emit
+/// nor touch the limiter.
 pub fn warnRateLimited(comptime event: []const u8, limiter: *RateLimiter, fields: anytype) void {
+    if (!enabled(.warn)) return;
     const now_ms = std.Io.Clock.awake.now(std.Options.debug_io).toMilliseconds();
-    const last = limiter.last_ms.load(.monotonic);
-    if (last != 0 and now_ms - last < limiter.interval_ms) {
-        _ = limiter.suppressed.fetchAdd(1, .monotonic);
-        return;
-    }
-    if (limiter.last_ms.cmpxchgStrong(last, now_ms, .monotonic, .monotonic) != null) {
-        _ = limiter.suppressed.fetchAdd(1, .monotonic);
-        return;
-    }
-    const suppressed = limiter.suppressed.swap(0, .monotonic);
-    emit(.warn, event, fields);
-    if (suppressed != 0) emit(.warn, event ++ "_suppressed", .{ .suppressed = suppressed });
+    const suppressed = limiter.admit(now_ms) orelse return;
+
+    var buf: [max_line_bytes]u8 = undefined;
+    const ts_ms = std.Io.Clock.real.now(std.Options.debug_io).toMilliseconds();
+    const line = formatSuppressed(&buf, .warn, ts_ms, currentPid(), event, suppressed, fields);
+    writeStderr(line);
 }
 
 pub fn info(comptime event: []const u8, fields: anytype) void {
@@ -140,9 +159,10 @@ pub fn debug(comptime event: []const u8, fields: anytype) void {
 
 /// Format one event into `buf` and return the line, newline included. Pure:
 /// the timestamp and pid are parameters so tests can assert exact output.
-/// `buf` must hold at least the header; fields that overflow it are dropped
-/// whole and replaced by `"truncated":true`, so the result is always one
-/// valid JSON object.
+/// `buf.len` must be at least `min_buffer_len`. Fields that overflow `buf`
+/// are dropped whole and replaced by `"truncated":true`; if even the header
+/// does not fit, the line is `{"event":"log_header_overflow"}`. The result
+/// is always one valid JSON object.
 pub fn format(
     buf: []u8,
     level: Level,
@@ -151,8 +171,25 @@ pub fn format(
     comptime event: []const u8,
     fields: anytype,
 ) []const u8 {
+    return formatSuppressed(buf, level, ts_ms, pid, event, 0, fields);
+}
+
+pub const header_overflow_line = "{\"event\":\"log_header_overflow\"}\n";
+
+/// `format` plus a `"suppressed":N` member after the header when N > 0.
+pub fn formatSuppressed(
+    buf: []u8,
+    level: Level,
+    ts_ms: i64,
+    pid: i64,
+    comptime event: []const u8,
+    suppressed: u64,
+    fields: anytype,
+) []const u8 {
+    std.debug.assert(buf.len >= min_buffer_len);
     const truncated_marker = ",\"truncated\":true";
     const tail = "}\n";
+    comptime std.debug.assert(min_buffer_len >= header_overflow_line.len + truncated_marker.len + tail.len);
     // Reserve room so the marker and the closing brace always fit.
     var line: Line = .{ .buf = buf[0 .. buf.len - truncated_marker.len - tail.len] };
 
@@ -164,8 +201,16 @@ pub fn format(
     line.int(pid);
     line.raw(",\"event\":");
     line.string(event);
+    if (suppressed != 0) {
+        line.raw(",\"suppressed\":");
+        line.int(suppressed);
+    }
+    if (line.overflow) {
+        @memcpy(buf[0..header_overflow_line.len], header_overflow_line);
+        return buf[0..header_overflow_line.len];
+    }
 
-    var truncated = line.overflow;
+    var truncated = false;
     inline for (@typeInfo(@TypeOf(fields)).@"struct".field_names) |field_name| {
         const checkpoint = line.len;
         line.raw(",");
@@ -242,8 +287,9 @@ const Line = struct {
                     i += 1;
                 },
                 0x80...0xff => {
-                    // Emit valid UTF-8 sequences verbatim; escape stray invalid
-                    // UTF-8 bytes as \u00XX so the output is always valid JSON.
+                    // Emit valid UTF-8 sequences verbatim; replace each stray
+                    // invalid byte with an escaped U+FFFD so the output is
+                    // always valid JSON and never misrepresents the byte.
                     const seq_len = std.unicode.utf8ByteSequenceLength(byte) catch 0;
                     if (seq_len > 1 and i + seq_len <= bytes.len and
                         std.unicode.utf8ValidateSlice(bytes[i .. i + seq_len]))
@@ -251,8 +297,7 @@ const Line = struct {
                         self.raw(bytes[i .. i + seq_len]);
                         i += seq_len;
                     } else {
-                        var tmp: [6]u8 = undefined;
-                        self.raw(std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{byte}) catch "?");
+                        self.raw("\\ufffd");
                         i += 1;
                     }
                 },
@@ -415,4 +460,127 @@ test "emit below the configured level writes nothing and does not crash" {
     warn("suppressed_in_test", .{ .n = @as(u8, 1) });
     info("suppressed_in_test", .{});
     debug("suppressed_in_test", .{});
+}
+
+fn expectValidJsonLine(line: []const u8) !std.json.Parsed(std.json.Value) {
+    try std.testing.expect(line.len > 0 and line[line.len - 1] == '\n');
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, line, "\n"));
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, line, .{});
+    errdefer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    return parsed;
+}
+
+test "format with the smallest buffer still emits valid JSON" {
+    var buf: [min_buffer_len]u8 = undefined;
+    const line = format(&buf, .warn, std.math.maxInt(i64), std.math.minInt(i64), "accept_error", .{
+        .err = error.SystemFdQuotaExceeded,
+        .path = @as([]const u8, "/a/fairly/long/socket/path/that/will/not/fit/in/the/small/buffer"),
+        .n = @as(u8, 1),
+    });
+    try std.testing.expect(line.len <= min_buffer_len);
+    var parsed = try expectValidJsonLine(line);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("accept_error", parsed.value.object.get("event").?.string);
+    try std.testing.expect(parsed.value.object.get("truncated").?.bool);
+}
+
+test "format emits a fixed line when the header overflows" {
+    const quotes: [max_line_bytes]u8 = @splat('"');
+    var buf: [max_line_bytes]u8 = undefined;
+    const line = format(&buf, .err, 1, 2, &quotes, .{ .n = @as(u8, 1) });
+    try std.testing.expectEqualStrings(header_overflow_line, line);
+    var parsed = try expectValidJsonLine(line);
+    parsed.deinit();
+
+    var small: [min_buffer_len]u8 = undefined;
+    const long_event_bytes: [min_buffer_len - 40]u8 = @splat('e');
+    const long_event = &long_event_bytes;
+    const small_line = format(&small, .debug, std.math.minInt(i64), std.math.minInt(i64), long_event, .{});
+    var parsed_small = try expectValidJsonLine(small_line);
+    parsed_small.deinit();
+}
+
+test "format replaces invalid UTF-8 with U+FFFD and keeps valid sequences" {
+    var buf: [max_line_bytes]u8 = undefined;
+    const line = format(&buf, .warn, 1, 2, "e", .{ .name = @as([]const u8, "a\xffb\xc3\xa9\xe2\x82") });
+    var parsed = try expectValidJsonLine(line);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("a\u{FFFD}b\u{e9}\u{FFFD}\u{FFFD}", parsed.value.object.get("name").?.string);
+}
+
+test "format output is valid JSON for every truncation point" {
+    const unit = "\"\\\n\x01\xff\xc3\xa9 text ";
+    var payload_buf: [unit.len * 8]u8 = undefined;
+    for (0..8) |k| @memcpy(payload_buf[k * unit.len ..][0..unit.len], unit);
+    const payload: []const u8 = &payload_buf;
+    var size: usize = min_buffer_len;
+    while (size <= 512) : (size += 1) {
+        const buf = try std.testing.allocator.alloc(u8, size);
+        defer std.testing.allocator.free(buf);
+        const line = format(buf, .info, 1700000000000, 99, "sweep", .{
+            .a = @as([]const u8, payload),
+            .b = @as(u64, 7),
+            .c = @as([]const u8, payload[0..40]),
+        });
+        try std.testing.expect(line.len <= size);
+        var parsed = try expectValidJsonLine(line);
+        parsed.deinit();
+    }
+}
+
+test "formatSuppressed puts the suppressed count inline in the object" {
+    var buf: [max_line_bytes]u8 = undefined;
+    const line = formatSuppressed(&buf, .warn, 1, 2, "accept_error", 999, .{ .err = error.Unexpected });
+    try std.testing.expectEqualStrings(
+        "{\"ts_ms\":1,\"level\":\"warn\",\"pid\":2,\"event\":\"accept_error\",\"suppressed\":999,\"err\":\"Unexpected\"}\n",
+        line,
+    );
+    const quiet = formatSuppressed(&buf, .warn, 1, 2, "accept_error", 0, .{});
+    try std.testing.expect(std.mem.indexOf(u8, quiet, "suppressed") == null);
+}
+
+test "RateLimiter admits one call per interval and counts the rest" {
+    var limiter: RateLimiter = .{ .interval_ms = 1000 };
+    try std.testing.expectEqual(@as(?u64, 0), limiter.admit(5000));
+    for (0..999) |i| {
+        try std.testing.expectEqual(@as(?u64, null), limiter.admit(5000 + @as(i64, @intCast(i % 1000))));
+    }
+    try std.testing.expectEqual(@as(?u64, 999), limiter.admit(6000));
+    try std.testing.expectEqual(@as(?u64, null), limiter.admit(6500));
+    try std.testing.expectEqual(@as(?u64, 1), limiter.admit(7000));
+    try std.testing.expectEqual(@as(?u64, 0), limiter.admit(9000));
+}
+
+test "RateLimiter treats a zero clock reading as a real emit" {
+    var limiter: RateLimiter = .{ .interval_ms = 10 };
+    try std.testing.expectEqual(@as(?u64, 0), limiter.admit(0));
+    try std.testing.expectEqual(@as(?u64, null), limiter.admit(5));
+}
+
+test "RateLimiter counts every call exactly once across threads" {
+    var limiter: RateLimiter = .{ .interval_ms = std.math.maxInt(i64) };
+    const Worker = struct {
+        fn run(l: *RateLimiter, admitted: *std.atomic.Value(u64)) void {
+            for (0..1000) |_| {
+                if (l.admit(1234) != null) _ = admitted.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var admitted: std.atomic.Value(u64) = .init(0);
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &limiter, &admitted });
+    for (threads) |t| t.join();
+    try std.testing.expectEqual(@as(u64, 1), admitted.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 3999), limiter.suppressed.load(.monotonic));
+}
+
+test "warnRateLimited below the configured level leaves the limiter untouched" {
+    const saved = getLevel();
+    defer setLevel(saved);
+    setLevel(.err);
+    var limiter: RateLimiter = .{ .interval_ms = 1000 };
+    warnRateLimited("suppressed_in_test", &limiter, .{ .n = @as(u8, 1) });
+    try std.testing.expectEqual(@as(i64, 0), limiter.last_ms.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), limiter.suppressed.load(.monotonic));
 }
