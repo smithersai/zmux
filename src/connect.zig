@@ -1201,7 +1201,7 @@ fn handleServerLine(
         const params = parsed.value.object.get("params") orelse return false;
         if (!jsonAnyStringEquals(params, &.{ "paneId", "pane_id" }, pane_id)) return false;
         const encoded = jsonAnyObjectString(params, &.{ "dataBase64", "data_base64" }) orelse return false;
-        const decoded = try base64Decode(allocator, encoded);
+        const decoded = base64Decode(allocator, encoded) catch return false;
         defer allocator.free(decoded);
         try writeAllFd(stdout_fd, decoded);
         return false;
@@ -1290,12 +1290,11 @@ fn replayScrollbackFromAttach(
     payload: []const u8,
     out_fd: posix.fd_t,
 ) !void {
-    const marker = "\"replayBase64\":\"";
-    const start = std.mem.indexOf(u8, payload, marker) orelse return;
-    const value_start = start + marker.len;
-    if (value_start >= payload.len) return;
-    const value_end = std.mem.indexOfScalarPos(u8, payload, value_start, '"') orelse return;
-    const encoded = payload[value_start..value_end];
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const result = parsed.value.object.get("result") orelse return;
+    const encoded = jsonObjectString(result, "replayBase64") orelse return;
     if (encoded.len == 0) return;
 
     const decoded = base64Decode(allocator, encoded) catch return;

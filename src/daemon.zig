@@ -16,7 +16,7 @@ const StartLock = struct {
     path: []u8,
     allocator: std.mem.Allocator,
 
-    fn release(self: *StartLock) void {
+    pub fn release(self: *StartLock) void {
         self.file.close(self.io);
         std.Io.Dir.deleteFileAbsolute(self.io, self.path) catch {};
         self.allocator.free(self.path);
@@ -476,6 +476,11 @@ pub const fuzz_hooks = struct {
     pub const socketPathTooLongMessageFn = socketPathTooLongMessage;
     pub const pidPathFn = pidPath;
     pub const parseArgsFn = parseArgs;
+    pub const writePidFileFn = writePidFile;
+    pub const deletePidFileFn = deletePidFile;
+    pub const acquireStartLockFn = acquireStartLock;
+    pub const socketAcceptsConnectionFn = socketAcceptsConnection;
+    pub const waitForSocketAcceptsConnectionFn = waitForSocketAcceptsConnection;
 };
 
 test "socket path falls back to HOME/.smithers when HOME is provided" {

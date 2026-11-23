@@ -396,12 +396,38 @@ Minimum macOS deployment target is 14.0.
 
 ```sh
 zig build           # build all artifacts
-zig build test      # unit + integration tests
+zig build test      # unit + integration tests + fuzz corpus smoke checks
 ```
 
 The integration suite drives the real server over a UNIX socket and exercises
 session create / attach / detach / scrollback replay end-to-end. See
 `test/integration/session_daemon.zig`.
+
+### Fuzz testing
+
+`zmux` ships a 32-target coverage-guided structured fuzz suite built on Zig
+0.17's `std.testing.fuzz` + `std.testing.Smith` with LLVM SanitizerCoverage
+instrumentation (`test/fuzz/`). Every fuzz target checks differential oracles,
+single-line JSON-RPC / JSON log invariants, structural state-graph invariants,
+and `FailingAllocator` OOM leak/atomicity guarantees:
+
+```sh
+# Fast pure + pipe/socketpair fuzz suite (26 targets)
+zig build fuzz -Doptimize=ReleaseSafe --fuzz=25K --summary all
+
+# Continuous fuzzing with web UI (runs until interrupted)
+zig build fuzz -Doptimize=ReleaseSafe --fuzz
+
+# Target a single fuzzer by name
+zig build fuzz -Dtest-filter="ScrollbackBuffer" --fuzz=100K
+
+# Live real-PTY, private socket binding, pid/lock, and multi-client chaos (6 targets)
+zig build fuzz-live --fuzz=150 --summary all
+```
+
+`zig build test` automatically executes every fuzz target's regression corpus
+deterministically without `--fuzz`. CI runs bounded coverage-guided campaigns
+for both `fuzz` and `fuzz-live` on Ubuntu on every push and pull request.
 
 ## Acknowledgements
 

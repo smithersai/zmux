@@ -610,8 +610,14 @@ pub const Manager = struct {
         defer self.mutex.unlock(self.io);
 
         const found = self.findPaneWithParentsLocked(pane_id) orelse return error.PaneNotFound;
-        try replaceOwnedString(self.allocator, &found.window.active_pane_id, found.pane.id);
-        try replaceOwnedString(self.allocator, &found.session.active_window_id, found.window.id);
+        const new_active_pane = try self.allocator.dupe(u8, found.pane.id);
+        errdefer self.allocator.free(new_active_pane);
+        const new_active_window = try self.allocator.dupe(u8, found.window.id);
+
+        self.allocator.free(found.window.active_pane_id);
+        found.window.active_pane_id = new_active_pane;
+        self.allocator.free(found.session.active_window_id);
+        found.session.active_window_id = new_active_window;
     }
 
     pub fn selectWindow(self: *Manager, window_id: []const u8) !void {
@@ -787,9 +793,19 @@ pub const Manager = struct {
         const client = self.findClientLocked(client_id) orelse return error.ClientNotFound;
         const found = self.findPaneWithParentsLocked(pane_id) orelse return error.PaneNotFound;
         try found.pane.native.resize(client.cols, client.rows);
-        try replaceOwnedString(self.allocator, &client.session_id, found.session.id);
-        try replaceOwnedString(self.allocator, &client.window_id, found.window.id);
-        try replaceOwnedString(self.allocator, &client.pane_id, found.pane.id);
+
+        const new_session_id = try self.allocator.dupe(u8, found.session.id);
+        errdefer self.allocator.free(new_session_id);
+        const new_window_id = try self.allocator.dupe(u8, found.window.id);
+        errdefer self.allocator.free(new_window_id);
+        const new_pane_id = try self.allocator.dupe(u8, found.pane.id);
+
+        self.allocator.free(client.session_id);
+        client.session_id = new_session_id;
+        self.allocator.free(client.window_id);
+        client.window_id = new_window_id;
+        self.allocator.free(client.pane_id);
+        client.pane_id = new_pane_id;
     }
 
     pub fn bindKey(self: *Manager, table: []const u8, key: []const u8, command: []const u8, repeat: bool) !void {

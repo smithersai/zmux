@@ -61,6 +61,7 @@ pub fn build(b: *std.Build) void {
         target = b.resolveTargetQuery(query);
     }
     const optimize = b.standardOptimizeOption(.{});
+    const test_filters = b.option([]const []const u8, "test-filter", "Skip tests that do not match any filter") orelse &.{};
 
     const root_mod = b.addModule("zmux", .{
         .root_source_file = b.path("src/main.zig"),
@@ -133,6 +134,205 @@ pub fn build(b: *std.Build) void {
         .root_module = integration_mod,
     });
     test_step.dependOn(&b.addRunArtifact(integration_tests).step);
+
+    // Coverage-guided structured fuzz suite (fast pure + socketpair/pipe targets).
+    // Run `zig build fuzz --fuzz=100K` (or `--fuzz` for continuous webui fuzzing).
+    // Also wired into `zig build test` so every corpus seed is smoke-tested on
+    // every normal test run without requiring `--fuzz`.
+    const fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("test/fuzz/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zmux", .module = root_mod }},
+    });
+    const fuzz_tests = b.addTest(.{
+        .name = "zmux-fuzz",
+        .root_module = fuzz_mod,
+        .filters = test_filters,
+        // Zig 0.17's self-hosted x86_64 backend does not emit SanitizerCoverage
+        // PC tables in Debug mode; force LLVM so `--fuzz` always gets real
+        // edge-coverage guidance.
+        .use_llvm = true,
+    });
+    const run_fuzz = b.addRunArtifact(fuzz_tests);
+    const fuzz_step = b.step("fuzz", "Run fast coverage-guided fuzz tests (pass --fuzz[=N] to fuzz)");
+    fuzz_step.dependOn(&run_fuzz.step);
+    test_step.dependOn(&run_fuzz.step);
+
+    // Stateful real-PTY and live UNIX-socket chaos fuzzers.
+    // Run `zig build fuzz-live --fuzz=200` (each iteration spawns real PTYs).
+    const fuzz_live_mod = b.createModule(.{
+        .root_source_file = b.path("test/fuzz/live.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zmux", .module = root_mod }},
+    });
+    const fuzz_live_tests = b.addTest(.{
+        .name = "zmux-fuzz-live",
+        .root_module = fuzz_live_mod,
+        .filters = test_filters,
+        .use_llvm = true,
+    });
+    const run_fuzz_live = b.addRunArtifact(fuzz_live_tests);
+    const fuzz_live_step = b.step("fuzz-live", "Run live PTY and UNIX-socket chaos fuzzers (pass --fuzz[=N] to fuzz)");
+    fuzz_live_step.dependOn(&run_fuzz_live.step);
+    test_step.dependOn(&run_fuzz_live.step);
+
+    // Granular per-module unit test steps so Smithers PACKAGE.ts can run only
+    // affected unit tests when a module changes.
+    addUnitTestStep(b, target, optimize, "test-buffer", "src/buffer.zig", "Run buffer unit tests");
+    addUnitTestStep(b, target, optimize, "test-protocol", "src/protocol.zig", "Run protocol unit tests");
+    addUnitTestStep(b, target, optimize, "test-rpc-line-reader", "src/rpc_line_reader.zig", "Run rpc_line_reader unit tests");
+    addUnitTestStep(b, target, optimize, "test-log", "src/log.zig", "Run log unit tests");
+    addUnitTestStep(b, target, optimize, "test-foreground", "src/foreground.zig", "Run foreground unit tests");
+    addUnitTestStep(b, target, optimize, "test-sys", "src/sys.zig", "Run sys unit tests");
+    addUnitTestStep(b, target, optimize, "test-pty", "src/pty.zig", "Run pty unit tests");
+    addUnitTestStep(b, target, optimize, "test-native", "src/native.zig", "Run native unit tests");
+    addUnitTestStep(b, target, optimize, "test-mux", "src/mux.zig", "Run mux unit tests");
+    addUnitTestStep(b, target, optimize, "test-connect", "src/connect.zig", "Run connect unit tests");
+    addUnitTestStep(b, target, optimize, "test-server", "src/server.zig", "Run server unit tests");
+    addUnitTestStep(b, target, optimize, "test-daemon", "src/daemon.zig", "Run daemon unit tests");
+    addUnitTestStep(b, target, optimize, "test-main", "src/main.zig", "Run main library unit tests");
+    const test_integration_step = b.step("test-integration", "Run integration test suite");
+    test_integration_step.dependOn(&b.addRunArtifact(integration_tests).step);
+
+    // Performance benchmarks: one independent executable per module so each
+    // suite compiles and runs only its exact dependency slice. Defaults to
+    // ReleaseFast so benchmark numbers reflect optimized production code.
+    const bench_optimize = b.option(
+        std.builtin.OptimizeMode,
+        "bench-optimize",
+        "Optimization mode for benchmarks (default: fast)",
+    ) orelse if (optimize == .debug) .fast else optimize;
+
+    const bench_harness_mod = b.createModule(.{
+        .root_source_file = b.path("bench/bench.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+    });
+
+    const bench_step = b.step("bench", "Run all zmux performance benchmark suites");
+
+    // Helper modules scoped strictly to each benchmark's dependencies.
+    const mod_buffer = createRootModule(b, target, bench_optimize, "src/buffer.zig");
+    const mod_protocol = createRootModule(b, target, bench_optimize, "src/protocol.zig");
+    const mod_rpc_line_reader = createRootModule(b, target, bench_optimize, "src/rpc_line_reader.zig");
+    const mod_log = createRootModule(b, target, bench_optimize, "src/log.zig");
+    const mod_foreground = createRootModule(b, target, bench_optimize, "src/foreground.zig");
+    const mod_sys = createRootModule(b, target, bench_optimize, "src/sys.zig");
+    const mod_pty = createRootModule(b, target, bench_optimize, "src/pty.zig");
+    const mod_native = createRootModule(b, target, bench_optimize, "src/native.zig");
+    const mod_mux = createRootModule(b, target, bench_optimize, "src/mux.zig");
+    const mod_connect = createRootModule(b, target, bench_optimize, "src/connect.zig");
+    const mod_daemon = createRootModule(b, target, bench_optimize, "src/daemon.zig");
+    const mod_server = createRootModule(b, target, bench_optimize, "src/server.zig");
+
+    addBenchStep(b, bench_step, target, bench_optimize, bench_harness_mod, "buffer", "bench/buffer_bench.zig", &.{
+        .{ .name = "buffer", .module = mod_buffer },
+    });
+    addBenchStep(b, bench_step, target, bench_optimize, bench_harness_mod, "protocol", "bench/protocol_bench.zig", &.{
+        .{ .name = "protocol", .module = mod_protocol },
+    });
+    addBenchStep(b, bench_step, target, bench_optimize, bench_harness_mod, "rpc-line-reader", "bench/rpc_line_reader_bench.zig", &.{
+        .{ .name = "rpc_line_reader", .module = mod_rpc_line_reader },
+        .{ .name = "sys", .module = mod_sys },
+    });
+    addBenchStep(b, bench_step, target, bench_optimize, bench_harness_mod, "log", "bench/log_bench.zig", &.{
+        .{ .name = "log", .module = mod_log },
+    });
+    addBenchStep(b, bench_step, target, bench_optimize, bench_harness_mod, "foreground", "bench/foreground_bench.zig", &.{
+        .{ .name = "foreground", .module = mod_foreground },
+    });
+    addBenchStep(b, bench_step, target, bench_optimize, bench_harness_mod, "sys", "bench/sys_bench.zig", &.{
+        .{ .name = "sys", .module = mod_sys },
+    });
+    addBenchStep(b, bench_step, target, bench_optimize, bench_harness_mod, "pty", "bench/pty_bench.zig", &.{
+        .{ .name = "pty", .module = mod_pty },
+    });
+    addBenchStep(b, bench_step, target, bench_optimize, bench_harness_mod, "native", "bench/native_bench.zig", &.{
+        .{ .name = "buffer", .module = mod_buffer },
+        .{ .name = "native", .module = mod_native },
+    });
+    addBenchStep(b, bench_step, target, bench_optimize, bench_harness_mod, "mux", "bench/mux_bench.zig", &.{
+        .{ .name = "mux", .module = mod_mux },
+    });
+    addBenchStep(b, bench_step, target, bench_optimize, bench_harness_mod, "connect", "bench/connect_bench.zig", &.{
+        .{ .name = "connect", .module = mod_connect },
+        .{ .name = "sys", .module = mod_sys },
+    });
+    addBenchStep(b, bench_step, target, bench_optimize, bench_harness_mod, "daemon", "bench/daemon_bench.zig", &.{
+        .{ .name = "daemon", .module = mod_daemon },
+    });
+    addBenchStep(b, bench_step, target, bench_optimize, bench_harness_mod, "server", "bench/server_bench.zig", &.{
+        .{ .name = "buffer", .module = mod_buffer },
+        .{ .name = "rpc_line_reader", .module = mod_rpc_line_reader },
+        .{ .name = "server", .module = mod_server },
+        .{ .name = "sys", .module = mod_sys },
+    });
+
+    const report_mod = b.createModule(.{
+        .root_source_file = b.path("bench/report.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+    });
+    const report_exe = b.addExecutable(.{
+        .name = "zmux-bench-report",
+        .root_module = report_mod,
+    });
+    const run_report = b.addRunArtifact(report_exe);
+    run_report.addPassthruArgs();
+    const report_step = b.step("bench-report", "Aggregate benchmark JSON outputs and compare against baseline");
+    report_step.dependOn(&run_report.step);
+}
+
+fn addUnitTestStep(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    step_name: []const u8,
+    root: []const u8,
+    description: []const u8,
+) void {
+    const unit_tests = b.addTest(.{
+        .root_module = createRootModule(b, target, optimize, root),
+    });
+    const step = b.step(step_name, description);
+    step.dependOn(&b.addRunArtifact(unit_tests).step);
+}
+
+fn addBenchStep(
+    b: *std.Build,
+    all_bench_step: *std.Build.Step,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    bench_harness_mod: *std.Build.Module,
+    comptime name: []const u8,
+    root_path: []const u8,
+    imports: []const std.Build.Module.Import,
+) void {
+    const mod = b.createModule(.{
+        .root_source_file = b.path(root_path),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    linkPtyLibraries(mod, target);
+    mod.addImport("bench", bench_harness_mod);
+    for (imports) |imp| mod.addImport(imp.name, imp.module);
+
+    const exe = b.addExecutable(.{
+        .name = "bench-" ++ name,
+        .root_module = mod,
+    });
+    const run = b.addRunArtifact(exe);
+    run.addPassthruArgs();
+
+    const step = b.step("bench-" ++ name, "Run " ++ name ++ " performance benchmarks");
+    step.dependOn(&run.step);
+
+    const run_for_all = b.addRunArtifact(exe);
+    run_for_all.addPassthruArgs();
+    all_bench_step.dependOn(&run_for_all.step);
 }
 
 fn createRootModule(
