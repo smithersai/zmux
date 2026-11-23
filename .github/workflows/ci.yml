@@ -11,12 +11,15 @@ jobs:
   test:
     name: Test ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         os:
           - ubuntu-latest
+          - ubuntu-24.04-arm
           - macos-latest
+          - macos-15-intel
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -30,11 +33,44 @@ jobs:
         run: zig fmt --check src test build.zig build.zig.zon
 
       - name: Run tests
-        run: zig build test --summary all
+        env:
+          ZMUX_TEST_FULL_CONNECTION_CAP: "1"
+        run: |
+          ulimit -n 2048
+          zig build test --summary all
+
+      - name: Test foreign UID protection
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo "$(command -v zig)" build test-integration -Dintegration-filter=foreign_ \
+            --cache-dir "$RUNNER_TEMP/zmux-root-cache" \
+            --global-cache-dir "$RUNNER_TEMP/zmux-root-global-cache" --summary all
+
+  musl:
+    name: Test on Alpine (musl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.1
+
+      - name: Run unit and integration tests on musl
+        run: |
+          zig_dir=$(dirname "$(readlink -f "$(command -v zig)")")
+          docker run --rm \
+            -v "$zig_dir:/opt/zig:ro" -v "$GITHUB_WORKSPACE:/src" \
+            -w /src alpine:3.23 \
+            /opt/zig/zig build test -Dtarget=x86_64-linux-musl --summary all
 
   cross-compile:
     name: Cross-compile ${{ matrix.zig_target }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:

@@ -1,6 +1,47 @@
 # Changelog
 
-## [0.3.0] - 2026-11-22
+## [0.3.1]
+
+### Changed
+
+- **D1.** `pane_output` goes to attached or subscribed connections. Use
+  `events.subscribe` with pane IDs or `["*"]` to monitor output separately.
+  Output frames include `offset` and `generation`. Slow consumers receive
+  `pane_output_dropped` with `dropped_bytes` and `resume_offset`. Lifecycle
+  broadcasts remain global.
+- **D2.** Malformed JSON returns `-32700`. Domain failures use `-32000` and
+  errors include `data.kind`. Requests with no ID receive no response.
+- **D3.** Spawn methods merge `env` over the daemon environment. Set
+  `clearEnv: true` to replace it. Unset `TERM` defaults to `xterm-256color`.
+- **D4.** `client.attach` can create a missing session atomically with
+  `createIfMissing`. The response adds `created`, `exited`, `exitCode`,
+  `signal`, `generation`, and `replayEndOffset`. `zmux-connect` replays
+  exited panes and displays their status before respawning. `pane.respawn`
+  defaults to `kill: false` and emits `pane_respawned`.
+- **D5.** Session names are unique. An exact ID takes precedence over a
+  session name.
+- **D6.** Relative socket options resolve against the working directory.
+  Library callers must pass an absolute path.
+- `session.create`, `window.new`, and `pane.split` return compact results
+  with `sessionId`, `windowId`, `paneId`, and `generation`.
+  `session.capture` adds `textBase64` and sanitizes invalid UTF-8 in `text`.
+- Detached clients receive `client_detached` with the reason. Remote
+  switches notify the owning connection with `client_switched`. The
+  existing notification field `session_id` carries a pane ID.
+
+### Fixed
+
+- Authenticate daemons before sending any request. Auto-spawn verifies its
+  log destination and reaps the intermediate child.
+- Drain buffered daemon frames, preserve partial frames, and bound writes.
+  Restore the terminal on exit or suspend. Drain redirected stdin through
+  EOF and keep reading pane output during a two-second quiet period.
+- Accept reserved names with the explicit `attach` verb. Escape controls
+  in human-readable output and print complete error responses with `--json`.
+- Validate releases on each native target and publish only after every
+  platform has supplied its archives and checksums.
+
+## [0.3.0] - 2026-11-23
 
 ### Changed
 
@@ -54,14 +95,14 @@
   race-free 0600 socket binding without `umask(2)`, and `POLL.HUP` line
   draining behave as in 0.2.0.
 
-## [0.2.1] - 2026-11-22
+## [0.2.1] - 2026-11-23
 
 ### Fixed
 
 - Fixed Linux `createPrivateSocketParent` for Zig 0.15.2 consumers. Opening the
   directory without `O_PATH` lets `fchmod` enforce mode `0700` under `umask 0022`.
 
-## [0.2.0] - 2026-11-22
+## [0.2.0] - 2026-11-23
 
 ### Added
 

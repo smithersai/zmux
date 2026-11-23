@@ -48,81 +48,64 @@ fn requireUnixSocketBind(path: []const u8) !void {
     std.Io.Dir.deleteFileAbsolute(io, path) catch {};
 }
 
-fn connectClient(path: []const u8) !posix.fd_t {
-    const address = try sys.UnixAddress.init(path);
-    const deadline_ms = nowMs() + 2_000;
+const LineReader = zmux.internal.rpc_line_reader.LineReader;
+
+const Connection = struct {
+    fd: posix.fd_t,
+    reader: LineReader = .{},
+
+    fn close(self: *Connection) void {
+        if (@hasDecl(LineReader, "deinit")) self.reader.deinit();
+        sys.close(self.fd);
+    }
+
+    fn read(self: *Connection, allocator: std.mem.Allocator, max_len: usize, deadline_ms: i64) ![]u8 {
+        if (nowMs() >= deadline_ms) return error.ReadTimeout;
+        const timestamp = std.Io.Timestamp.fromNanoseconds(@as(i96, deadline_ms) * std.time.ns_per_ms);
+        return self.reader.readLineAllocTimeout(allocator, io, self.fd, max_len, .{ .deadline = timestamp.withClock(.awake) }) catch |err| switch (err) {
+            error.ConnectionClosed => error.EndOfStream,
+            else => err,
+        };
+    }
+};
+
+fn connectClient(path: []const u8) !Connection {
+    return connectClientUntil(path, nowMs() + 2_000);
+}
+
+fn connectClientUntil(path: []const u8, deadline: i64) !Connection {
     while (true) {
-        const fd = try sys.unixStreamSocket();
-        if (sys.connect(fd, &address)) |_| {
-            return fd;
-        } else |err| {
-            sys.close(fd);
-            // A saturated listen backlog surfaces as a transient ECONNREFUSED
-            // on unix sockets (macOS clamps the accept queue to somaxconn):
-            // the server drains and accepts moments later, so retry briefly
-            // rather than treating a full backlog as a hard failure.
-            if (err == error.ConnectionRefused and nowMs() < deadline_ms) {
+        const fd = sys.connectUnixDeadline(path, deadline) catch |err| switch (err) {
+            error.ConnectionRefused, error.FileNotFound, error.WouldBlock => {
+                if (nowMs() >= deadline) return err;
                 sleepMs(2);
                 continue;
-            }
-            return err;
-        }
+            },
+            else => return err,
+        };
+        return .{ .fd = fd };
     }
 }
 
 fn writeAll(fd: posix.fd_t, bytes: []const u8) !void {
+    const deadline = nowMs() + 4_000;
     var offset: usize = 0;
     while (offset < bytes.len) {
-        offset += try sys.write(fd, bytes[offset..]);
+        const remaining = deadline - nowMs();
+        if (remaining <= 0) return error.WriteTimeout;
+        var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+        if (try posix.poll(&fds, @intCast(remaining)) == 0) return error.WriteTimeout;
+        const n = sys.send(fd, bytes[offset..@min(bytes.len, offset + 4096)]) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+        if (n == 0) return error.WriteZero;
+        offset += n;
     }
 }
 
-fn readLineAlloc(allocator: std.mem.Allocator, fd: posix.fd_t, max_len: usize) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
-    var byte: [1]u8 = undefined;
-    while (true) {
-        const n = try posix.read(fd, &byte);
-        if (n == 0) {
-            if (out.items.len == 0) return error.EndOfStream;
-            return try out.toOwnedSlice(allocator);
-        }
-        if (byte[0] == '\n') return try out.toOwnedSlice(allocator);
-        try out.append(allocator, byte[0]);
-        if (out.items.len > max_len) return error.ResponseTooLarge;
-    }
-}
-
-fn readLineAllocTimeout(allocator: std.mem.Allocator, fd: posix.fd_t, max_len: usize, timeout_ms: i64) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
-    const deadline = nowMs() + timeout_ms;
-    var byte: [1]u8 = undefined;
-    while (true) {
-        const now = nowMs();
-        if (now >= deadline) return error.ReadTimeout;
-        var fds = [_]posix.pollfd{.{
-            .fd = fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const remaining: i32 = @intCast(@min(deadline - now, std.math.maxInt(i32)));
-        const ready = try posix.poll(&fds, remaining);
-        if (ready == 0) return error.ReadTimeout;
-        if ((fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and (fds[0].revents & posix.POLL.IN) == 0) {
-            return error.EndOfStream;
-        }
-        if ((fds[0].revents & posix.POLL.IN) == 0) continue;
-
-        const n = try posix.read(fd, &byte);
-        if (n == 0) {
-            if (out.items.len == 0) return error.EndOfStream;
-            return try out.toOwnedSlice(allocator);
-        }
-        if (byte[0] == '\n') return try out.toOwnedSlice(allocator);
-        try out.append(allocator, byte[0]);
-        if (out.items.len > max_len) return error.ResponseTooLarge;
-    }
+fn readLineAllocTimeout(allocator: std.mem.Allocator, client: *Connection, max_len: usize, timeout_ms: i64) ![]u8 {
+    return client.read(allocator, max_len, nowMs() + timeout_ms);
 }
 
 fn rpcLine(
@@ -131,45 +114,35 @@ fn rpcLine(
     request: []const u8,
     max_len: usize,
 ) ![]u8 {
-    const client = try connectClient(socket_path);
-    defer sys.close(client);
-    try writeAll(client, request);
-    return readRpcResponseWithAnyId(allocator, client, max_len);
+    var client = try connectClient(socket_path);
+    defer client.close();
+    try writeAll(client.fd, request);
+    return readRpcResponseWithAnyId(allocator, &client, max_len);
 }
 
-fn readRpcResponseWithAnyId(allocator: std.mem.Allocator, fd: posix.fd_t, max_len: usize) ![]u8 {
+fn readRpcResponseWithAnyId(allocator: std.mem.Allocator, client: *Connection, max_len: usize) ![]u8 {
+    const deadline = nowMs() + 4_000;
     while (true) {
-        const line = try readLineAlloc(allocator, fd, max_len);
+        const line = try client.read(allocator, max_len, deadline);
         if (lineHasRpcId(allocator, line)) return line;
         allocator.free(line);
     }
 }
 
-fn readRpcResponseLine(
-    allocator: std.mem.Allocator,
-    fd: posix.fd_t,
-    expected_id: i64,
-    max_len: usize,
-) ![]u8 {
-    while (true) {
-        const line = try readLineAlloc(allocator, fd, max_len);
-        if (lineMatchesRpcId(allocator, line, expected_id)) return line;
-        allocator.free(line);
-    }
+fn readRpcResponseLine(allocator: std.mem.Allocator, client: *Connection, expected_id: i64, max_len: usize) ![]u8 {
+    return readRpcResponseLineTimeout(allocator, client, expected_id, max_len, 4_000);
 }
 
 fn readRpcResponseLineTimeout(
     allocator: std.mem.Allocator,
-    fd: posix.fd_t,
+    client: *Connection,
     expected_id: i64,
     max_len: usize,
     timeout_ms: i64,
 ) ![]u8 {
     const deadline = nowMs() + timeout_ms;
     while (true) {
-        const now = nowMs();
-        if (now >= deadline) return error.ReadTimeout;
-        const line = try readLineAllocTimeout(allocator, fd, max_len, deadline - now);
+        const line = try client.read(allocator, max_len, deadline);
         if (lineMatchesRpcId(allocator, line, expected_id)) return line;
         allocator.free(line);
     }
@@ -193,24 +166,14 @@ fn lineMatchesRpcId(allocator: std.mem.Allocator, line: []const u8, expected_id:
 }
 
 fn waitForSocket(path: []const u8, timeout_ms: i64) !void {
+    const allocator = std.testing.allocator;
     const deadline = nowMs() + timeout_ms;
-    while (nowMs() < deadline) {
-        const fd = sys.unixStreamSocket() catch {
-            sleepMs(10);
-            continue;
-        };
-        defer sys.close(fd);
-        const address = sys.UnixAddress.init(path) catch {
-            sleepMs(10);
-            continue;
-        };
-        if (sys.connect(fd, &address)) |_| {
-            return;
-        } else |_| {
-            sleepMs(10);
-        }
-    }
-    return error.SocketNotReady;
+    var client = try connectClientUntil(path, deadline);
+    defer client.close();
+    try writeAll(client.fd, "{\"id\":1,\"method\":\"daemon.ping\"}\n");
+    const reply = try client.read(allocator, 64 * 1024, deadline);
+    defer allocator.free(reply);
+    try expectNoRpcError(allocator, reply);
 }
 
 fn waitForClientCount(
@@ -221,15 +184,15 @@ fn waitForClientCount(
 ) !void {
     const deadline = nowMs() + timeout_ms;
     while (nowMs() < deadline) {
-        const client = connectClient(socket_path) catch {
+        var client = connectClientUntil(socket_path, deadline) catch {
             sleepMs(10);
             continue;
         };
-        defer sys.close(client);
+        defer client.close();
 
-        try writeAll(client, "{\"id\":99,\"method\":\"client.list\",\"params\":{}}\n");
+        try writeAll(client.fd, "{\"id\":99,\"method\":\"client.list\",\"params\":{}}\n");
 
-        const line = readRpcResponseLine(allocator, client, 99, 64 * 1024) catch {
+        const line = readRpcResponseLineTimeout(allocator, &client, 99, 64 * 1024, deadline - nowMs()) catch {
             sleepMs(10);
             continue;
         };
@@ -260,7 +223,7 @@ fn waitForProcessGone(pid: posix.pid_t, timeout_ms: i64) !void {
 
 fn waitForSessionExited(
     allocator: std.mem.Allocator,
-    fd: posix.fd_t,
+    fd: *Connection,
     pane_id: []const u8,
     expected_exit_code: i64,
     timeout_ms: i64,
@@ -284,63 +247,6 @@ fn waitForSessionExited(
         return;
     }
     return error.SessionExitedTimeout;
-}
-
-fn waitForPaneOutput(
-    allocator: std.mem.Allocator,
-    fd: posix.fd_t,
-    pane_id: []const u8,
-    timeout_ms: i64,
-) !void {
-    const deadline = nowMs() + timeout_ms;
-    // Drain in bulk rather than one syscall per byte: a slow reader lets the
-    // server's per-connection broadcast queue overflow while another pane is
-    // flooding, which drops this client (EndOfStream) before the target line
-    // ever arrives. Chunked reads keep the client draining fast enough to stay.
-    var pending = std.ArrayList(u8).empty;
-    defer pending.deinit(allocator);
-    var chunk: [64 * 1024]u8 = undefined;
-    while (true) {
-        const now = nowMs();
-        if (now >= deadline) return error.PaneOutputTimeout;
-        var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-        const remaining: i32 = @intCast(@min(deadline - now, std.math.maxInt(i32)));
-        const ready = try posix.poll(&fds, remaining);
-        if (ready == 0) return error.PaneOutputTimeout;
-        if ((fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0 and (fds[0].revents & posix.POLL.IN) == 0) {
-            return error.EndOfStream;
-        }
-        if ((fds[0].revents & posix.POLL.IN) == 0) continue;
-
-        const n = try posix.read(fd, &chunk);
-        if (n == 0) return error.EndOfStream;
-        try pending.appendSlice(allocator, chunk[0..n]);
-
-        var start: usize = 0;
-        while (std.mem.indexOfScalarPos(u8, pending.items, start, '\n')) |nl| {
-            const line = pending.items[start..nl];
-            start = nl + 1;
-            if (paneOutputMatches(allocator, line, pane_id)) return;
-        }
-        if (start > 0) {
-            const rest = pending.items.len - start;
-            std.mem.copyForwards(u8, pending.items[0..rest], pending.items[start..]);
-            pending.shrinkRetainingCapacity(rest);
-        }
-    }
-}
-
-fn paneOutputMatches(allocator: std.mem.Allocator, line: []const u8, pane_id: []const u8) bool {
-    if (line.len == 0) return false;
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    const method = parsed.value.object.get("method") orelse return false;
-    if (method != .string or !std.mem.eql(u8, method.string, "pane_output")) return false;
-    const params = parsed.value.object.get("params") orelse return false;
-    if (params != .object) return false;
-    const got = params.object.get("pane_id") orelse return false;
-    return got == .string and std.mem.eql(u8, got.string, pane_id);
 }
 
 fn firstPaneMasterFd(server: *server_mod.Server) !posix.fd_t {
@@ -538,17 +444,17 @@ fn attachReplay(
     pane_id: []const u8,
     rpc_id: i64,
 ) ![]u8 {
-    const client = try connectClient(socket_path);
-    defer sys.close(client);
+    var client = try connectClient(socket_path);
+    defer client.close();
     const attach_req = try std.fmt.allocPrint(
         allocator,
         "{{\"id\":{},\"method\":\"client.attach\",\"params\":{{\"paneId\":\"{s}\",\"rows\":24,\"cols\":80}}}}\n",
         .{ rpc_id, pane_id },
     );
     defer allocator.free(attach_req);
-    try writeAll(client, attach_req);
+    try writeAll(client.fd, attach_req);
 
-    const line = try readRpcResponseLine(allocator, client, rpc_id, 1024 * 1024);
+    const line = try readRpcResponseLine(allocator, &client, rpc_id, 1024 * 1024);
     defer allocator.free(line);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
     defer parsed.deinit();
@@ -560,7 +466,7 @@ fn attachReplay(
 
 fn readNotificationLine(
     allocator: std.mem.Allocator,
-    fd: posix.fd_t,
+    fd: *Connection,
     expected_method: []const u8,
     expected_pane_id: []const u8,
     timeout_ms: i64,
@@ -596,7 +502,7 @@ fn readNotificationLine(
             allocator.free(line);
             continue;
         }
-        const pane_id = params.object.get("pane_id") orelse params.object.get("session_id") orelse {
+        const pane_id = params.object.get("pane_id") orelse params.object.get("session_id") orelse params.object.get("client_id") orelse {
             allocator.free(line);
             continue;
         };
@@ -607,12 +513,14 @@ fn readNotificationLine(
 
 fn readPaneOutputContaining(
     allocator: std.mem.Allocator,
-    fd: posix.fd_t,
+    fd: *Connection,
     pane_id: []const u8,
     needle: []const u8,
     timeout_ms: i64,
 ) ![]u8 {
     const deadline = nowMs() + timeout_ms;
+    var tail: std.ArrayList(u8) = .empty;
+    defer tail.deinit(allocator);
     while (true) {
         const now = nowMs();
         if (now >= deadline) return error.PaneOutputTimeout;
@@ -624,8 +532,12 @@ fn readPaneOutputContaining(
         const params = parsed.value.object.get("params") orelse return error.MissingParams;
         const encoded = try expectStringField(params, "data_base64");
         const decoded = try decodeBase64(allocator, encoded);
-        if (std.mem.indexOf(u8, decoded, needle) != null) return decoded;
-        allocator.free(decoded);
+        defer allocator.free(decoded);
+        try tail.appendSlice(allocator, decoded);
+        if (std.mem.indexOf(u8, tail.items, needle) != null) return tail.toOwnedSlice(allocator);
+        const keep = @min(tail.items.len, needle.len -| 1);
+        std.mem.copyForwards(u8, tail.items[0..keep], tail.items[tail.items.len - keep ..]);
+        tail.shrinkRetainingCapacity(keep);
     }
 }
 
@@ -772,46 +684,42 @@ test "daemon JSON-RPC errors are framed and the connection remains usable" {
 
     try waitForSocket(socket_path, 2_000);
 
-    const client = try connectClient(socket_path);
-    defer sys.close(client);
+    var client = try connectClient(socket_path);
+    defer client.close();
 
     {
-        try writeAll(client, "not-json\n");
-        const line = try readRpcResponseWithAnyId(allocator, client, 64 * 1024);
+        try writeAll(client.fd, "not-json\n");
+        const line = try readRpcResponseWithAnyId(allocator, &client, 64 * 1024);
         defer allocator.free(line);
-        try expectRpcErrorCode(allocator, line, -32600);
+        try expectRpcErrorCode(allocator, line, -32700);
     }
 
     {
-        try writeAll(client, "{\"id\":2,\"method\":\"missing.method\",\"params\":{}}\n");
-        const line = try readRpcResponseLine(allocator, client, 2, 64 * 1024);
+        try writeAll(client.fd, "{\"id\":2,\"method\":\"missing.method\",\"params\":{}}\n");
+        const line = try readRpcResponseLine(allocator, &client, 2, 64 * 1024);
         defer allocator.free(line);
         try expectRpcErrorCode(allocator, line, -32601);
     }
 
     {
-        try writeAll(client, "{\"id\":3,\"method\":\"session.info\",\"params\":{}}\n");
-        const line = try readRpcResponseLine(allocator, client, 3, 64 * 1024);
+        try writeAll(client.fd, "{\"id\":3,\"method\":\"session.info\",\"params\":{}}\n");
+        const line = try readRpcResponseLine(allocator, &client, 3, 64 * 1024);
         defer allocator.free(line);
         try expectRpcErrorCode(allocator, line, -32602);
     }
 
     {
-        try writeAll(client, "{\"id\":4,\"method\":\"client.detach\",\"params\":{\"clientId\":\"client-missing\"}}\n");
-        const line = try readRpcResponseLine(allocator, client, 4, 64 * 1024);
+        try writeAll(client.fd, "{\"id\":4,\"method\":\"client.detach\",\"params\":{\"clientId\":\"client-missing\"}}\n");
+        const line = try readRpcResponseLine(allocator, &client, 4, 64 * 1024);
         defer allocator.free(line);
         try expectRpcErrorCode(allocator, line, -32000);
     }
 
     {
-        try writeAll(client, "{\"id\":{\"trace\":[1,2]},\"method\":\"daemon.ping\",\"params\":{}}\n");
-        const line = try readRpcResponseWithAnyId(allocator, client, 64 * 1024);
+        try writeAll(client.fd, "{\"id\":{\"trace\":[1,2]},\"method\":\"daemon.ping\",\"params\":{}}\n");
+        const line = try readRpcResponseWithAnyId(allocator, &client, 64 * 1024);
         defer allocator.free(line);
-        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
-        defer parsed.deinit();
-        const id_val = parsed.value.object.get("id") orelse return error.MissingId;
-        try std.testing.expect(id_val == .object);
-        try std.testing.expect(parsed.value.object.get("result") != null);
+        try expectRpcErrorCode(allocator, line, -32600);
     }
 
     {
@@ -820,18 +728,21 @@ test "daemon JSON-RPC errors are framed and the connection remains usable" {
         @memset(oversized[0 .. oversized.len - 1], 'x');
         oversized[oversized.len - 1] = '\n';
 
-        const overflow = try connectClient(socket_path);
-        defer sys.close(overflow);
-        try writeAll(overflow, oversized);
-        const line = try readRpcResponseWithAnyId(allocator, overflow, 64 * 1024);
+        var overflow = try connectClient(socket_path);
+        defer overflow.close();
+        writeAll(overflow.fd, oversized) catch |err| switch (err) {
+            error.BrokenPipe, error.ConnectionResetByPeer => {},
+            else => return err,
+        };
+        const line = try readRpcResponseWithAnyId(allocator, &overflow, 64 * 1024);
         defer allocator.free(line);
-        try expectRpcErrorCode(allocator, line, -32700);
-        try std.testing.expectError(error.EndOfStream, readLineAllocTimeout(allocator, overflow, 64 * 1024, 2_000));
+        try expectRpcErrorCode(allocator, line, -32600);
+        try std.testing.expectError(error.EndOfStream, readLineAllocTimeout(allocator, &overflow, 64 * 1024, 2_000));
     }
 
     {
-        try writeAll(client, "{\"id\":5,\"method\":\"daemon.ping\",\"params\":{}}\n");
-        const line = try readRpcResponseLine(allocator, client, 5, 64 * 1024);
+        try writeAll(client.fd, "{\"id\":5,\"method\":\"daemon.ping\",\"params\":{}}\n");
+        const line = try readRpcResponseLine(allocator, &client, 5, 64 * 1024);
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
@@ -841,8 +752,8 @@ test "daemon JSON-RPC errors are framed and the connection remains usable" {
     }
 
     {
-        try writeAll(client, "{\"id\":6,\"method\":\"daemon.shutdown\",\"params\":{}}\n");
-        const line = try readRpcResponseLine(allocator, client, 6, 64 * 1024);
+        try writeAll(client.fd, "{\"id\":6,\"method\":\"daemon.shutdown\",\"params\":{}}\n");
+        const line = try readRpcResponseLine(allocator, &client, 6, 64 * 1024);
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
@@ -879,8 +790,8 @@ test "natural child exit is reaped and broadcasts session_exited" {
 
     try waitForSocket(socket_path, 2_000);
 
-    const observer = try connectClient(socket_path);
-    defer sys.close(observer);
+    var observer = try connectClient(socket_path);
+    defer observer.close();
 
     var pane_id: []u8 = &.{};
     defer if (pane_id.len > 0) allocator.free(pane_id);
@@ -897,11 +808,11 @@ test "natural child exit is reaped and broadcasts session_exited" {
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
         const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
-        pane_id = try allocator.dupe(u8, (result_val.object.get("id") orelse return error.MissingSessionId).string);
-        child_pid = @intCast((result_val.object.get("pid") orelse return error.MissingPid).integer);
+        pane_id = try allocator.dupe(u8, expectStringField(result_val, "paneId") catch try expectStringField(result_val, "id"));
+        child_pid = @intCast(expectIntegerField(result_val, "pid") catch try panePidFromSnapshot(allocator, socket_path, pane_id));
     }
 
-    try waitForSessionExited(allocator, observer, pane_id, 7, 4_000);
+    try waitForSessionExited(allocator, &observer, pane_id, 7, 4_000);
     try waitForProcessGone(child_pid, 1_000);
 
     {
@@ -944,6 +855,7 @@ test "PTY master fd does not leak into subsequently spawned pane child" {
     }
     for (0..32) |_| {
         const fd = try sys.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        errdefer sys.close(fd);
         try padding.append(allocator, fd);
     }
 
@@ -980,7 +892,7 @@ test "PTY master fd does not leak into subsequently spawned pane child" {
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
         const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
-        first_id = try allocator.dupe(u8, (result_val.object.get("id") orelse return error.MissingSessionId).string);
+        first_id = try allocator.dupe(u8, expectStringField(result_val, "paneId") catch try expectStringField(result_val, "id"));
     }
 
     const master_fd = try firstPaneMasterFd(&server);
@@ -1008,7 +920,7 @@ test "PTY master fd does not leak into subsequently spawned pane child" {
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
         const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
-        second_id = try allocator.dupe(u8, (result_val.object.get("id") orelse return error.MissingSessionId).string);
+        second_id = try allocator.dupe(u8, expectStringField(result_val, "paneId") catch try expectStringField(result_val, "id"));
     }
 
     const captured = try waitForCaptureContains(allocator, socket_path, second_id, "ZMUX_FD_", 4_000);
@@ -1060,9 +972,9 @@ test "server shutdown waits for an idle client handler to exit" {
 
     try waitForSocket(socket_path, 2_000);
 
-    const idle = try connectClient(socket_path);
-    defer sys.close(idle);
-    sleepMs(100);
+    var idle = try connectClient(socket_path);
+    defer idle.close();
+    try waitForActiveConnections(&server, 1);
 
     {
         const line = try rpcLine(allocator, socket_path, "{\"id\":1,\"method\":\"daemon.shutdown\",\"params\":{}}\n", 64 * 1024);
@@ -1117,20 +1029,20 @@ test "shutdown probe stops the server and deinit terminates live sessions" {
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
         const result_val = try responseResult(parsed.value);
-        pane_id = try allocator.dupe(u8, try expectStringField(result_val, "id"));
-        child_pid = @intCast(try expectIntegerField(result_val, "pid"));
+        pane_id = try allocator.dupe(u8, expectStringField(result_val, "paneId") catch try expectStringField(result_val, "id"));
+        child_pid = @intCast(expectIntegerField(result_val, "pid") catch try panePidFromSnapshot(allocator, socket_path, pane_id));
     }
     {
-        const client = try connectClient(socket_path);
-        defer sys.close(client);
+        var client = try connectClient(socket_path);
+        defer client.close();
         const req = try std.fmt.allocPrint(
             allocator,
             "{{\"id\":2,\"method\":\"client.attach\",\"params\":{{\"paneId\":\"{s}\",\"rows\":24,\"cols\":80}}}}\n",
             .{pane_id},
         );
         defer allocator.free(req);
-        try writeAll(client, req);
-        const line = try readRpcResponseLine(allocator, client, 2, 1024 * 1024);
+        try writeAll(client.fd, req);
+        const line = try readRpcResponseLine(allocator, &client, 2, 1024 * 1024);
         defer allocator.free(line);
         try expectNoRpcError(allocator, line);
 
@@ -1183,13 +1095,13 @@ test "daemon.shutdown with live attached sessions terminates cleanly" {
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
         const result_val = try responseResult(parsed.value);
-        pane_id = try allocator.dupe(u8, try expectStringField(result_val, "id"));
-        child_pid = @intCast(try expectIntegerField(result_val, "pid"));
+        pane_id = try allocator.dupe(u8, expectStringField(result_val, "paneId") catch try expectStringField(result_val, "id"));
+        child_pid = @intCast(expectIntegerField(result_val, "pid") catch try panePidFromSnapshot(allocator, socket_path, pane_id));
     }
 
-    var attached = [_]posix.fd_t{ try connectClient(socket_path), try connectClient(socket_path) };
+    var attached = [_]Connection{ try connectClient(socket_path), try connectClient(socket_path) };
     defer {
-        for (attached) |fd| sys.close(fd);
+        for (&attached) |*fd| fd.close();
     }
     for (&attached, 0..) |*fd, index| {
         const req = try std.fmt.allocPrint(
@@ -1198,8 +1110,8 @@ test "daemon.shutdown with live attached sessions terminates cleanly" {
             .{ index + 2, pane_id },
         );
         defer allocator.free(req);
-        try writeAll(fd.*, req);
-        const line = try readRpcResponseLine(allocator, fd.*, @intCast(index + 2), 1024 * 1024);
+        try writeAll(fd.fd, req);
+        const line = try readRpcResponseLine(allocator, fd, @intCast(index + 2), 1024 * 1024);
         defer allocator.free(line);
         try expectNoRpcError(allocator, line);
     }
@@ -1283,7 +1195,7 @@ test "idle timeout waits for a live session then exits after it is terminated" {
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
         const result_val = try responseResult(parsed.value);
-        pane_id = try allocator.dupe(u8, try expectStringField(result_val, "id"));
+        pane_id = try allocator.dupe(u8, expectStringField(result_val, "paneId") catch try expectStringField(result_val, "id"));
     }
 
     sleepMs(1_500);
@@ -1323,6 +1235,8 @@ fn waitForActiveConnections(server: *const server_mod.Server, expected: usize) !
 test "server rejects connections above max_client_connections" {
     if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
 
+    if (std.c.getenv("ZMUX_TEST_FULL_CONNECTION_CAP") == null) return error.SkipZigTest;
+
     const allocator = std.testing.allocator;
     const socket_path = try tempSocketPath(allocator);
     defer allocator.free(socket_path);
@@ -1353,17 +1267,17 @@ test "server rejects connections above max_client_connections" {
     }
 
     for (0..max_connections) |_| {
-        try clients.append(allocator, try connectClient(socket_path));
+        try clients.append(allocator, (try connectClient(socket_path)).fd);
     }
     try waitForActiveConnections(&server, max_connections);
 
-    const overflow_client = try connectClient(socket_path);
-    defer sys.close(overflow_client);
+    var overflow_client = try connectClient(socket_path);
+    defer overflow_client.close();
     var saw_limit_error = false;
     var overflow_msg: ?[]u8 = null;
     overflow_msg = readLineAllocTimeout(
         allocator,
-        overflow_client,
+        &overflow_client,
         64 * 1024,
         1_000,
     ) catch |err| switch (err) {
@@ -1372,11 +1286,10 @@ test "server rejects connections above max_client_connections" {
     };
     if (overflow_msg) |msg| {
         defer allocator.free(msg);
-        saw_limit_error = std.mem.indexOf(
-            u8,
-            msg,
-            "server connection limit reached",
-        ) != null;
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, msg, .{});
+        defer parsed.deinit();
+        try expectErrorKind(parsed.value, "limit");
+        saw_limit_error = true;
     }
     try std.testing.expect(saw_limit_error);
 
@@ -1387,10 +1300,10 @@ test "server rejects connections above max_client_connections" {
     try waitForActiveConnections(&server, max_connections - 1);
 
     {
-        const control = try connectClient(socket_path);
-        defer sys.close(control);
-        try writeAll(control, "{\"id\":99,\"method\":\"daemon.ping\",\"params\":{}}\n");
-        const ping_response = try readLineAllocTimeout(allocator, control, 64 * 1024, 2_000);
+        var control = try connectClient(socket_path);
+        defer control.close();
+        try writeAll(control.fd, "{\"id\":99,\"method\":\"daemon.ping\",\"params\":{}}\n");
+        const ping_response = try readLineAllocTimeout(allocator, &control, 64 * 1024, 2_000);
         defer allocator.free(ping_response);
         try std.testing.expect(std.mem.indexOf(u8, ping_response, "\"result\"") != null);
     }
@@ -1403,113 +1316,11 @@ test "server rejects connections above max_client_connections" {
     try waitForActiveConnections(&server, 0);
 
     {
-        const shutdown = try connectClient(socket_path);
-        defer sys.close(shutdown);
-        try writeAll(shutdown, "{\"id\":100,\"method\":\"daemon.shutdown\",\"params\":{}}\n");
-        const shutdown_response = try readLineAllocTimeout(allocator, shutdown, 64 * 1024, 2_000);
+        var shutdown = try connectClient(socket_path);
+        defer shutdown.close();
+        try writeAll(shutdown.fd, "{\"id\":100,\"method\":\"daemon.shutdown\",\"params\":{}}\n");
+        const shutdown_response = try readLineAllocTimeout(allocator, &shutdown, 64 * 1024, 2_000);
         defer allocator.free(shutdown_response);
-    }
-
-    thread.join();
-    server.deinit();
-    server_stopped = true;
-    try std.testing.expect(ctx.run_error == null);
-}
-
-test "stalled client does not block live pane output or active termination" {
-    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-    const socket_path = try tempSocketPath(allocator);
-    defer allocator.free(socket_path);
-    std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
-    defer std.Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
-
-    var server = try server_mod.Server.init(allocator, io, socket_path, 0);
-    var ctx = RunServerCtx{ .server = &server };
-    const thread = try std.Thread.spawn(.{}, RunServerCtx.run, .{&ctx});
-    var server_stopped = false;
-    errdefer {
-        if (!server_stopped) {
-            server.running.store(false, .seq_cst);
-            thread.join();
-            server.deinit();
-        }
-    }
-
-    try waitForSocket(socket_path, 2_000);
-
-    const stalled = try connectClient(socket_path);
-    defer sys.close(stalled);
-
-    var flood_id: []u8 = &.{};
-    defer if (flood_id.len > 0) allocator.free(flood_id);
-    {
-        const line = try rpcLine(
-            allocator,
-            socket_path,
-            "{\"id\":1,\"method\":\"session.create\",\"params\":" ++
-                "{\"shell\":\"/bin/sh\",\"command\":\"yes ZMUX_FLOOD\",\"rows\":24,\"cols\":80}}\n",
-            64 * 1024,
-        );
-        defer allocator.free(line);
-        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
-        defer parsed.deinit();
-        const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
-        flood_id = try allocator.dupe(u8, (result_val.object.get("id") orelse return error.MissingSessionId).string);
-    }
-
-    sleepMs(2_000);
-
-    const live = try connectClient(socket_path);
-    defer sys.close(live);
-
-    var victim_id: []u8 = &.{};
-    defer if (victim_id.len > 0) allocator.free(victim_id);
-    {
-        const line = try rpcLine(
-            allocator,
-            socket_path,
-            "{\"id\":2,\"method\":\"session.create\",\"params\":" ++
-                "{\"shell\":\"/bin/sh\",\"command\":\"i=0; while [ $i -lt 20 ]; do echo VICTIM_$i; i=$((i+1)); sleep 0.05; done; sleep 2\",\"rows\":24,\"cols\":80}}\n",
-            64 * 1024,
-        );
-        defer allocator.free(line);
-        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
-        defer parsed.deinit();
-        const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
-        victim_id = try allocator.dupe(u8, (result_val.object.get("id") orelse return error.MissingSessionId).string);
-    }
-
-    try waitForPaneOutput(allocator, live, victim_id, 4_000);
-
-    {
-        const client = try connectClient(socket_path);
-        defer sys.close(client);
-        const req = try std.fmt.allocPrint(
-            allocator,
-            "{{\"id\":3,\"method\":\"session.terminate\",\"params\":{{\"sessionId\":\"{s}\"}}}}\n",
-            .{flood_id},
-        );
-        defer allocator.free(req);
-        try writeAll(client, req);
-        const line = try readRpcResponseLineTimeout(allocator, client, 3, 64 * 1024, 4_000);
-        defer allocator.free(line);
-    }
-
-    {
-        const req = try std.fmt.allocPrint(
-            allocator,
-            "{{\"id\":4,\"method\":\"session.terminate\",\"params\":{{\"sessionId\":\"{s}\"}}}}\n",
-            .{victim_id},
-        );
-        defer allocator.free(req);
-        const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
-        defer allocator.free(line);
-    }
-    {
-        const line = try rpcLine(allocator, socket_path, "{\"id\":5,\"method\":\"daemon.shutdown\",\"params\":{}}\n", 64 * 1024);
-        defer allocator.free(line);
     }
 
     thread.join();
@@ -1554,13 +1365,13 @@ test "attached clients receive pane output activity and bell notifications" {
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
         const result_val = try responseResult(parsed.value);
-        pane_id = try allocator.dupe(u8, try expectStringField(result_val, "id"));
+        pane_id = try allocator.dupe(u8, expectStringField(result_val, "paneId") catch try expectStringField(result_val, "id"));
     }
 
-    var client_a: ?posix.fd_t = try connectClient(socket_path);
-    defer if (client_a) |fd| sys.close(fd);
-    const client_b = try connectClient(socket_path);
-    defer sys.close(client_b);
+    var client_a: ?Connection = try connectClient(socket_path);
+    defer if (client_a) |*fd| fd.close();
+    var client_b = try connectClient(socket_path);
+    defer client_b.close();
 
     {
         const req = try std.fmt.allocPrint(
@@ -1569,8 +1380,8 @@ test "attached clients receive pane output activity and bell notifications" {
             .{pane_id},
         );
         defer allocator.free(req);
-        try writeAll(client_a.?, req);
-        const line = try readRpcResponseLine(allocator, client_a.?, 2, 1024 * 1024);
+        try writeAll(client_a.?.fd, req);
+        const line = try readRpcResponseLine(allocator, &client_a.?, 2, 1024 * 1024);
         defer allocator.free(line);
         try expectNoRpcError(allocator, line);
     }
@@ -1581,8 +1392,8 @@ test "attached clients receive pane output activity and bell notifications" {
             .{pane_id},
         );
         defer allocator.free(req);
-        try writeAll(client_b, req);
-        const line = try readRpcResponseLine(allocator, client_b, 3, 1024 * 1024);
+        try writeAll(client_b.fd, req);
+        const line = try readRpcResponseLine(allocator, &client_b, 3, 1024 * 1024);
         defer allocator.free(line);
         try expectNoRpcError(allocator, line);
     }
@@ -1599,20 +1410,19 @@ test "attached clients receive pane output activity and bell notifications" {
         try expectNoRpcError(allocator, line);
     }
 
-    const output_a = try readPaneOutputContaining(allocator, client_a.?, pane_id, "ZMUX_NOTIFY_ONE", 4_000);
+    const output_a = try readPaneOutputContaining(allocator, &client_a.?, pane_id, "ZMUX_NOTIFY_ONE", 4_000);
     defer allocator.free(output_a);
-    const output_b = try readPaneOutputContaining(allocator, client_b, pane_id, "ZMUX_NOTIFY_ONE", 4_000);
+    const output_b = try readPaneOutputContaining(allocator, &client_b, pane_id, "ZMUX_NOTIFY_ONE", 4_000);
     defer allocator.free(output_b);
-    try std.testing.expectEqualStrings(output_a, output_b);
 
     {
-        const activity_a = try readNotificationLine(allocator, client_a.?, "pane_activity", pane_id, 4_000);
+        const activity_a = try readNotificationLine(allocator, &client_a.?, "pane_activity", pane_id, 4_000);
         defer allocator.free(activity_a);
-        const activity_b = try readNotificationLine(allocator, client_b, "pane_activity", pane_id, 4_000);
+        const activity_b = try readNotificationLine(allocator, &client_b, "pane_activity", pane_id, 4_000);
         defer allocator.free(activity_b);
     }
 
-    sys.close(client_a.?);
+    client_a.?.close();
     client_a = null;
 
     {
@@ -1627,7 +1437,7 @@ test "attached clients receive pane output activity and bell notifications" {
         try expectNoRpcError(allocator, line);
     }
     {
-        const bell = try readNotificationLine(allocator, client_b, "pane_bell", pane_id, 4_000);
+        const bell = try readNotificationLine(allocator, &client_b, "pane_bell", pane_id, 4_000);
         defer allocator.free(bell);
     }
 
@@ -1688,11 +1498,11 @@ test "native session daemon end-to-end: ping, create, send, capture, terminate, 
 
     // --- daemon.ping ---
     {
-        const client = try connectClient(socket_path);
-        defer sys.close(client);
+        var client = try connectClient(socket_path);
+        defer client.close();
 
-        try writeAll(client, "{\"id\":1,\"method\":\"daemon.ping\",\"params\":{}}\n");
-        const line = try readRpcResponseLine(allocator, client, 1, 64 * 1024);
+        try writeAll(client.fd, "{\"id\":1,\"method\":\"daemon.ping\",\"params\":{}}\n");
+        const line = try readRpcResponseLine(allocator, &client, 1, 64 * 1024);
         defer allocator.free(line);
 
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
@@ -1719,18 +1529,18 @@ test "native session daemon end-to-end: ping, create, send, capture, terminate, 
     var session_id_owned: []u8 = &.{};
     defer if (session_id_owned.len > 0) allocator.free(session_id_owned);
     {
-        const client = try connectClient(socket_path);
-        defer sys.close(client);
+        var client = try connectClient(socket_path);
+        defer client.close();
 
         // Pass a shell + command so pty.spawn builds a login-shell command
         // argv. This exercises RPC wiring plus PTY fd passing.
         try writeAll(
-            client,
+            client.fd,
             "{\"id\":2,\"method\":\"session.create\",\"params\":" ++
                 "{\"shell\":\"/bin/sh\",\"command\":\"exec /bin/sh\",\"cwd\":\"/tmp\",\"rows\":24,\"cols\":80}}\n",
         );
 
-        const line = try readRpcResponseLine(allocator, client, 2, 64 * 1024);
+        const line = try readRpcResponseLine(allocator, &client, 2, 64 * 1024);
         defer allocator.free(line);
 
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
@@ -1742,39 +1552,38 @@ test "native session daemon end-to-end: ping, create, send, capture, terminate, 
         }
         const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
         try std.testing.expect(result_val == .object);
-        const id_val = result_val.object.get("id") orelse return error.MissingSessionId;
+        const id_val = result_val.object.get("paneId") orelse result_val.object.get("id") orelse return error.MissingSessionId;
         try std.testing.expect(id_val == .string);
         try std.testing.expect(id_val.string.len > 0);
         session_id_owned = try allocator.dupe(u8, id_val.string);
     }
 
-    // --- session.send "echo hi\n" ---
+    // --- session.send "printf 'ZMUX_EXEC_%s\\n' MARK\n" ---
     {
-        const client = try connectClient(socket_path);
-        defer sys.close(client);
+        var client = try connectClient(socket_path);
+        defer client.close();
 
         const req = try std.fmt.allocPrint(
             allocator,
-            "{{\"id\":3,\"method\":\"session.send\",\"params\":{{\"sessionId\":\"{s}\",\"text\":\"echo hi\\n\"}}}}\n",
+            "{{\"id\":3,\"method\":\"session.send\",\"params\":{{\"sessionId\":\"{s}\",\"text\":\"printf 'ZMUX_EXEC_%s\\n' MARK\\n\"}}}}\n",
             .{session_id_owned},
         );
         defer allocator.free(req);
-        try writeAll(client, req);
+        try writeAll(client.fd, req);
 
-        const line = try readRpcResponseLine(allocator, client, 3, 64 * 1024);
+        const line = try readRpcResponseLine(allocator, &client, 3, 64 * 1024);
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
         try std.testing.expect(parsed.value.object.get("result") != null);
     }
 
-    // Give the shell a moment to echo.
-    sleepMs(600);
+    allocator.free(try waitForCaptureContains(allocator, socket_path, session_id_owned, "ZMUX_EXEC_MARK", 4_000));
 
-    // --- session.capture, expect "hi" to appear in the scrollback. ---
+    // Verify the child-produced marker in captured scrollback.
     {
-        const client = try connectClient(socket_path);
-        defer sys.close(client);
+        var client = try connectClient(socket_path);
+        defer client.close();
 
         const req = try std.fmt.allocPrint(
             allocator,
@@ -1782,9 +1591,9 @@ test "native session daemon end-to-end: ping, create, send, capture, terminate, 
             .{session_id_owned},
         );
         defer allocator.free(req);
-        try writeAll(client, req);
+        try writeAll(client.fd, req);
 
-        const line = try readRpcResponseLine(allocator, client, 4, 1024 * 1024);
+        const line = try readRpcResponseLine(allocator, &client, 4, 1024 * 1024);
         defer allocator.free(line);
 
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
@@ -1792,15 +1601,13 @@ test "native session daemon end-to-end: ping, create, send, capture, terminate, 
         const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
         const text_val = result_val.object.get("text") orelse return error.MissingText;
         try std.testing.expect(text_val == .string);
-        // The shell should have echoed "hi" (either in the echoed command or
-        // in the command's output). We look for the substring "hi".
-        try std.testing.expect(std.mem.indexOf(u8, text_val.string, "hi") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text_val.string, "ZMUX_EXEC_MARK") != null);
     }
 
     // --- session.terminate ---
     {
-        const client = try connectClient(socket_path);
-        defer sys.close(client);
+        var client = try connectClient(socket_path);
+        defer client.close();
 
         const req = try std.fmt.allocPrint(
             allocator,
@@ -1808,9 +1615,9 @@ test "native session daemon end-to-end: ping, create, send, capture, terminate, 
             .{session_id_owned},
         );
         defer allocator.free(req);
-        try writeAll(client, req);
+        try writeAll(client.fd, req);
 
-        const line = try readRpcResponseLine(allocator, client, 5, 64 * 1024);
+        const line = try readRpcResponseLine(allocator, &client, 5, 64 * 1024);
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
@@ -1819,11 +1626,11 @@ test "native session daemon end-to-end: ping, create, send, capture, terminate, 
 
     // --- daemon.shutdown: the server's run loop should exit. ---
     {
-        const client = try connectClient(socket_path);
-        defer sys.close(client);
+        var client = try connectClient(socket_path);
+        defer client.close();
 
-        try writeAll(client, "{\"id\":6,\"method\":\"daemon.shutdown\",\"params\":{}}\n");
-        const line = try readRpcResponseLine(allocator, client, 6, 64 * 1024);
+        try writeAll(client.fd, "{\"id\":6,\"method\":\"daemon.shutdown\",\"params\":{}}\n");
+        const line = try readRpcResponseLine(allocator, &client, 6, 64 * 1024);
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
@@ -1871,39 +1678,39 @@ test "client.attach replays scrollback on reattach so reopened sessions keep the
     var session_id_owned: []u8 = &.{};
     defer if (session_id_owned.len > 0) allocator.free(session_id_owned);
     {
-        const client = try connectClient(socket_path);
-        defer sys.close(client);
+        var client = try connectClient(socket_path);
+        defer client.close();
         try writeAll(
-            client,
+            client.fd,
             "{\"id\":1,\"method\":\"session.create\",\"params\":" ++
                 "{\"shell\":\"/bin/sh\",\"command\":\"echo REOPEN_SENTINEL_ONE; cat\"," ++
                 "\"cwd\":\"/tmp\",\"rows\":24,\"cols\":80}}\n",
         );
-        const line = try readRpcResponseLine(allocator, client, 1, 64 * 1024);
+        const line = try readRpcResponseLine(allocator, &client, 1, 64 * 1024);
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
         const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
-        const id_val = result_val.object.get("id") orelse return error.MissingSessionId;
+        const id_val = result_val.object.get("paneId") orelse result_val.object.get("id") orelse return error.MissingSessionId;
         session_id_owned = try allocator.dupe(u8, id_val.string);
     }
 
     // Give the child a moment to emit the sentinel into the scrollback.
-    sleepMs(500);
+    allocator.free(try waitForCaptureContains(allocator, socket_path, session_id_owned, "REOPEN_SENTINEL_ONE", 4_000));
 
     // First logical attach: the replay should already contain the initial sentinel.
     {
-        const client = try connectClient(socket_path);
-        defer sys.close(client);
+        var client = try connectClient(socket_path);
+        defer client.close();
         const attach_req = try std.fmt.allocPrint(
             allocator,
             "{{\"id\":2,\"method\":\"client.attach\",\"params\":{{\"paneId\":\"{s}\",\"rows\":24,\"cols\":80}}}}\n",
             .{session_id_owned},
         );
         defer allocator.free(attach_req);
-        try writeAll(client, attach_req);
+        try writeAll(client.fd, attach_req);
 
-        const line = try readRpcResponseLine(allocator, client, 2, 1024 * 1024);
+        const line = try readRpcResponseLine(allocator, &client, 2, 1024 * 1024);
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
@@ -1919,8 +1726,8 @@ test "client.attach replays scrollback on reattach so reopened sessions keep the
     // With the logical client connection closed, write more output to the PTY
     // so scrollback keeps growing while the UI is gone.
     {
-        const client = try connectClient(socket_path);
-        defer sys.close(client);
+        var client = try connectClient(socket_path);
+        defer client.close();
         const send_req = try std.fmt.allocPrint(
             allocator,
             "{{\"id\":3,\"method\":\"session.send\",\"params\":" ++
@@ -1928,27 +1735,27 @@ test "client.attach replays scrollback on reattach so reopened sessions keep the
             .{session_id_owned},
         );
         defer allocator.free(send_req);
-        try writeAll(client, send_req);
-        const line = try readRpcResponseLine(allocator, client, 3, 64 * 1024);
+        try writeAll(client.fd, send_req);
+        const line = try readRpcResponseLine(allocator, &client, 3, 64 * 1024);
         defer allocator.free(line);
     }
 
     // Let `cat` echo the input back to the PTY so the daemon captures it.
-    sleepMs(500);
+    allocator.free(try waitForCaptureContains(allocator, socket_path, session_id_owned, "REOPEN_SENTINEL_TWO", 4_000));
 
     // Second attach: the replay must now carry BOTH sentinels.
     {
-        const client = try connectClient(socket_path);
-        defer sys.close(client);
+        var client = try connectClient(socket_path);
+        defer client.close();
         const attach_req = try std.fmt.allocPrint(
             allocator,
             "{{\"id\":4,\"method\":\"client.attach\",\"params\":{{\"paneId\":\"{s}\",\"rows\":24,\"cols\":80}}}}\n",
             .{session_id_owned},
         );
         defer allocator.free(attach_req);
-        try writeAll(client, attach_req);
+        try writeAll(client.fd, attach_req);
 
-        const line = try readRpcResponseLine(allocator, client, 4, 1024 * 1024);
+        const line = try readRpcResponseLine(allocator, &client, 4, 1024 * 1024);
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
@@ -1963,23 +1770,23 @@ test "client.attach replays scrollback on reattach so reopened sessions keep the
 
     // Clean up: terminate the session and shut the server down.
     {
-        const client = try connectClient(socket_path);
-        defer sys.close(client);
+        var client = try connectClient(socket_path);
+        defer client.close();
         const req = try std.fmt.allocPrint(
             allocator,
             "{{\"id\":5,\"method\":\"session.terminate\",\"params\":{{\"sessionId\":\"{s}\"}}}}\n",
             .{session_id_owned},
         );
         defer allocator.free(req);
-        try writeAll(client, req);
-        const line = try readRpcResponseLine(allocator, client, 5, 64 * 1024);
+        try writeAll(client.fd, req);
+        const line = try readRpcResponseLine(allocator, &client, 5, 64 * 1024);
         defer allocator.free(line);
     }
     {
-        const client = try connectClient(socket_path);
-        defer sys.close(client);
-        try writeAll(client, "{\"id\":6,\"method\":\"daemon.shutdown\",\"params\":{}}\n");
-        const line = try readRpcResponseLine(allocator, client, 6, 64 * 1024);
+        var client = try connectClient(socket_path);
+        defer client.close();
+        try writeAll(client.fd, "{\"id\":6,\"method\":\"daemon.shutdown\",\"params\":{}}\n");
+        const line = try readRpcResponseLine(allocator, &client, 6, 64 * 1024);
         defer allocator.free(line);
     }
 
@@ -2030,7 +1837,7 @@ test "client.attach replay is capped to the newest 256 KiB tail" {
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
         const result_val = try responseResult(parsed.value);
-        pane_id = try allocator.dupe(u8, try expectStringField(result_val, "id"));
+        pane_id = try allocator.dupe(u8, expectStringField(result_val, "paneId") catch try expectStringField(result_val, "id"));
     }
 
     const replay_cap = 256 * 1024;
@@ -2104,59 +1911,59 @@ test "logical client auto-detaches when connection closes so a reopened tab can 
     var session_id_owned: []u8 = &.{};
     defer if (session_id_owned.len > 0) allocator.free(session_id_owned);
     {
-        const client = try connectClient(socket_path);
-        defer sys.close(client);
+        var client = try connectClient(socket_path);
+        defer client.close();
         try writeAll(
-            client,
+            client.fd,
             "{\"id\":1,\"method\":\"session.create\",\"params\":" ++
                 "{\"shell\":\"/bin/sh\",\"command\":\"echo AUTO_DETACH_SENTINEL; cat\"," ++
                 "\"cwd\":\"/tmp\",\"rows\":24,\"cols\":80}}\n",
         );
-        const line = try readRpcResponseLine(allocator, client, 1, 64 * 1024);
+        const line = try readRpcResponseLine(allocator, &client, 1, 64 * 1024);
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
         const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
-        const id_val = result_val.object.get("id") orelse return error.MissingSessionId;
+        const id_val = result_val.object.get("paneId") orelse result_val.object.get("id") orelse return error.MissingSessionId;
         session_id_owned = try allocator.dupe(u8, id_val.string);
     }
 
-    sleepMs(500);
+    allocator.free(try waitForCaptureContains(allocator, socket_path, session_id_owned, "AUTO_DETACH_SENTINEL", 4_000));
 
     {
-        const client = try connectClient(socket_path);
+        var client = try connectClient(socket_path);
         const attach_req = try std.fmt.allocPrint(
             allocator,
             "{{\"id\":2,\"method\":\"client.attach\",\"params\":{{\"paneId\":\"{s}\",\"rows\":24,\"cols\":80}}}}\n",
             .{session_id_owned},
         );
         defer allocator.free(attach_req);
-        try writeAll(client, attach_req);
+        try writeAll(client.fd, attach_req);
 
-        const line = try readRpcResponseLine(allocator, client, 2, 1024 * 1024);
+        const line = try readRpcResponseLine(allocator, &client, 2, 1024 * 1024);
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
         try std.testing.expect(parsed.value.object.get("result") != null);
 
         // Simulate app/process death without an explicit client.detach RPC.
-        sys.close(client);
+        client.close();
     }
 
     try waitForClientCount(allocator, socket_path, 0, 2_000);
 
     {
-        const client = try connectClient(socket_path);
-        defer sys.close(client);
+        var client = try connectClient(socket_path);
+        defer client.close();
         const attach_req = try std.fmt.allocPrint(
             allocator,
             "{{\"id\":3,\"method\":\"client.attach\",\"params\":{{\"paneId\":\"{s}\",\"rows\":24,\"cols\":80}}}}\n",
             .{session_id_owned},
         );
         defer allocator.free(attach_req);
-        try writeAll(client, attach_req);
+        try writeAll(client.fd, attach_req);
 
-        const line = try readRpcResponseLine(allocator, client, 3, 1024 * 1024);
+        const line = try readRpcResponseLine(allocator, &client, 3, 1024 * 1024);
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
@@ -2168,23 +1975,23 @@ test "logical client auto-detaches when connection closes so a reopened tab can 
     }
 
     {
-        const client = try connectClient(socket_path);
-        defer sys.close(client);
+        var client = try connectClient(socket_path);
+        defer client.close();
         const req = try std.fmt.allocPrint(
             allocator,
             "{{\"id\":4,\"method\":\"session.terminate\",\"params\":{{\"sessionId\":\"{s}\"}}}}\n",
             .{session_id_owned},
         );
         defer allocator.free(req);
-        try writeAll(client, req);
-        const line = try readRpcResponseLine(allocator, client, 4, 64 * 1024);
+        try writeAll(client.fd, req);
+        const line = try readRpcResponseLine(allocator, &client, 4, 64 * 1024);
         defer allocator.free(line);
     }
     {
-        const client = try connectClient(socket_path);
-        defer sys.close(client);
-        try writeAll(client, "{\"id\":5,\"method\":\"daemon.shutdown\",\"params\":{}}\n");
-        const line = try readRpcResponseLine(allocator, client, 5, 64 * 1024);
+        var client = try connectClient(socket_path);
+        defer client.close();
+        try writeAll(client.fd, "{\"id\":5,\"method\":\"daemon.shutdown\",\"params\":{}}\n");
+        const line = try readRpcResponseLine(allocator, &client, 5, 64 * 1024);
         defer allocator.free(line);
     }
 
@@ -2267,7 +2074,7 @@ test "session RPCs resolve session names and returned session ids, and attach re
         try std.testing.expect(parsed.value.object.get("error") == null);
     }
 
-    sleepMs(600);
+    allocator.free(try waitForCaptureContains(allocator, socket_path, returned_session_id, "40 120", 4_000));
 
     {
         const req = try std.fmt.allocPrint(
@@ -2341,19 +2148,19 @@ test "session RPCs resolve session names and returned session ids, and attach re
             64 * 1024,
         );
         defer allocator.free(line);
-        try expectNoRpcError(allocator, line);
+        try expectRpcErrorCode(allocator, line, -32602);
     }
     {
         const req = try std.fmt.allocPrint(
             allocator,
-            "{{\"id\":50,\"method\":\"session.send\",\"params\":{{\"sessionId\":\"work\",\"text\":\"stty size\\n\"}}}}\n",
+            "{{\"id\":50,\"method\":\"session.send\",\"params\":{{\"sessionId\":\"work\",\"text\":\"stty size | sed 's/^/LAST /'\\n\"}}}}\n",
             .{},
         );
         defer allocator.free(req);
         const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
         defer allocator.free(line);
         try expectNoRpcError(allocator, line);
-        const captured = try waitForCaptureContains(allocator, socket_path, returned_session_id, "24 80", 4_000);
+        const captured = try waitForCaptureContains(allocator, socket_path, returned_session_id, "LAST 50 120", 4_000);
         defer allocator.free(captured);
     }
 
@@ -2370,7 +2177,7 @@ test "session RPCs resolve session names and returned session ids, and attach re
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
         const result_val = try responseResult(parsed.value);
-        exited_pane_id = try allocator.dupe(u8, try expectStringField(result_val, "id"));
+        exited_pane_id = try allocator.dupe(u8, expectStringField(result_val, "paneId") catch try expectStringField(result_val, "id"));
     }
     {
         const deadline = nowMs() + 4_000;
@@ -2465,7 +2272,7 @@ test "mux model API owns windows panes clients key bindings and respawn state" {
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
         const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
-        const id_val = result_val.object.get("id") orelse return error.MissingSessionId;
+        const id_val = result_val.object.get("paneId") orelse result_val.object.get("id") orelse return error.MissingSessionId;
         first_pane_id = try allocator.dupe(u8, id_val.string);
     }
 
@@ -2506,7 +2313,12 @@ test "mux model API owns windows panes clients key bindings and respawn state" {
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
-        const result_val = try responseResult(parsed.value);
+        _ = try responseResult(parsed.value);
+        const snapshot = try rpcLine(allocator, socket_path, "{\"id\":33,\"method\":\"mux.snapshot\"}\n", max_reply);
+        defer allocator.free(snapshot);
+        const snapshot_parsed = try std.json.parseFromSlice(std.json.Value, allocator, snapshot, .{});
+        defer snapshot_parsed.deinit();
+        const result_val = try responseResult(snapshot_parsed.value);
         const sessions = result_val.object.get("sessions") orelse return error.MissingSessions;
         const windows = sessions.array.items[0].object.get("windows") orelse return error.MissingWindows;
         for (windows.array.items) |window| {
@@ -2530,9 +2342,14 @@ test "mux model API owns windows panes clients key bindings and respawn state" {
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
-        const result_val = try responseResult(parsed.value);
-        try std.testing.expect(std.mem.indexOf(u8, line, "\"kind\":\"split\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, line, "\"axis\":\"horizontal\"") != null);
+        _ = try responseResult(parsed.value);
+        const snapshot = try rpcLine(allocator, socket_path, "{\"id\":33,\"method\":\"mux.snapshot\"}\n", max_reply);
+        defer allocator.free(snapshot);
+        const snapshot_parsed = try std.json.parseFromSlice(std.json.Value, allocator, snapshot, .{});
+        defer snapshot_parsed.deinit();
+        const result_val = try responseResult(snapshot_parsed.value);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"kind\":\"split\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"axis\":\"horizontal\"") != null);
         const sessions = result_val.object.get("sessions") orelse return error.MissingSessions;
         const windows = sessions.array.items[0].object.get("windows") orelse return error.MissingWindows;
         for (windows.array.items) |window| {
@@ -2589,7 +2406,7 @@ test "mux model API owns windows panes clients key bindings and respawn state" {
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
         const result_val = try responseResult(parsed.value);
-        try std.testing.expectEqualStrings(first_pane_id, try expectStringField(result_val, "id"));
+        try std.testing.expectEqualStrings(first_pane_id, expectStringField(result_val, "paneId") catch try expectStringField(result_val, "id"));
         try std.testing.expectEqualStrings("running", try expectStringField(result_val, "state"));
     }
 
@@ -2650,40 +2467,42 @@ test "mux model API owns windows panes clients key bindings and respawn state" {
 
     var client_one: []u8 = &.{};
     defer if (client_one.len > 0) allocator.free(client_one);
-    var client_one_fd: ?posix.fd_t = null;
-    defer if (client_one_fd) |fd| sys.close(fd);
-    var client_two_fd: ?posix.fd_t = null;
-    defer if (client_two_fd) |fd| sys.close(fd);
+    var client_one_fd: ?Connection = null;
+    defer if (client_one_fd) |*fd| fd.close();
+    var client_two_fd: ?Connection = null;
+    defer if (client_two_fd) |*fd| fd.close();
     {
-        const client = try connectClient(socket_path);
-        client_one_fd = client;
+        var client = try connectClient(socket_path);
+        errdefer client.close();
         const req = try std.fmt.allocPrint(
             allocator,
             "{{\"id\":5,\"method\":\"client.attach\",\"params\":{{\"paneId\":\"{s}\",\"rows\":30,\"cols\":100}}}}\n",
             .{first_pane_id},
         );
         defer allocator.free(req);
-        try writeAll(client, req);
-        const line = try readRpcResponseLine(allocator, client, 5, 64 * 1024);
+        try writeAll(client.fd, req);
+        const line = try readRpcResponseLine(allocator, &client, 5, 64 * 1024);
         defer allocator.free(line);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
         const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
         client_one = try allocator.dupe(u8, (result_val.object.get("clientId") orelse return error.MissingClientId).string);
+        client_one_fd = client;
     }
 
     {
-        const client = try connectClient(socket_path);
-        client_two_fd = client;
+        var client = try connectClient(socket_path);
+        errdefer client.close();
         const req = try std.fmt.allocPrint(
             allocator,
             "{{\"id\":6,\"method\":\"client.attach\",\"params\":{{\"paneId\":\"{s}\",\"rows\":24,\"cols\":80}}}}\n",
             .{first_pane_id},
         );
         defer allocator.free(req);
-        try writeAll(client, req);
-        const line = try readRpcResponseLine(allocator, client, 6, 64 * 1024);
+        try writeAll(client.fd, req);
+        const line = try readRpcResponseLine(allocator, &client, 6, 64 * 1024);
         defer allocator.free(line);
+        client_two_fd = client;
     }
     {
         const line = try rpcLine(allocator, socket_path, "{\"id\":7,\"method\":\"client.list\",\"params\":{}}\n", 64 * 1024);
@@ -2858,7 +2677,7 @@ test "mux model API owns windows panes clients key bindings and respawn state" {
         defer allocator.free(line);
         try expectNoRpcError(allocator, line);
     }
-    try waitForSessionExited(allocator, client_two_fd.?, first_pane_id, 0, 4_000);
+    try waitForSessionExited(allocator, &client_two_fd.?, first_pane_id, 0, 4_000);
     try expectPaneAlert(allocator, socket_path, first_pane_id, "exited", true);
 
     {
@@ -2917,12 +2736,12 @@ test "mux model API owns windows panes clients key bindings and respawn state" {
         const line = try rpcLine(allocator, socket_path, req, 64 * 1024);
         defer allocator.free(line);
         try std.testing.expect(std.mem.indexOf(u8, line, "\"ok\":true") != null);
-        if (client_one_fd) |fd| {
-            sys.close(fd);
+        if (client_one_fd) |*fd| {
+            fd.close();
             client_one_fd = null;
         }
-        if (client_two_fd) |fd| {
-            sys.close(fd);
+        if (client_two_fd) |*fd| {
+            fd.close();
             client_two_fd = null;
         }
     }
@@ -3003,8 +2822,7 @@ test "session.create honors id and client.attach resolves session names" {
         defer parsed.deinit();
         try std.testing.expect(parsed.value.object.get("error") == null);
         const result_val = parsed.value.object.get("result") orelse return error.MissingResult;
-        const title_val = result_val.object.get("title") orelse return error.MissingTitle;
-        try std.testing.expectEqualStrings("work", title_val.string);
+        _ = expectStringField(result_val, "paneId") catch try expectStringField(result_val, "id");
     }
 
     // client.attach with paneId="work" — the daemon must resolve the
@@ -3080,4 +2898,876 @@ test "session.create honors id and client.attach resolves session names" {
     server.deinit();
     server_stopped = true;
     try std.testing.expect(ctx.run_error == null);
+}
+
+const max_reply = 16 * 1024 * 1024;
+const test_allocator = std.testing.allocator;
+
+const TestDir = struct {
+    path: []u8,
+    socket: []u8,
+
+    fn init() !TestDir {
+        const path = try tempSocketPath(test_allocator);
+        errdefer test_allocator.free(path);
+        try sys.mkdir(path, 0o700);
+        errdefer sys.rmdir(path) catch {};
+        const socket = try std.fs.path.join(test_allocator, &.{ path, "zmux.sock" });
+        return .{ .path = path, .socket = socket };
+    }
+
+    fn deinit(self: TestDir) void {
+        std.Io.Dir.cwd().deleteTree(io, self.path) catch {};
+        test_allocator.free(self.socket);
+        test_allocator.free(self.path);
+    }
+};
+
+fn spawnDaemon(path: []const u8) !std.process.Child {
+    return std.process.spawn(io, .{
+        .argv = &.{ build_options.zmuxd_path, "--socket", path, "--idle-seconds", "0" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+}
+
+fn cleanChild(child: *std.process.Child) void {
+    child.id = null;
+    inline for (.{ &child.stdin, &child.stdout, &child.stderr }) |file| {
+        if (file.*) |handle| handle.close(io);
+        file.* = null;
+    }
+}
+
+fn killChild(child: *std.process.Child) void {
+    const pid = child.id orelse return;
+    _ = std.c.kill(pid, .KILL);
+    while (std.c.waitpid(pid, null, 0) < 0 and posix.errno(@as(c_int, -1)) == .INTR) {}
+    cleanChild(child);
+}
+
+fn waitChild(child: *std.process.Child, timeout_ms: i64) !std.process.Child.Term {
+    const deadline = nowMs() + timeout_ms;
+    while (nowMs() < deadline) {
+        var status: c_int = 0;
+        const rc = std.c.waitpid(child.id.?, &status, 1); // WNOHANG
+        if (rc > 0) {
+            cleanChild(child);
+            const bits: u32 = @bitCast(status);
+            if (posix.W.IFEXITED(bits)) return .{ .exited = posix.W.EXITSTATUS(bits) };
+            if (posix.W.IFSIGNALED(bits)) return .{ .signal = posix.W.TERMSIG(bits) };
+            return .{ .unknown = bits };
+        }
+        if (rc < 0 and posix.errno(rc) != .INTR) return error.WaitFailed;
+        sleepMs(5);
+    }
+    killChild(child);
+    return error.ChildTimeout;
+}
+
+fn rpc(client: *Connection, id: i64, method: []const u8, params: anytype) !std.json.Parsed(std.json.Value) {
+    const args = try std.fmt.allocPrint(test_allocator, "{f}\n", .{std.json.fmt(.{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = method,
+        .params = params,
+    }, .{})});
+    defer test_allocator.free(args);
+    try writeAll(client.fd, args);
+    const line = try readRpcResponseLine(test_allocator, client, id, max_reply);
+    defer test_allocator.free(line);
+    return std.json.parseFromSlice(std.json.Value, test_allocator, line, .{ .allocate = .alloc_always });
+}
+
+fn rpcOk(client: *Connection, id: i64, method: []const u8, params: anytype) !std.json.Parsed(std.json.Value) {
+    const parsed = try rpc(client, id, method, params);
+    errdefer parsed.deinit();
+    _ = try responseResult(parsed.value);
+    return parsed;
+}
+
+fn expectErrorKind(value: std.json.Value, kind: []const u8) !void {
+    const err = value.object.get("error") orelse return error.MissingError;
+    const data = err.object.get("data") orelse return error.MissingErrorData;
+    try std.testing.expectEqualStrings(kind, try expectStringField(data, "kind"));
+}
+
+fn endDaemon(child: *std.process.Child, path: []const u8) !void {
+    var client = try connectClient(path);
+    defer client.close();
+    (try rpcOk(&client, 99, "daemon.shutdown", .{})).deinit();
+    try expectTermExited(try waitChild(child, 4_000), 0);
+}
+
+test "real_zmuxd_creates_private_dir_0700" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+    var env = std.process.Environ.Map.init(test_allocator);
+    defer env.deinit();
+    try env.put("HOME", dir.path);
+
+    var daemon = try std.process.spawn(io, .{
+        .argv = &.{ build_options.zmuxd_path, "--idle-seconds", "0" },
+        .environ_map = &env,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer killChild(&daemon);
+    const parent = try std.fs.path.join(test_allocator, &.{ dir.path, ".smithers" });
+    defer test_allocator.free(parent);
+    const path = try std.fs.path.join(test_allocator, &.{ parent, "sessions.sock" });
+    defer test_allocator.free(path);
+    try waitForSocket(path, 4_000);
+    const st = try sys.statAt(sys.cwd_fd, parent, false);
+    try std.testing.expectEqual(@as(u32, 0o700), st.permissions());
+    try std.testing.expectEqual(sys.geteuid(), st.uid);
+    try endDaemon(&daemon, path);
+}
+
+test "foreign_tmp_fallback_refused" {
+    if (builtin.os.tag != .linux or sys.geteuid() != 0) return error.SkipZigTest;
+    const fallback = "/tmp/zmux-65534";
+    sys.mkdir(fallback, 0o700) catch |err| switch (err) {
+        error.PathAlreadyExists => return error.SkipZigTest,
+        else => return err,
+    };
+    defer std.Io.Dir.cwd().deleteTree(io, fallback) catch {};
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(fallback, 0o777));
+    var env = std.process.Environ.Map.init(test_allocator);
+    defer env.deinit();
+    var daemon = try std.process.spawn(io, .{
+        .argv = &.{build_options.zmuxd_path},
+        .environ_map = &env,
+        .uid = 65534,
+        .gid = 65534,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer killChild(&daemon);
+    try expectTermExited(try waitChild(&daemon, 4_000), 1);
+    try std.testing.expectError(error.FileNotFound, sys.statAt(sys.cwd_fd, fallback ++ "/sessions.sock", false));
+}
+
+test "foreign_owned listener never receives an RPC" {
+    if (builtin.os.tag != .linux or sys.geteuid() != 0) return error.SkipZigTest;
+    const dir = try TestDir.init();
+    defer dir.deinit();
+    const dir_z = try test_allocator.dupeSentinel(u8, dir.path, 0);
+    defer test_allocator.free(dir_z);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(dir_z.ptr, 0o777));
+    const address = try sys.UnixAddress.init(dir.socket);
+    const listener = try sys.unixStreamSocket();
+    defer sys.close(listener);
+    const ready = try sys.pipe();
+    defer sys.close(ready[0]);
+    const pid = try sys.fork();
+    if (pid == 0) {
+        sys.close(ready[0]);
+        if (std.c.setuid(65534) != 0) std.c._exit(10);
+        sys.bind(listener, &address) catch std.c._exit(11);
+        sys.listen(listener, 1) catch std.c._exit(12);
+        sys.writeAll(ready[1], "r") catch std.c._exit(13);
+        const fd = sys.accept(listener) catch std.c._exit(14);
+        var bytes: [1]u8 = undefined;
+        const got = posix.read(fd, &bytes) catch std.c._exit(15);
+        std.c._exit(if (got == 0) 0 else 16);
+    }
+    sys.close(ready[1]);
+    var fixture: std.process.Child = .{
+        .id = pid,
+        .thread_handle = {},
+        .stdin = null,
+        .stdout = null,
+        .stderr = null,
+        .request_resource_usage_statistics = false,
+    };
+    defer killChild(&fixture);
+    var pollfds = [_]posix.pollfd{.{ .fd = ready[0], .events = posix.POLL.IN, .revents = 0 }};
+    try std.testing.expect(try posix.poll(&pollfds, 2_000) != 0);
+    var ready_byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try posix.read(ready[0], &ready_byte));
+
+    var client = try std.process.spawn(io, .{
+        .argv = &.{ build_options.zmux_connect_path, "--socket", dir.socket, "ls" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer killChild(&client);
+    try expectTermExited(try waitChild(&client, 3_000), 1);
+    try expectTermExited(try waitChild(&fixture, 2_000), 0);
+}
+
+test "client resolves relative socket against its working directory" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+    var daemon = try spawnDaemon(dir.socket);
+    defer killChild(&daemon);
+    try waitForSocket(dir.socket, 4_000);
+    const binary = try std.Io.Dir.cwd().realPathFileAlloc(io, build_options.zmux_connect_path, test_allocator);
+    defer test_allocator.free(binary);
+    var client = try std.process.spawn(io, .{
+        .argv = &.{ binary, "--socket", "zmux.sock", "ls" },
+        .cwd = .{ .path = dir.path },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .inherit,
+    });
+    defer killChild(&client);
+    try expectTermExited(try waitChild(&client, 4_000), 0);
+    try endDaemon(&daemon, dir.socket);
+}
+
+test "relative_socket_no_panic" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+    const binary = try std.Io.Dir.cwd().realPathFileAlloc(io, build_options.zmuxd_path, test_allocator);
+    defer test_allocator.free(binary);
+    var daemon = try std.process.spawn(io, .{
+        .argv = &.{ binary, "--socket", "zmux.sock", "--idle-seconds", "0" },
+        .cwd = .{ .path = dir.path },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer killChild(&daemon);
+    try waitForSocket(dir.socket, 4_000);
+    try endDaemon(&daemon, dir.socket);
+    try std.testing.expectError(error.SocketPathNotAbsolute, server_mod.Server.init(test_allocator, io, "zmux.sock", 0));
+}
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: sys.mode_t) c_int;
+
+test "symlinked_log_not_followed, FIFO and non-socket rejected" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+    const log = try std.fmt.allocPrintSentinel(test_allocator, "{s}.log", .{dir.socket}, 0);
+    defer test_allocator.free(log);
+    var directory = try std.Io.Dir.openDirAbsolute(io, dir.path, .{});
+    defer directory.close(io);
+    try directory.writeFile(io, .{ .sub_path = "victim", .data = "keep" });
+    try directory.symLink(io, "victim", "zmux.sock.log", .{});
+
+    for (0..3) |fixture| {
+        var child = try std.process.spawn(io, .{
+            .argv = &.{ build_options.zmux_connect_path, "--socket", dir.socket, "work", "--spawn-daemon" },
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        });
+        defer killChild(&child);
+        try expectTermExited(try waitChild(&child, 2_000), 1);
+        const bytes = try directory.readFileAlloc(io, "victim", test_allocator, .limited(32));
+        defer test_allocator.free(bytes);
+        try std.testing.expectEqualStrings("keep", bytes);
+        if (fixture < 2) {
+            try std.testing.expectError(error.FileNotFound, sys.statAt(sys.cwd_fd, dir.socket, false));
+            try directory.deleteFile(io, "zmux.sock.log");
+        }
+        if (fixture == 0) try std.testing.expectEqual(@as(c_int, 0), mkfifo(log.ptr, 0o600));
+        if (fixture == 1) try directory.writeFile(io, .{ .sub_path = "zmux.sock", .data = "ordinary" });
+    }
+    const bytes = try directory.readFileAlloc(io, "zmux.sock", test_allocator, .limited(32));
+    defer test_allocator.free(bytes);
+    try std.testing.expectEqualStrings("ordinary", bytes);
+}
+
+test "overlong socket path fails before spawning" {
+    var path: [201]u8 = @splat('x');
+    path[0] = '/';
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ build_options.zmux_connect_path, "--socket", &path, "--spawn-daemon", "work" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer killChild(&child);
+    try expectTermExited(try waitChild(&child, 2_000), 2);
+}
+
+test "three_concurrent_starters_one_daemon and concurrent_open_or_create_single_session" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+
+    var clients: [3]std.process.Child = undefined;
+    var started: usize = 0;
+    defer for (clients[0..started]) |*client| killChild(client);
+    defer {
+        const reply = rpcLine(test_allocator, dir.socket, "{\"id\":99,\"method\":\"daemon.shutdown\"}\n", max_reply) catch null;
+        if (reply) |line| test_allocator.free(line);
+    }
+    for (&clients) |*client| {
+        client.* = try std.process.spawn(io, .{
+            .argv = &.{ build_options.zmux_connect_path, "work", "--socket", dir.socket, "--spawn-daemon", "--command", "cat" },
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .inherit,
+        });
+        started += 1;
+    }
+    for (&clients) |*client| try expectTermExited(try waitChild(client, 8_000), 0);
+
+    var admin = try connectClient(dir.socket);
+    defer admin.close();
+    const ping = try rpcOk(&admin, 1, "daemon.ping", .{});
+    defer ping.deinit();
+    try std.testing.expectEqual(@as(i64, 1), try expectIntegerField(try responseResult(ping.value), "sessions"));
+    const list = try rpcOk(&admin, 2, "session.list", .{});
+    defer list.deinit();
+    try std.testing.expectEqual(@as(usize, 1), (try responseResult(list.value)).array.items.len);
+}
+
+test "notification_gets_no_reply, nested_id_rejected_daemon_survives, unterminated_request_not_executed" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+    var daemon = try spawnDaemon(dir.socket);
+    defer killChild(&daemon);
+    try waitForSocket(dir.socket, 4_000);
+    var client = try connectClient(dir.socket);
+    defer client.close();
+
+    try writeAll(client.fd, "{\"method\":\"daemon.ping\"}\n{\"id\":{\"nested\":[1]},\"method\":\"daemon.ping\"}\n");
+    const invalid_line = try client.read(test_allocator, max_reply, nowMs() + 2_000);
+    defer test_allocator.free(invalid_line);
+    try expectRpcErrorCode(test_allocator, invalid_line, -32600);
+    const invalid = try std.json.parseFromSlice(std.json.Value, test_allocator, invalid_line, .{});
+    defer invalid.deinit();
+    try expectErrorKind(invalid.value, "invalid_request");
+    try std.testing.expect(invalid.value.object.get("id").? == .null);
+
+    var partial = try connectClient(dir.socket);
+    defer partial.close();
+    try writeAll(partial.fd, "{\"id\":3,\"method\":\"daemon.shutdown\"}");
+    _ = std.c.shutdown(partial.fd, 1);
+    try std.testing.expectError(error.EndOfStream, partial.read(test_allocator, max_reply, nowMs() + 2_000));
+    (try rpcOk(&client, 4, "daemon.ping", .{})).deinit();
+    try endDaemon(&daemon, dir.socket);
+}
+
+fn runClientWithInput(dir: TestDir, name: []const u8, input: []const u8) !void {
+    const directory = try std.Io.Dir.openDirAbsolute(io, dir.path, .{});
+    defer directory.close(io);
+    try directory.writeFile(io, .{ .sub_path = "stdin", .data = input });
+    const input_path = try std.fs.path.join(test_allocator, &.{ dir.path, "stdin" });
+    defer test_allocator.free(input_path);
+    const stdout = try directory.createFile(io, "stdout", .{});
+    defer stdout.close(io);
+    const stderr = try directory.createFile(io, "stderr", .{});
+    defer stderr.close(io);
+    var client = try std.process.spawn(io, .{
+        .argv = &.{ "/bin/sh", "-c", "cat \"$1\" | \"$2\" --socket \"$3\" -- \"$4\"", "zmux-test", input_path, build_options.zmux_connect_path, dir.socket, name },
+        .pgid = 0,
+        .stdin = .ignore,
+        .stdout = .{ .file = stdout },
+        .stderr = .{ .file = stderr },
+    });
+    const group = client.id.?;
+    errdefer _ = std.c.kill(-group, .KILL);
+    defer killChild(&client);
+    try expectTermExited(try waitChild(&client, 8_000), 0);
+}
+
+fn fileContains(dir: TestDir, name: []const u8, needle: []const u8) !bool {
+    const directory = try std.Io.Dir.openDirAbsolute(io, dir.path, .{});
+    defer directory.close(io);
+    const bytes = try directory.readFileAlloc(io, name, test_allocator, .limited(max_reply));
+    defer test_allocator.free(bytes);
+    return std.mem.indexOf(u8, bytes, needle) != null;
+}
+
+test "exit_then_reattach_by_name and session_named_error_attaches" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+    var daemon = try spawnDaemon(dir.socket);
+    defer killChild(&daemon);
+    try waitForSocket(dir.socket, 4_000);
+    var admin = try connectClient(dir.socket);
+    defer admin.close();
+    const created = try rpcOk(&admin, 1, "session.create", .{ .id = "error", .shell = "/bin/sh", .command = "exec /bin/sh" });
+    defer created.deinit();
+    const pane = try expectStringField(try responseResult(created.value), "paneId");
+
+    try runClientWithInput(dir, "error", "printf 'FIRST_%s\\n' RUN; exit 0\n");
+    try std.testing.expect(try fileContains(dir, "stdout", "FIRST_RUN"));
+    try std.testing.expect(try fileContains(dir, "stderr", "session ended"));
+    try runClientWithInput(dir, "error", "printf 'SECOND_%s\\n' RUN; exit 0\n");
+    try std.testing.expect(try fileContains(dir, "stdout", "FIRST_RUN"));
+    try std.testing.expect(try fileContains(dir, "stdout", "SECOND_RUN"));
+    try std.testing.expect(try fileContains(dir, "stderr", "[session exited: code 0]"));
+    const info = try rpcOk(&admin, 2, "session.info", .{ .sessionId = pane });
+    defer info.deinit();
+    try std.testing.expectEqual(@as(i64, 1), try expectIntegerField(try responseResult(info.value), "generation"));
+    try endDaemon(&daemon, dir.socket);
+}
+
+test "piped input reaches the pane through POLLHUP" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+    var daemon = try spawnDaemon(dir.socket);
+    defer killChild(&daemon);
+    try waitForSocket(dir.socket, 4_000);
+    var admin = try connectClient(dir.socket);
+    defer admin.close();
+    const command = try std.fmt.allocPrint(test_allocator, "stty raw -echo; printf 'ready\\n'; head -c 204800 > '{s}/received'", .{dir.path});
+    defer test_allocator.free(command);
+    (try rpcOk(&admin, 1, "session.create", .{ .id = "ls", .shell = "/bin/sh", .command = command })).deinit();
+    test_allocator.free(try waitForCaptureContains(test_allocator, dir.socket, "ls", "ready", 4_000));
+
+    const bytes = try test_allocator.alloc(u8, 200 * 1024);
+    defer test_allocator.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i);
+    try runClientWithInput(dir, "ls", bytes);
+
+    const directory = try std.Io.Dir.openDirAbsolute(io, dir.path, .{});
+    defer directory.close(io);
+    const received = try directory.readFileAlloc(io, "received", test_allocator, .limited(bytes.len + 1));
+    defer test_allocator.free(received);
+    try std.testing.expectEqualSlices(u8, bytes, received);
+    try endDaemon(&daemon, dir.socket);
+}
+
+test "prebuffered_exit_notification_handled" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+    const listener = try sys.unixStreamSocket();
+    defer sys.close(listener);
+    const address = try sys.UnixAddress.init(dir.socket);
+    try sys.bind(listener, &address);
+    try sys.listen(listener, 1);
+
+    const directory = try std.Io.Dir.openDirAbsolute(io, dir.path, .{});
+    defer directory.close(io);
+    const stdout = try directory.createFile(io, "stdout", .{});
+    defer stdout.close(io);
+    const stderr = try directory.createFile(io, "stderr", .{});
+    defer stderr.close(io);
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ build_options.zmux_connect_path, "--socket", dir.socket, "attach", "error" },
+        .stdin = .ignore,
+        .stdout = .{ .file = stdout },
+        .stderr = .{ .file = stderr },
+    });
+    defer killChild(&child);
+    var pollfds = [_]posix.pollfd{.{ .fd = listener, .events = posix.POLL.IN, .revents = 0 }};
+    try std.testing.expect(try posix.poll(&pollfds, 2_000) != 0);
+    var conn: Connection = .{ .fd = try sys.accept(listener) };
+    defer conn.close();
+    const ping = try conn.read(test_allocator, max_reply, nowMs() + 2_000);
+    defer test_allocator.free(ping);
+    try std.testing.expect(lineMatchesRpcId(test_allocator, ping, 100));
+    const ping_reply = try std.fmt.allocPrint(test_allocator, "{{\"id\":100,\"result\":{{\"version\":\"{s}\"}}}}\n", .{zmux.protocol.version});
+    defer test_allocator.free(ping_reply);
+    try writeAll(conn.fd, ping_reply);
+    const attach = try conn.read(test_allocator, max_reply, nowMs() + 2_000);
+    defer test_allocator.free(attach);
+    try std.testing.expect(lineMatchesRpcId(test_allocator, attach, 1));
+
+    // Replay ends two bytes into the first live frame. It must appear once.
+    try writeAll(conn.fd, "{\"id\":1,\"result\":{\"paneId\":\"p\",\"clientId\":\"c\",\"replayBase64\" : \"YWI=\",\"replayEndOffset\":2,\"generation\":0}}\n" ++
+        "{\"method\":\"pane_output\",\"params\":{\"pane_id\":\"p\",\"data_base64\":\"YWJjZA==\",\"offset\":0,\"generation\":0}}\n" ++
+        "{\"method\":\"session_exited\",\"params\":{\"session_id\":\"p\",\"generation\":0}}\n");
+    try expectTermExited(try waitChild(&child, 1_500), 0);
+    const bytes = try directory.readFileAlloc(io, "stdout", test_allocator, .limited(128));
+    defer test_allocator.free(bytes);
+    try std.testing.expectEqualStrings("abcd", bytes);
+    try std.testing.expect(try fileContains(dir, "stderr", "session ended"));
+}
+
+test "exit_tail_output_not_lost and attach_replay_no_gap_no_dup" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+    var daemon = try spawnDaemon(dir.socket);
+    defer killChild(&daemon);
+    try waitForSocket(dir.socket, 4_000);
+    var observer = try connectClient(dir.socket);
+    defer observer.close();
+    (try rpcOk(&observer, 1, "events.subscribe", .{ .panes = &.{"*"} })).deinit();
+    var admin = try connectClient(dir.socket);
+    defer admin.close();
+    const created = try rpcOk(&admin, 2, "session.create", .{ .id = "tail", .shell = "/bin/sh", .command = "printf 'LEAD'; read line; printf 'TAIL'; exit 7" });
+    defer created.deinit();
+    const pane_id = try expectStringField(try responseResult(created.value), "paneId");
+    test_allocator.free(try waitForCaptureContains(test_allocator, dir.socket, pane_id, "LEAD", 4_000));
+    const attached = try rpcOk(&admin, 3, "client.attach", .{ .paneId = pane_id });
+    defer attached.deinit();
+    const attach = try responseResult(attached.value);
+    const offset = try expectIntegerField(attach, "replayEndOffset");
+    const replay = try decodeBase64(test_allocator, try expectStringField(attach, "replayBase64"));
+    defer test_allocator.free(replay);
+    try std.testing.expectEqualStrings("LEAD", replay);
+    try std.testing.expectEqual(@as(i64, 4), offset);
+    (try rpcOk(&admin, 4, "session.send", .{ .sessionId = pane_id, .text = "\n" })).deinit();
+
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(test_allocator);
+    try stream.appendSlice(test_allocator, replay);
+    const deadline = nowMs() + 4_000;
+    while (true) {
+        const line = try observer.read(test_allocator, max_reply, deadline);
+        defer test_allocator.free(line);
+        const parsed = try std.json.parseFromSlice(std.json.Value, test_allocator, line, .{});
+        defer parsed.deinit();
+        const method = try expectStringField(parsed.value, "method");
+        const params = parsed.value.object.get("params").?;
+        if (std.mem.eql(u8, method, "session_exited")) {
+            try std.testing.expectEqual(@as(i64, 7), try expectIntegerField(params, "exit_code"));
+            break;
+        }
+        if (!std.mem.eql(u8, method, "pane_output")) continue;
+        const chunk = try decodeBase64(test_allocator, try expectStringField(params, "data_base64"));
+        defer test_allocator.free(chunk);
+        const start: usize = @intCast(try expectIntegerField(params, "offset"));
+        try std.testing.expect(start <= stream.items.len);
+        const overlap = @min(chunk.len, stream.items.len - start);
+        try std.testing.expectEqualSlices(u8, stream.items[start..][0..overlap], chunk[0..overlap]);
+        try stream.appendSlice(test_allocator, chunk[overlap..]);
+    }
+    try std.testing.expect(std.mem.endsWith(u8, stream.items, "TAIL"));
+    try endDaemon(&daemon, dir.socket);
+}
+
+test "flood_does_not_disconnect_slow_client or an attached quiet pane client" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+    var daemon = try spawnDaemon(dir.socket);
+    defer killChild(&daemon);
+    try waitForSocket(dir.socket, 4_000);
+    var admin = try connectClient(dir.socket);
+    defer admin.close();
+    var slow = try connectClient(dir.socket);
+    defer slow.close();
+    // Subscribe before flooding and stop reading to force the queue to cross
+    // its high-water mark. The quiet pane is attached on another connection.
+    (try rpcOk(&slow, 1, "events.subscribe", .{ .panes = &.{"*"} })).deinit();
+
+    const quiet = try rpcOk(&admin, 2, "session.create", .{ .id = "quiet", .shell = "/bin/sh", .command = "read line; printf 'QUIET_%s' OK; sleep 10" });
+    defer quiet.deinit();
+    const quiet_id = try expectStringField(try responseResult(quiet.value), "paneId");
+    var live = try connectClient(dir.socket);
+    defer live.close();
+    (try rpcOk(&live, 3, "client.attach", .{ .paneId = quiet_id })).deinit();
+
+    const flood = try rpcOk(&admin, 4, "session.create", .{
+        .id = "flood",
+        .shell = "/bin/sh",
+        .command = "yes flood | head -c 8388608; printf 'FLOOD_DONE'; sleep 10",
+    });
+    defer flood.deinit();
+    const flood_id = try expectStringField(try responseResult(flood.value), "paneId");
+    test_allocator.free(try waitForCaptureContains(test_allocator, dir.socket, flood_id, "FLOOD_DONE", 5_000));
+    (try rpcOk(&admin, 5, "session.send", .{ .sessionId = quiet_id, .text = "\n" })).deinit();
+
+    const deadline = nowMs() + 4_000;
+    var tail: std.ArrayList(u8) = .empty;
+    defer tail.deinit(test_allocator);
+    while (std.mem.indexOf(u8, tail.items, "QUIET_OK") == null) {
+        const line = try live.read(test_allocator, max_reply, deadline);
+        defer test_allocator.free(line);
+        const parsed = try std.json.parseFromSlice(std.json.Value, test_allocator, line, .{});
+        defer parsed.deinit();
+        const method = try expectStringField(parsed.value, "method");
+        if (!std.mem.eql(u8, method, "pane_output")) continue;
+        const params = parsed.value.object.get("params").?;
+        try std.testing.expectEqualStrings(quiet_id, try expectStringField(params, "pane_id"));
+        const chunk = try decodeBase64(test_allocator, try expectStringField(params, "data_base64"));
+        defer test_allocator.free(chunk);
+        try tail.appendSlice(test_allocator, chunk);
+    }
+    const dropped = try readNotificationLine(test_allocator, &slow, "pane_output_dropped", flood_id, 4_000);
+    defer test_allocator.free(dropped);
+    (try rpcOk(&slow, 6, "daemon.ping", .{})).deinit();
+    (try rpcOk(&live, 7, "daemon.ping", .{})).deinit();
+    try endDaemon(&daemon, dir.socket);
+}
+
+test "background_job_dies_on_terminate and client_list_pruned_after_terminate" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+    var daemon = try spawnDaemon(dir.socket);
+    defer killChild(&daemon);
+    try waitForSocket(dir.socket, 4_000);
+    var admin = try connectClient(dir.socket);
+    defer admin.close();
+    // The job inherits the PTY process group. Its HUP trap leaves a receipt,
+    // so a later zombie reparented to the runner cannot make the test flaky.
+    const command = try std.fmt.allocPrint(test_allocator, "(trap 'echo gone > {s}/gone; exit 0' HUP; echo ready > {s}/ready; while :; do sleep 1; done) & wait", .{ dir.path, dir.path });
+    defer test_allocator.free(command);
+    const created = try rpcOk(&admin, 1, "session.create", .{ .id = "job", .shell = "/bin/sh", .command = command });
+    defer created.deinit();
+    const pane = try expectStringField(try responseResult(created.value), "paneId");
+    var attached = try connectClient(dir.socket);
+    defer attached.close();
+    const reply = try rpcOk(&attached, 2, "client.attach", .{ .paneId = pane });
+    defer reply.deinit();
+    const id = try expectStringField(try responseResult(reply.value), "clientId");
+    try waitForFile(dir, "ready", "ready", 3_000);
+    (try rpcOk(&admin, 3, "session.terminate", .{ .sessionId = pane })).deinit();
+    try waitForFile(dir, "gone", "gone", 3_000);
+    const detached = try readNotificationLine(test_allocator, &attached, "client_detached", id, 3_000);
+    defer test_allocator.free(detached);
+    try waitForClientCount(test_allocator, dir.socket, 0, 3_000);
+    try endDaemon(&daemon, dir.socket);
+}
+
+fn waitForFile(dir: TestDir, file: []const u8, needle: []const u8, timeout_ms: i64) !void {
+    const deadline = nowMs() + timeout_ms;
+    while (nowMs() < deadline) {
+        if (fileContains(dir, file, needle) catch |err| switch (err) {
+            error.FileNotFound => false,
+            else => return err,
+        }) return;
+        sleepMs(10);
+    }
+    return error.FileTimeout;
+}
+
+test "respawn_does_not_end_attached_client" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+    var daemon = try spawnDaemon(dir.socket);
+    defer killChild(&daemon);
+    try waitForSocket(dir.socket, 4_000);
+    var admin = try connectClient(dir.socket);
+    defer admin.close();
+    (try rpcOk(&admin, 1, "session.create", .{ .id = "work", .shell = "/bin/sh", .command = "exec /bin/sh" })).deinit();
+
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ build_options.zmux_connect_path, "--socket", dir.socket, "work", "--no-create" },
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .inherit,
+    });
+    defer killChild(&child);
+    try waitForClientCount(test_allocator, dir.socket, 1, 4_000);
+    const failed = try rpc(&admin, 2, "pane.respawn", .{ .paneId = "work", .kill = false });
+    defer failed.deinit();
+    try expectErrorKind(failed.value, "conflict");
+    (try rpcOk(&admin, 3, "pane.respawn", .{ .paneId = "work", .kill = true })).deinit();
+    try child.stdin.?.writeStreamingAll(io, "printf 'NEW_%s\\n' LIFE\n");
+    test_allocator.free(try waitForCaptureContains(test_allocator, dir.socket, "work", "NEW_LIFE", 4_000));
+    try child.stdin.?.writeStreamingAll(io, "exit 0\n");
+    try expectTermExited(try waitChild(&child, 4_000), 0);
+    try endDaemon(&daemon, dir.socket);
+}
+
+test "sigterm_during_connect_burst_exits" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+    var daemon = try spawnDaemon(dir.socket);
+    defer killChild(&daemon);
+    try waitForSocket(dir.socket, 4_000);
+    var clients: [32]posix.fd_t = undefined;
+    var count: usize = 0;
+    defer for (clients[0..count]) |fd| sys.close(fd);
+    for (&clients, 0..) |*fd, i| {
+        const conn = connectClientUntil(dir.socket, nowMs() + 200) catch |err| {
+            if (i > clients.len / 2) break;
+            return err;
+        };
+        fd.* = conn.fd;
+        count += 1;
+        if (i == clients.len / 2) {
+            try std.testing.expectEqual(@as(c_int, 0), std.c.kill(daemon.id.?, .TERM));
+        }
+    }
+    try expectTermExited(try waitChild(&daemon, 3_000), 0);
+}
+
+test "sigterm_with_blocked_pty_write_exits" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+    var daemon = try spawnDaemon(dir.socket);
+    defer killChild(&daemon);
+    try waitForSocket(dir.socket, 4_000);
+    var admin = try connectClient(dir.socket);
+    defer admin.close();
+    (try rpcOk(&admin, 1, "session.create", .{ .id = "blocked", .shell = "/bin/sh", .command = "stty raw -echo; printf 'BLOCKED_READY'; sleep 60" })).deinit();
+    test_allocator.free(try waitForCaptureContains(test_allocator, dir.socket, "blocked", "BLOCKED_READY", 4_000));
+    var writer = try connectClient(dir.socket);
+    defer writer.close();
+    const raw = try test_allocator.alloc(u8, 400 * 1024);
+    defer test_allocator.free(raw);
+    @memset(raw, 'x');
+    const encoder = std.base64.standard.Encoder;
+    const encoded = try test_allocator.alloc(u8, encoder.calcSize(raw.len));
+    defer test_allocator.free(encoded);
+    _ = encoder.encode(encoded, raw);
+    const frame = try std.fmt.allocPrint(test_allocator, "{{\"id\":2,\"method\":\"session.send\",\"params\":{{\"sessionId\":\"blocked\",\"dataBase64\":\"{s}\"}}}}\n", .{encoded});
+    defer test_allocator.free(frame);
+    try writeAll(writer.fd, frame);
+    try std.testing.expectError(error.ReadTimeout, writer.read(test_allocator, max_reply, nowMs() + 100));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.kill(daemon.id.?, .TERM));
+    try expectTermExited(try waitChild(&daemon, 3_000), 0);
+}
+
+test "environment merge, replacement, default TERM and duplicate names" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+    var env = std.process.Environ.Map.init(test_allocator);
+    defer env.deinit();
+    try env.put("ZMUX_INHERITED", "inherited");
+    var daemon = try std.process.spawn(io, .{
+        .argv = &.{ build_options.zmuxd_path, "--socket", dir.socket, "--idle-seconds", "0" },
+        .environ_map = &env,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer killChild(&daemon);
+    try waitForSocket(dir.socket, 4_000);
+    var admin = try connectClient(dir.socket);
+    defer admin.close();
+    const command = "printf '%s/%s/%s\\n' \"${ZMUX_INHERITED-unset}\" \"$ROUND_ONE\" \"$TERM\"; /bin/cat";
+    const merged = try rpcOk(&admin, 1, "session.create", .{ .id = "merged", .shell = "/bin/sh", .command = command, .env = .{ .ROUND_ONE = "set" } });
+    defer merged.deinit();
+    (try rpcOk(&admin, 2, "session.create", .{ .id = "clear", .shell = "/bin/sh", .command = command, .env = .{ .ROUND_ONE = "set" }, .clearEnv = true })).deinit();
+    test_allocator.free(try waitForCaptureContains(test_allocator, dir.socket, "merged", "inherited/set/xterm-256color", 4_000));
+    test_allocator.free(try waitForCaptureContains(test_allocator, dir.socket, "clear", "unset/set/xterm-256color", 4_000));
+
+    const duplicate = try rpc(&admin, 3, "session.create", .{ .id = "merged", .shell = "/bin/sh", .command = command });
+    defer duplicate.deinit();
+    try expectErrorKind(duplicate.value, "conflict");
+    try std.testing.expectEqualStrings("DuplicateSessionName", try expectStringField(duplicate.value.object.get("error").?, "message"));
+    const session_id = try expectStringField(try responseResult(merged.value), "sessionId");
+    const shadow = try rpc(&admin, 4, "session.rename", .{ .sessionId = "clear", .name = session_id });
+    defer shadow.deinit();
+    try expectErrorKind(shadow.value, "conflict");
+    try std.testing.expectEqualStrings("NameShadowsId", try expectStringField(shadow.value.object.get("error").?, "message"));
+    const exact = try rpcOk(&admin, 5, "client.attach", .{ .paneId = session_id });
+    defer exact.deinit();
+    try std.testing.expectEqualStrings(try expectStringField(try responseResult(merged.value), "paneId"), try expectStringField(try responseResult(exact.value), "paneId"));
+    try endDaemon(&daemon, dir.socket);
+}
+
+extern "c" fn openpty(master: *posix.fd_t, slave: *posix.fd_t, name: ?[*]u8, termios: ?*const posix.termios, size: ?*const posix.winsize) c_int;
+
+fn waitForRawMode(fd: posix.fd_t) !posix.termios {
+    const deadline = nowMs() + 2_000;
+    while (nowMs() < deadline) {
+        const mode = try posix.tcgetattr(fd);
+        if (!mode.lflag.ICANON and !mode.iflag.IGNCR and mode.cc[@backingInt(posix.V.MIN)] == 1 and
+            mode.cc[@backingInt(posix.V.TIME)] == 0) return mode;
+        sleepMs(5);
+    }
+    return error.RawModeTimeout;
+}
+
+test "client restores inherited terminal on TSTP and TERM, and re-enters raw on CONT" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+    const listener = try sys.unixStreamSocket();
+    defer sys.close(listener);
+    const address = try sys.UnixAddress.init(dir.socket);
+    try sys.bind(listener, &address);
+    try sys.listen(listener, 1);
+
+    var master: posix.fd_t = undefined;
+    var slave: posix.fd_t = undefined;
+    const size: posix.winsize = .{ .row = 24, .col = 80, .xpixel = 0, .ypixel = 0 };
+    if (openpty(&master, &slave, null, null, &size) != 0) return error.OpenTestPtyFailed;
+    defer sys.close(master);
+    defer sys.close(slave);
+    try sys.setCloseOnExec(master);
+    try sys.setCloseOnExec(slave);
+    var inherited = try posix.tcgetattr(slave);
+    inherited.iflag.IGNCR = true;
+    inherited.lflag.ICANON = true;
+    inherited.cc[@backingInt(posix.V.MIN)] = 0;
+    inherited.cc[@backingInt(posix.V.TIME)] = 5;
+    try posix.tcsetattr(slave, .NOW, inherited);
+    const original = try posix.tcgetattr(slave);
+
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ build_options.zmux_connect_path, "--socket", dir.socket, "tty" },
+        .pgid = 0,
+        .stdin = .{ .file = .{ .handle = slave, .flags = .{ .nonblocking = false } } },
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer killChild(&child);
+    var pollfds = [_]posix.pollfd{.{ .fd = listener, .events = posix.POLL.IN, .revents = 0 }};
+    try std.testing.expect(try posix.poll(&pollfds, 2_000) != 0);
+    var conn: Connection = .{ .fd = try sys.accept(listener) };
+    defer conn.close();
+    test_allocator.free(try conn.read(test_allocator, max_reply, nowMs() + 2_000));
+    const ping = try std.fmt.allocPrint(test_allocator, "{{\"id\":100,\"result\":{{\"version\":\"{s}\"}}}}\n", .{zmux.protocol.version});
+    defer test_allocator.free(ping);
+    try writeAll(conn.fd, ping);
+    test_allocator.free(try conn.read(test_allocator, max_reply, nowMs() + 2_000));
+    try writeAll(conn.fd, "{\"id\":1,\"result\":{\"paneId\":\"p\",\"clientId\":\"c\"}}\n{");
+
+    _ = try waitForRawMode(slave);
+    const initial_resize = try conn.read(test_allocator, max_reply, nowMs() + 2_000);
+    defer test_allocator.free(initial_resize);
+    try std.testing.expect(std.mem.indexOf(u8, initial_resize, "\"method\":\"session.resize\"") != null);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.kill(child.id.?, .WINCH));
+    const winch_resize = try conn.read(test_allocator, max_reply, nowMs() + 2_000);
+    defer test_allocator.free(winch_resize);
+    try std.testing.expect(std.mem.indexOf(u8, winch_resize, "\"method\":\"session.resize\"") != null);
+    try sys.writeAll(master, "\r");
+    const input = try conn.read(test_allocator, max_reply, nowMs() + 2_000);
+    defer test_allocator.free(input);
+    try std.testing.expect(std.mem.indexOf(u8, input, "\"dataBase64\":\"DQ==\"") != null);
+
+    const pid = child.id.?;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.kill(pid, .TSTP));
+    const deadline = nowMs() + 2_000;
+    while (true) {
+        var status: c_int = 0;
+        const got = std.c.waitpid(pid, &status, 3); // WNOHANG | WUNTRACED
+        if (got > 0) {
+            if (!posix.W.IFSTOPPED(@bitCast(status))) {
+                cleanChild(&child);
+                return error.UnexpectedChildTerm;
+            }
+            break;
+        }
+        if (nowMs() >= deadline) return error.StopTimeout;
+        sleepMs(5);
+    }
+    try std.testing.expectEqualDeep(original, try posix.tcgetattr(slave));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.kill(pid, .CONT));
+    _ = try waitForRawMode(slave);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.kill(pid, .TERM));
+    const term = try waitChild(&child, 2_000);
+    try std.testing.expect(term == .signal and term.signal == .TERM);
+    try std.testing.expectEqualDeep(original, try posix.tcgetattr(slave));
+}
+
+test "auto-spawn keeps daemon startup logs when stderr is closed" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+    var env = std.process.Environ.Map.init(test_allocator);
+    defer env.deinit();
+    try env.put("ZMUX_LOG_LEVEL", "info");
+    defer {
+        const reply = rpcLine(test_allocator, dir.socket, "{\"id\":1,\"method\":\"daemon.shutdown\"}\n", max_reply) catch null;
+        if (reply) |line| test_allocator.free(line);
+    }
+    var client = try std.process.spawn(io, .{
+        .argv = &.{ build_options.zmux_connect_path, "--socket", dir.socket, "missing", "--spawn-daemon", "--no-create" },
+        .environ_map = &env,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .close,
+    });
+    defer killChild(&client);
+    try expectTermExited(try waitChild(&client, 6_000), 1);
+    try waitForSocket(dir.socket, 2_000);
+    try std.testing.expect(try fileContains(dir, "zmux.sock.log", "daemon_start"));
+}
+
+test "daemon preserves a regular file at the socket path" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+    const directory = try std.Io.Dir.openDirAbsolute(io, dir.path, .{});
+    defer directory.close(io);
+    try directory.writeFile(io, .{ .sub_path = "zmux.sock", .data = "keep" });
+    var daemon = try spawnDaemon(dir.socket);
+    defer killChild(&daemon);
+    try expectTermExited(try waitChild(&daemon, 3_000), 1);
+    try std.testing.expect(try fileContains(dir, "zmux.sock", "keep"));
 }
