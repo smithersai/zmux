@@ -13,6 +13,14 @@ extern "c" fn openpty(
     winp: ?*const posix.winsize,
 ) c_int;
 
+/// `TERM` applied when the spawn environment does not set one.
+pub const default_term = "xterm-256color";
+
+/// How `SpawnOptions.env` combines with the daemon environment.
+pub const EnvMode = enum { merge, replace };
+
+extern "c" fn tcgetpgrp(fd: c_int) posix.pid_t;
+
 pub const SpawnOptions = struct {
     shell: ?[]const u8 = null,
     command: ?[]const u8 = null,
@@ -20,6 +28,8 @@ pub const SpawnOptions = struct {
     env: ?[]const []const u8 = null,
     rows: u16 = 24,
     cols: u16 = 80,
+    /// Phase 0 stub (T2 owns): ignored; `env` still replaces the environment.
+    env_mode: EnvMode = .merge,
 };
 
 pub const ExitObserver = struct {
@@ -45,6 +55,8 @@ pub const Pty = struct {
             .xpixel = 0,
             .ypixel = 0,
         };
+
+        try validateSpawnOptions(opts);
 
         const fds = try openPty(wsz);
         const master_fd = fds.master_fd;
@@ -126,18 +138,33 @@ pub const Pty = struct {
         }
     }
 
-    pub fn terminate(self: *const Pty) void {
+    /// Phase 0 stub (T2 owns): does not take `wait_mutex` or skip reaped
+    /// children yet.
+    pub fn terminate(self: *Pty) void {
         const pgid: posix.pid_t = -self.child_pid;
         if (std.c.kill(pgid, posix.SIG.TERM) != 0) {
             _ = std.c.kill(self.child_pid, posix.SIG.TERM);
         }
     }
 
-    pub fn kill(self: *const Pty) void {
+    /// Phase 0 stub (T2 owns): see `terminate`.
+    pub fn kill(self: *Pty) void {
         const pgid: posix.pid_t = -self.child_pid;
         if (std.c.kill(pgid, posix.SIG.KILL) != 0) {
             _ = std.c.kill(self.child_pid, posix.SIG.KILL);
         }
+    }
+
+    /// SIGHUP+SIGCONT to the terminal foreground group when it is not the
+    /// shell group, then to the shell group.
+    pub fn hangupForeground(self: *Pty) void {
+        const fg = tcgetpgrp(self.master_fd);
+        if (fg > 0 and fg != self.child_pid) {
+            _ = std.c.kill(-fg, posix.SIG.HUP);
+            _ = std.c.kill(-fg, posix.SIG.CONT);
+        }
+        _ = std.c.kill(-self.child_pid, posix.SIG.HUP);
+        _ = std.c.kill(-self.child_pid, posix.SIG.CONT);
     }
 
     pub fn pollReadable(self: *const Pty, timeout_ms: i32) !bool {
@@ -154,10 +181,23 @@ pub const Pty = struct {
         return posix.read(self.master_fd, buffer);
     }
 
-    pub fn write(self: *const Pty, bytes: []const u8) !void {
+    pub const WriteError = error{ InputTimeout, InputClosed, WriteZero, BrokenPipe, InputOutput };
+
+    /// Write every byte before the monotonic `deadline_ms` (`sys.monotonicMs`)
+    /// unless `stop_fd` becomes readable. Phase 0 stub (T2 owns): blocking
+    /// write; `deadline_ms` and `stop_fd` are not consulted yet.
+    pub fn write(self: *Pty, bytes: []const u8, deadline_ms: i64, stop_fd: posix.fd_t) WriteError!void {
+        _ = deadline_ms;
+        _ = stop_fd;
         var offset: usize = 0;
         while (offset < bytes.len) {
-            offset += try sys.write(self.master_fd, bytes[offset..]);
+            const n = sys.write(self.master_fd, bytes[offset..]) catch |err| switch (err) {
+                error.WouldBlock => return error.InputTimeout,
+                error.BrokenPipe, error.ConnectionResetByPeer => return error.BrokenPipe,
+                else => return error.InputOutput,
+            };
+            if (n == 0) return error.WriteZero;
+            offset += n;
         }
     }
 
@@ -211,6 +251,16 @@ pub const Pty = struct {
         return self.reaped;
     }
 };
+
+fn validateSpawnOptions(opts: SpawnOptions) error{InvalidSpawnArgument}!void {
+    if (opts.shell) |v| if (std.mem.indexOfScalar(u8, v, 0) != null) return error.InvalidSpawnArgument;
+    if (opts.command) |v| if (std.mem.indexOfScalar(u8, v, 0) != null) return error.InvalidSpawnArgument;
+    if (opts.cwd) |v| if (std.mem.indexOfScalar(u8, v, 0) != null) return error.InvalidSpawnArgument;
+    if (opts.env) |entries| for (entries) |entry| {
+        if (std.mem.indexOfScalar(u8, entry, 0) != null) return error.InvalidSpawnArgument;
+        if (entry.len == 0 or entry[0] == '=') return error.InvalidSpawnArgument;
+    };
+}
 
 const OpenPtyResult = struct {
     master_fd: posix.fd_t,

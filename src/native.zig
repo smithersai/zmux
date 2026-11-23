@@ -4,6 +4,14 @@ const buffer = @import("buffer.zig");
 const foreground = @import("foreground.zig");
 const pty = @import("pty.zig");
 const protocol = @import("protocol.zig");
+const sys = @import("sys.zig");
+
+/// Decoded child exit: exactly one of the fields is set for a reaped child,
+/// both null when the status was unavailable.
+pub const ExitInfo = struct { exit_code: ?u32, signal: ?u32 };
+
+/// Budget for one `send`/`sendKey`/`writeInput` call.
+pub const default_input_deadline_ms: i64 = 2000;
 
 pub const NativeSessionState = enum {
     creating,
@@ -34,6 +42,7 @@ pub const NativeSessionOptions = struct {
     cols: u16 = 80,
     scrollback_bytes: usize = buffer.default_capacity,
     event_sink: ?EventSink = null,
+    generation: u64 = 0,
 };
 
 pub const Event = union(enum) {
@@ -47,16 +56,21 @@ pub const Event = union(enum) {
 pub const PaneOutputEvent = struct {
     pane_id: []const u8,
     data: []const u8,
+    /// Stream offset of `data[0]`.
+    offset: u64,
+    generation: u64,
 };
 
 pub const PaneActivityEvent = struct {
     pane_id: []const u8,
     last_activity_ms: i64,
+    generation: u64,
 };
 
 pub const PaneBellEvent = struct {
     pane_id: []const u8,
     last_bell_ms: i64,
+    generation: u64,
 };
 
 pub const EventSink = struct {
@@ -85,6 +99,10 @@ pub const NativeSession = struct {
     scrollback: buffer.ScrollbackBuffer,
     state_value: NativeSessionState = .creating,
     exit_status: ?u32 = null,
+    /// Undecoded wait status, kept for `exitInfo`.
+    raw_exit_status: ?u32 = null,
+    generation_value: u64 = 0,
+    input_stopped: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     event_sink: ?EventSink = null,
     foreground_tracker: foreground.Tracker,
     next_foreground_check_ms: i64 = 0,
@@ -132,6 +150,7 @@ pub const NativeSession = struct {
             .event_sink = opts.event_sink,
             .foreground_tracker = foreground.Tracker.init(handle.child_pid),
             .state_value = .running,
+            .generation_value = opts.generation,
         };
         native.handle.setExitObserver(.{
             .context = native,
@@ -237,13 +256,95 @@ pub const NativeSession = struct {
     }
 
     pub fn send(self: *NativeSession, text: []const u8, enter: bool) !void {
-        try self.handle.write(text);
-        if (enter) try self.handle.write("\r");
+        const deadline_ms = try self.inputDeadline();
+        try self.handle.write(text, deadline_ms, -1);
+        if (enter) try self.handle.write("\r", deadline_ms, -1);
     }
 
     pub fn sendKey(self: *NativeSession, key: []const u8) !void {
         const sequence = keySequence(key) orelse return error.UnknownKey;
-        try self.handle.write(sequence);
+        try self.handle.write(sequence, try self.inputDeadline(), -1);
+    }
+
+    /// Phase 0 stub (T2 owns): no per-session input mutex or stop fd yet.
+    fn inputDeadline(self: *NativeSession) error{InputClosed}!i64 {
+        if (self.input_stopped.load(.seq_cst)) return error.InputClosed;
+        return sys.monotonicMs() + default_input_deadline_ms;
+    }
+
+    pub fn generation(self: *NativeSession) u64 {
+        return self.generation_value;
+    }
+
+    pub fn isRunning(self: *NativeSession) bool {
+        return self.state() == .running;
+    }
+
+    pub fn exitInfo(self: *NativeSession) ?ExitInfo {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.state_value != .terminated) return null;
+        const status = self.raw_exit_status orelse return .{ .exit_code = null, .signal = null };
+        return .{
+            .exit_code = if (std.posix.W.IFEXITED(status)) std.posix.W.EXITSTATUS(status) else null,
+            .signal = if (std.posix.W.IFSIGNALED(status)) @backingInt(std.posix.W.TERMSIG(status)) else null,
+        };
+    }
+
+    pub fn setTitle(self: *NativeSession, title: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, title);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.allocator.free(self.title_value);
+        self.title_value = owned;
+    }
+
+    /// Wakes blocked writers (InputClosed). All later send/sendKey/writeInput
+    /// return InputClosed. Phase 0 stub: does not wake an in-flight write.
+    pub fn stopInput(self: *NativeSession) void {
+        self.input_stopped.store(true, .seq_cst);
+    }
+
+    /// Non-blocking start of teardown. Pair with `awaitTerminated`.
+    /// Phase 0 stub (T2 owns): SIGTERM to the shell group only.
+    pub fn beginTerminate(self: *NativeSession) void {
+        self.stopInput();
+        self.handle.terminate();
+    }
+
+    /// Reap until the monotonic `deadline_ms` (`sys.monotonicMs`), then
+    /// escalate to SIGKILL and reap briefly.
+    pub fn awaitTerminated(self: *NativeSession, deadline_ms: i64) void {
+        const previous = self.io.swapCancelProtection(.blocked);
+        defer _ = self.io.swapCancelProtection(previous);
+
+        var status: ?u32 = null;
+        while (true) {
+            if (self.reapExited()) |exit_status| {
+                status = exit_status;
+                break;
+            }
+            if (self.handle.isReaped()) break;
+            if (sys.monotonicMs() >= deadline_ms) {
+                self.handle.kill();
+                status = self.reapExitedBriefly();
+                break;
+            }
+            self.sleepMs(10);
+        }
+        self.markTerminated(status);
+    }
+
+    pub fn scrollbackTail(self: *NativeSession, allocator: std.mem.Allocator, max_bytes: usize) !buffer.Tail {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.scrollback.snapshotTail(allocator, max_bytes);
+    }
+
+    pub fn captureBounded(self: *NativeSession, allocator: std.mem.Allocator, lines: usize, max_bytes: usize) ![]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.scrollback.captureLastLinesBounded(allocator, lines, max_bytes);
     }
 
     pub fn resize(self: *NativeSession, cols: u16, rows: u16) !void {
@@ -264,7 +365,7 @@ pub const NativeSession = struct {
     }
 
     pub fn writeInput(self: *NativeSession, bytes: []const u8) !void {
-        try self.handle.write(bytes);
+        try self.handle.write(bytes, try self.inputDeadline(), -1);
     }
 
     pub fn infoJson(self: *NativeSession, allocator: std.mem.Allocator) ![]u8 {
@@ -330,21 +431,26 @@ pub const NativeSession = struct {
                 return;
             }
             self.mutex.lockUncancelable(self.io);
+            const offset = self.scrollback.endOffset();
             self.scrollback.append(read_buf[0..n]);
             self.mutex.unlock(self.io);
             self.emitEvent(.{ .pane_output = .{
                 .pane_id = self.id,
                 .data = read_buf[0..n],
+                .offset = offset,
+                .generation = self.generation_value,
             } });
             const now_ms = self.nowMs();
             self.emitEvent(.{ .pane_activity = .{
                 .pane_id = self.id,
                 .last_activity_ms = now_ms,
+                .generation = self.generation_value,
             } });
             if (std.mem.indexOfScalar(u8, read_buf[0..n], 0x07) != null) {
                 self.emitEvent(.{ .pane_bell = .{
                     .pane_id = self.id,
                     .last_bell_ms = now_ms,
+                    .generation = self.generation_value,
                 } });
             }
         }
@@ -363,6 +469,7 @@ pub const NativeSession = struct {
             .pid = process.pid,
             .comm = process.comm,
             .argv = process.argv,
+            .argv_truncated = process.argv_truncated,
         } });
     }
 
@@ -418,6 +525,7 @@ pub const NativeSession = struct {
             .pid = pid,
             .exit_code = if (status) |value| if (std.posix.W.IFEXITED(value)) std.posix.W.EXITSTATUS(value) else null else null,
             .signal = if (status) |value| if (std.posix.W.IFSIGNALED(value)) @backingInt(std.posix.W.TERMSIG(value)) else null else null,
+            .generation = self.generation_value,
         } });
     }
 
@@ -427,6 +535,7 @@ pub const NativeSession = struct {
         self.state_value = .terminated;
         if (self.exit_status == null) {
             self.exit_status = if (status) |value| decodedExitStatus(value) else null;
+            self.raw_exit_status = status;
         }
     }
 };

@@ -5,12 +5,15 @@ const Allocator = std.mem.Allocator;
 const posix = std.posix;
 
 pub const poll_interval_ms: i64 = 500;
+/// Bound on the serialized argv, measured after JSON escaping.
+pub const max_serialized_argv_bytes: usize = 64 * 1024;
 
 pub const ProcessInfo = struct {
     allocator: Allocator,
     pid: posix.pid_t,
     comm: []u8,
     argv: [][]u8,
+    argv_truncated: bool = false,
 
     pub fn deinit(self: *ProcessInfo) void {
         self.allocator.free(self.comm);
@@ -28,6 +31,20 @@ pub const Tracker = struct {
         return .{ .shell_pid = shell_pid };
     }
 
+    /// True when `pgid` differs from the last committed group, including a
+    /// return to the shell group. Phase 0 stub (T1 owns).
+    pub fn observe(self: *Tracker, pgid: posix.pid_t) bool {
+        if (pgid <= 0) return false;
+        if (self.last_pgid) |last| return last != pgid;
+        return true;
+    }
+
+    /// Record `pgid` as emitted. Call only after a successful emit.
+    pub fn commit(self: *Tracker, pgid: posix.pid_t) void {
+        self.last_pgid = pgid;
+    }
+
+    /// Deprecated: use `observe` and `commit`. Removed by T1 after T2 lands.
     pub fn shouldEmitForPgid(self: *Tracker, pgid: posix.pid_t) bool {
         if (pgid <= 0) return false;
         if (self.last_pgid) |last| {

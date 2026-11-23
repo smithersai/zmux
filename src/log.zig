@@ -28,6 +28,15 @@ pub const env_var = "ZMUX_LOG_LEVEL";
 
 /// Upper bound for one formatted line, including the trailing newline.
 pub const max_line_bytes: usize = 1024;
+/// Smallest `buf` that `format` accepts.
+pub const min_buffer_len: usize = 128;
+
+/// Shared state for `warnRateLimited`: at most one line per `interval_ms`.
+pub const RateLimiter = struct {
+    interval_ms: i64,
+    last_ms: std.atomic.Value(i64) = .init(0),
+    suppressed: std.atomic.Value(u64) = .init(0),
+};
 
 var current_level = std.atomic.Value(u8).init(@backingInt(default_level));
 
@@ -100,6 +109,25 @@ pub fn err(comptime event: []const u8, fields: anytype) void {
 
 pub fn warn(comptime event: []const u8, fields: anytype) void {
     emit(.warn, event, fields);
+}
+
+/// Emit a warning at most once per `limiter.interval_ms`, counting the
+/// suppressed calls. Phase 0 stub (T1 owns): the count is reported on a
+/// separate `<event>_suppressed` line instead of a `"suppressed"` field.
+pub fn warnRateLimited(comptime event: []const u8, limiter: *RateLimiter, fields: anytype) void {
+    const now_ms = std.Io.Clock.awake.now(std.Options.debug_io).toMilliseconds();
+    const last = limiter.last_ms.load(.monotonic);
+    if (last != 0 and now_ms - last < limiter.interval_ms) {
+        _ = limiter.suppressed.fetchAdd(1, .monotonic);
+        return;
+    }
+    if (limiter.last_ms.cmpxchgStrong(last, now_ms, .monotonic, .monotonic) != null) {
+        _ = limiter.suppressed.fetchAdd(1, .monotonic);
+        return;
+    }
+    const suppressed = limiter.suppressed.swap(0, .monotonic);
+    emit(.warn, event, fields);
+    if (suppressed != 0) emit(.warn, event ++ "_suppressed", .{ .suppressed = suppressed });
 }
 
 pub fn info(comptime event: []const u8, fields: anytype) void {

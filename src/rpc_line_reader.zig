@@ -129,6 +129,62 @@ pub const LineReader = struct {
         }
     }
 
+    /// Server framing: `null` on clean EOF between frames;
+    /// `error.TruncatedFrame` on EOF mid-frame.
+    /// Phase 0 stub (T1 owns): blocks without a deadline.
+    pub fn readFrameAllocMaybe(self: *LineReader, allocator: Allocator, fd: posix.fd_t, max_len: usize) !?[]u8 {
+        return frameOrTruncated(allocator, try self.readLineAllocMaybeDeadline(allocator, fd, max_len, null));
+    }
+
+    /// `readFrameAllocMaybe` that fails with `error.ReadTimeout` at the
+    /// absolute monotonic `deadline`.
+    /// Phase 0 stub (T1 owns): reads `deadline` on the debug Io's awake clock.
+    pub fn readFrameAllocMaybeDeadline(
+        self: *LineReader,
+        allocator: Allocator,
+        fd: posix.fd_t,
+        max_len: usize,
+        deadline: std.Io.Timestamp,
+    ) !?[]u8 {
+        const at: Deadline = .{ .io = std.Options.debug_io, .at = deadline.withClock(.awake) };
+        return frameOrTruncated(allocator, try self.readLineAllocMaybeDeadline(allocator, fd, max_len, at));
+    }
+
+    fn frameOrTruncated(allocator: Allocator, maybe_line: ?[]u8) !?[]u8 {
+        const line = maybe_line orelse return null;
+        if (line.len == 0 or line[line.len - 1] != '\n') {
+            allocator.free(line);
+            return error.TruncatedFrame;
+        }
+        return line;
+    }
+
+    pub fn hasBufferedLine(self: *const LineReader) bool {
+        return std.mem.indexOfScalar(u8, self.buffer[self.start..self.end], '\n') != null;
+    }
+
+    pub const FillResult = enum { data, would_block, eof };
+
+    /// One non-blocking read into the internal buffer. Used by poll-driven
+    /// loops. Phase 0 stub (T1 owns): returns `would_block` when the buffer is
+    /// full.
+    pub fn fillOnce(self: *LineReader, fd: posix.fd_t) !FillResult {
+        if (self.start != 0) {
+            const len = self.bufferedLen();
+            std.mem.copyForwards(u8, self.buffer[0..len], self.buffer[self.start..self.end]);
+            self.start = 0;
+            self.end = len;
+        }
+        if (self.end == self.buffer.len) return .would_block;
+        const n = posix.read(fd, self.buffer[self.end..]) catch |err| switch (err) {
+            error.WouldBlock => return .would_block,
+            else => return err,
+        };
+        if (n == 0) return .eof;
+        self.end += n;
+        return .data;
+    }
+
     pub fn nextBufferedLineAlloc(self: *LineReader, allocator: Allocator, max_len: usize) !?[]u8 {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);

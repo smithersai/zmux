@@ -24,6 +24,7 @@ pub const sys = @import("sys.zig");
 pub const internal = struct {
     pub const log = @import("log.zig");
     pub const rpc_line_reader = @import("rpc_line_reader.zig");
+    pub const socket_path = @import("socket_path.zig");
 };
 
 pub const NativeSession = native.NativeSession;
@@ -39,6 +40,20 @@ test {
     _ = @import("log.zig");
     _ = @import("rpc_line_reader.zig");
     _ = @import("sys.zig");
+    _ = @import("socket_path.zig");
+
+    // Review round-1 Phase 0 contract stubs are not called yet; referencing
+    // every public decl forces semantic analysis on every target.
+    std.testing.refAllDecls(protocol);
+    std.testing.refAllDecls(internal.rpc_line_reader.LineReader);
+    std.testing.refAllDecls(buffer.ScrollbackBuffer);
+    std.testing.refAllDecls(foreground.Tracker);
+    std.testing.refAllDecls(sys);
+    std.testing.refAllDecls(pty.Pty);
+    std.testing.refAllDecls(native.NativeSession);
+    std.testing.refAllDecls(mux.Manager);
+    std.testing.refAllDecls(mux.PaneHandle);
+    std.testing.refAllDecls(internal.socket_path);
 }
 
 test "advertised top-level modules are exported" {

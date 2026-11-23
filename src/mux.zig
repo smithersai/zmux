@@ -7,6 +7,84 @@ const Allocator = std.mem.Allocator;
 const NativeSession = native_mod.NativeSession;
 const NativeSessionOptions = native_mod.NativeSessionOptions;
 
+/// Error names the mux contract returns (review §1.10).
+pub const ContractError = error{ DuplicateSessionName, NameShadowsId, InvalidName, LimitExceeded, PaneRunning, InvalidAxis };
+
+/// Owned identifiers for a pane plus one retained reference to its native
+/// session. `deinit` frees the ids and releases the native.
+pub const PaneHandle = struct {
+    allocator: Allocator,
+    session_id: []u8,
+    window_id: []u8,
+    pane_id: []u8,
+    native: *NativeSession,
+
+    pub fn deinit(self: *PaneHandle) void {
+        self.native.release();
+        self.freeIds();
+        self.* = undefined;
+    }
+
+    /// Allocates the ids up front so the caller can create the pane without a
+    /// later allocation failure. `native` is set by the caller.
+    fn initIds(allocator: Allocator, session_id: []const u8, window_id: []const u8, pane_id: []const u8) !PaneHandle {
+        const owned_session = try allocator.dupe(u8, session_id);
+        errdefer allocator.free(owned_session);
+        const owned_window = try allocator.dupe(u8, window_id);
+        errdefer allocator.free(owned_window);
+        const owned_pane = try allocator.dupe(u8, pane_id);
+        return .{
+            .allocator = allocator,
+            .session_id = owned_session,
+            .window_id = owned_window,
+            .pane_id = owned_pane,
+            .native = undefined,
+        };
+    }
+
+    fn freeIds(self: *PaneHandle) void {
+        self.allocator.free(self.session_id);
+        self.allocator.free(self.window_id);
+        self.allocator.free(self.pane_id);
+    }
+
+    fn adopt(self: *PaneHandle, native: *NativeSession) PaneHandle {
+        native.retain();
+        self.native = native;
+        return self.*;
+    }
+};
+
+/// Drop a handle the caller does not need.
+fn discardHandle(handle: PaneHandle) void {
+    var owned = handle;
+    owned.deinit();
+}
+
+pub const AttachResult = struct {
+    client: ClientSnapshot,
+    created: bool,
+    exited: bool,
+    exit: ?native_mod.ExitInfo,
+    generation: u64,
+};
+
+pub const RespawnOptions = struct { kill: bool = false };
+
+pub const Counts = struct { sessions: usize, panes: usize, live_panes: usize };
+
+pub const DetachReason = enum { pane_removed, session_removed, remote_detach };
+
+pub const DetachedClient = struct { client_id: []u8, reason: DetachReason };
+
+pub const Limits = struct {
+    max_panes: usize = 256,
+    max_clients: usize = 1024,
+    max_bindings: usize = 1024,
+    max_total_scrollback_bytes: usize = 1024 * 1024 * 1024,
+    max_layout_depth: usize = 32,
+};
+
 pub const Axis = enum {
     horizontal,
     vertical,
@@ -411,6 +489,8 @@ pub const Manager = struct {
     next_pane_id: usize = 0,
     next_split_id: usize = 0,
     next_client_id: usize = 0,
+    /// Phase 0 stub (T3 owns): not enforced yet.
+    limits: Limits = .{},
 
     pub fn init(allocator: Allocator, io: std.Io, event_sink: ?native_mod.EventSink) Manager {
         return .{ .allocator = allocator, .io = io, .event_sink = event_sink };
@@ -452,12 +532,14 @@ pub const Manager = struct {
 
     /// Returns a retained native session. Caller owns one release().
     pub fn create(self: *Manager, opts: CreateOptions) !*NativeSession {
-        const pane = try self.createSessionPane(opts);
-        pane.native.retain();
-        return pane.native;
+        var handle = try self.createSessionPane(opts);
+        const native = handle.native;
+        native.retain();
+        handle.deinit();
+        return native;
     }
 
-    pub fn createSessionPane(self: *Manager, opts: CreateOptions) !*Pane {
+    pub fn createSessionPane(self: *Manager, opts: CreateOptions) !PaneHandle {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
@@ -467,6 +549,8 @@ pub const Manager = struct {
         defer self.allocator.free(window_id);
         const pane_id = try self.nextIdLocked("pane", &self.next_pane_id);
         defer self.allocator.free(pane_id);
+        var handle = try PaneHandle.initIds(self.allocator, session_id, window_id, pane_id);
+        errdefer handle.freeIds();
 
         const session_name = try self.allocator.dupe(u8, opts.title orelse session_id);
         errdefer self.allocator.free(session_name);
@@ -515,10 +599,10 @@ pub const Manager = struct {
         window.panes.appendAssumeCapacity(pane);
         session.windows.appendAssumeCapacity(window);
         self.sessions.appendAssumeCapacity(session);
-        return pane;
+        return handle.adopt(pane.native);
     }
 
-    pub fn newWindow(self: *Manager, session_id: []const u8, opts: CreateOptions) !*Pane {
+    pub fn newWindow(self: *Manager, session_id: []const u8, opts: CreateOptions) !PaneHandle {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
@@ -527,6 +611,8 @@ pub const Manager = struct {
         defer self.allocator.free(window_id);
         const pane_id = try self.nextIdLocked("pane", &self.next_pane_id);
         defer self.allocator.free(pane_id);
+        var handle = try PaneHandle.initIds(self.allocator, session.id, window_id, pane_id);
+        errdefer handle.freeIds();
 
         const window_name = try self.allocator.dupe(u8, opts.title orelse "window");
         errdefer self.allocator.free(window_name);
@@ -566,16 +652,18 @@ pub const Manager = struct {
         session.next_window_index += 1;
         self.allocator.free(session.active_window_id);
         session.active_window_id = active_window_id;
-        return pane;
+        return handle.adopt(pane.native);
     }
 
-    pub fn splitPane(self: *Manager, target_pane_id: []const u8, axis: Axis, opts: CreateOptions) !*Pane {
+    pub fn splitPane(self: *Manager, target_pane_id: []const u8, axis: Axis, opts: CreateOptions) !PaneHandle {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
         const found = self.findPaneWithParentsLocked(target_pane_id) orelse return error.PaneNotFound;
         const pane_id = try self.nextIdLocked("pane", &self.next_pane_id);
         defer self.allocator.free(pane_id);
+        var handle = try PaneHandle.initIds(self.allocator, found.session.id, found.window.id, pane_id);
+        errdefer handle.freeIds();
         const split_id = try self.nextIdLocked("split", &self.next_split_id);
         var split_id_owned = true;
         errdefer if (split_id_owned) self.allocator.free(split_id);
@@ -602,7 +690,7 @@ pub const Manager = struct {
         found.window.panes.appendAssumeCapacity(pane);
         self.allocator.free(found.window.active_pane_id);
         found.window.active_pane_id = active_pane_id;
-        return pane;
+        return handle.adopt(pane.native);
     }
 
     pub fn selectPane(self: *Manager, pane_id: []const u8) !void {
@@ -644,7 +732,10 @@ pub const Manager = struct {
         pane.has_custom_title = custom;
     }
 
-    pub fn respawnPane(self: *Manager, pane_id: []const u8) !*NativeSession {
+    /// Replace the pane's native session with a fresh spawn of the same spec
+    /// and the next generation. Fails with `PaneRunning` when the current
+    /// child is running and `opts.kill` is false.
+    pub fn respawnPane(self: *Manager, pane_id: []const u8, opts: RespawnOptions) !*NativeSession {
         var old_native: *NativeSession = undefined;
         var new_native: *NativeSession = undefined;
 
@@ -654,7 +745,13 @@ pub const Manager = struct {
                 self.mutex.unlock(self.io);
                 return error.PaneNotFound;
             };
-            new_native = NativeSession.create(self.allocator, self.io, pane.spawn.nativeOptions(pane.id, self.event_sink)) catch |err| {
+            if (!opts.kill and pane.native.isRunning()) {
+                self.mutex.unlock(self.io);
+                return error.PaneRunning;
+            }
+            var native_opts = pane.spawn.nativeOptions(pane.id, self.event_sink);
+            native_opts.generation = pane.native.generation() + 1;
+            new_native = NativeSession.create(self.allocator, self.io, native_opts) catch |err| {
                 self.mutex.unlock(self.io);
                 return err;
             };
@@ -924,9 +1021,9 @@ pub const Manager = struct {
         switch (parsed) {
             .noop => return,
             .split_window => |split| {
-                _ = try self.splitPane(target_pane_id, split.axis, .{
+                discardHandle(try self.splitPane(target_pane_id, split.axis, .{
                     .command = split.command,
-                });
+                }));
             },
             .new_window => |nw| {
                 const found = blk: {
@@ -936,13 +1033,13 @@ pub const Manager = struct {
                     break :blk try self.allocator.dupe(u8, found.session.id);
                 };
                 defer self.allocator.free(found);
-                _ = try self.newWindow(found, .{
+                discardHandle(try self.newWindow(found, .{
                     .title = nw.title,
                     .command = nw.command,
-                });
+                }));
             },
             .respawn_pane => {
-                const native = try self.respawnPane(target_pane_id);
+                const native = try self.respawnPane(target_pane_id, .{ .kill = true });
                 native.release();
             },
         }
@@ -1010,31 +1107,147 @@ pub const Manager = struct {
         }
     }
 
-    pub fn markActivity(self: *Manager, pane_id: []const u8) void {
+    /// Ignores events from a stale `generation`.
+    pub fn markActivity(self: *Manager, pane_id: []const u8, generation: u64, ts_ms: i64) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.findPaneLocked(pane_id)) |pane| {
+            if (pane.native.generation() != generation) return;
             pane.alerts.activity = true;
-            pane.alerts.last_activity_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
+            pane.alerts.last_activity_ms = ts_ms;
         }
     }
 
-    pub fn markBell(self: *Manager, pane_id: []const u8) void {
+    /// Ignores events from a stale `generation`.
+    pub fn markBell(self: *Manager, pane_id: []const u8, generation: u64, ts_ms: i64) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.findPaneLocked(pane_id)) |pane| {
+            if (pane.native.generation() != generation) return;
             pane.alerts.bell = true;
-            pane.alerts.last_bell_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
+            pane.alerts.last_bell_ms = ts_ms;
         }
     }
 
-    pub fn markExited(self: *Manager, pane_id: []const u8) void {
+    /// Ignores events from a stale `generation`.
+    pub fn markExited(self: *Manager, pane_id: []const u8, generation: u64) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.resolveTargetPaneLocked(pane_id)) |found| {
             const pane = found.pane;
+            if (pane.native.generation() != generation) return;
             pane.alerts.exited = true;
         }
+    }
+
+    /// Attach a client to `target`, creating a session first when
+    /// `create_opts` is non-null and the target does not resolve. Never fails
+    /// on an exited pane. Phase 0 stub (T3 owns): not atomic under one
+    /// critical section.
+    pub fn attachOrCreateClient(self: *Manager, target: []const u8, rows: u16, cols: u16, create_opts: ?CreateOptions) !AttachResult {
+        var created = false;
+        var client = self.attachClient(target, rows, cols) catch |err| switch (err) {
+            error.PaneNotFound => blk: {
+                const opts = create_opts orelse return err;
+                var handle = try self.createSessionPane(opts);
+                defer handle.deinit();
+                created = true;
+                break :blk try self.attachClient(handle.pane_id, rows, cols);
+            },
+            else => return err,
+        };
+        errdefer client.deinit(self.allocator);
+        const native = self.find(client.pane_id) orelse return error.PaneNotFound;
+        defer native.release();
+        const exit = native.exitInfo();
+        return .{
+            .client = client,
+            .created = created,
+            .exited = exit != null,
+            .exit = exit,
+            .generation = native.generation(),
+        };
+    }
+
+    /// Session, pane, and live-pane counts from one critical section.
+    pub fn counts(self: *Manager) Counts {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var result: Counts = .{ .sessions = self.sessions.items.len, .panes = 0, .live_panes = 0 };
+        for (self.sessions.items) |session| {
+            for (session.windows.items) |window| {
+                for (window.panes.items) |pane| {
+                    result.panes += 1;
+                    if (pane.native.state() != .terminated) result.live_panes += 1;
+                }
+            }
+        }
+        return result;
+    }
+
+    /// `native.stopInput` on every pane.
+    pub fn interruptInput(self: *Manager) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.sessions.items) |session| {
+            for (session.windows.items) |window| {
+                for (window.panes.items) |pane| pane.native.stopInput();
+            }
+        }
+    }
+
+    /// Set the manager sink and apply it to every existing native.
+    pub fn setEventSink(self: *Manager, sink: ?native_mod.EventSink) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.event_sink = sink;
+        for (self.sessions.items) |session| {
+            for (session.windows.items) |window| {
+                for (window.panes.items) |pane| pane.native.setEventSink(sink);
+            }
+        }
+    }
+
+    /// Clear the manager sink and `native.clearEventSink` on every pane.
+    pub fn clearEventSinks(self: *Manager) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.event_sink = null;
+        for (self.sessions.items) |session| {
+            for (session.windows.items) |window| {
+                for (window.panes.items) |pane| pane.native.clearEventSink();
+            }
+        }
+    }
+
+    /// Resize the pane's native PTY and record the size in its spawn spec.
+    pub fn resizePane(self: *Manager, pane_id: []const u8, rows: u16, cols: u16) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const pane = self.findPaneLocked(pane_id) orelse return error.PaneNotFound;
+        try pane.native.resize(cols, rows);
+        pane.spawn.rows = rows;
+        pane.spawn.cols = cols;
+    }
+
+    pub fn paneScrollbackTail(self: *Manager, allocator: Allocator, pane_id: []const u8, max_bytes: usize) !buffer.Tail {
+        self.mutex.lockUncancelable(self.io);
+        const pane = self.findPaneLocked(pane_id) orelse {
+            self.mutex.unlock(self.io);
+            return error.PaneNotFound;
+        };
+        const native = pane.native;
+        native.retain();
+        self.mutex.unlock(self.io);
+        defer native.release();
+        return native.scrollbackTail(allocator, max_bytes);
+    }
+
+    /// Clients pruned or detached since the last call; drained by the server.
+    /// Phase 0 stub (T3 owns): always empty.
+    pub fn takeDetachedClients(self: *Manager, allocator: Allocator) ![]DetachedClient {
+        _ = self;
+        return allocator.alloc(DetachedClient, 0);
     }
 
     pub fn find(self: *Manager, id: []const u8) ?*NativeSession {
@@ -1432,21 +1645,24 @@ fn createNewWindowAndSplitForFailureTest(allocator: Allocator) !void {
         .command = "cat",
         .scrollback_bytes = 4096,
     };
-    const first = try manager.createSessionPane(opts);
-    _ = try manager.newWindow(first.session_id, opts);
-    _ = try manager.splitPane(first.id, .horizontal, opts);
+    var first = try manager.createSessionPane(opts);
+    defer first.deinit();
+    discardHandle(try manager.newWindow(first.session_id, opts));
+    discardHandle(try manager.splitPane(first.pane_id, .horizontal, opts));
 }
 
 fn attachClientForFailureTest(allocator: Allocator) !void {
     var manager = Manager.init(allocator, std.testing.io, null);
     defer manager.deinit();
 
-    const pane = try manager.createSessionPane(.{
+    var pane = try manager.createSessionPane(.{
         .shell = "/bin/sh",
         .command = "cat",
         .scrollback_bytes = 4096,
     });
-    var client = try manager.attachClient(pane.id, 30, 100);
+
+    defer pane.deinit();
+    var client = try manager.attachClient(pane.pane_id, 30, 100);
     defer client.deinit(allocator);
 }
 
@@ -1454,15 +1670,17 @@ fn respawnPaneForFailureTest(allocator: Allocator) !void {
     var manager = Manager.init(allocator, std.testing.io, null);
     defer manager.deinit();
 
-    const pane = try manager.createSessionPane(.{
+    var pane = try manager.createSessionPane(.{
         .shell = "/bin/sh",
         .command = "cat",
         .scrollback_bytes = 4096,
     });
-    const pane_id = try allocator.dupe(u8, pane.id);
+
+    defer pane.deinit();
+    const pane_id = try allocator.dupe(u8, pane.pane_id);
     defer allocator.free(pane_id);
 
-    const native = try manager.respawnPane(pane_id);
+    const native = try manager.respawnPane(pane_id, .{ .kill = true });
     native.release();
 }
 
@@ -1477,10 +1695,12 @@ test "mux manager creates session window and pane state" {
     var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
-    const pane = try manager.createSessionPane(.{ .title = "one", .shell = "/bin/sh", .command = "cat" });
+    var pane = try manager.createSessionPane(.{ .title = "one", .shell = "/bin/sh", .command = "cat" });
+
+    defer pane.deinit();
     try std.testing.expect(std.mem.startsWith(u8, pane.session_id, "sess-"));
     try std.testing.expect(std.mem.startsWith(u8, pane.window_id, "win-"));
-    try std.testing.expect(std.mem.startsWith(u8, pane.id, "pane-"));
+    try std.testing.expect(std.mem.startsWith(u8, pane.pane_id, "pane-"));
 
     const snapshot = try manager.snapshotJson(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
@@ -1492,11 +1712,14 @@ test "mux manager splits panes and records layout" {
     var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
-    const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
-    const first_id = try std.testing.allocator.dupe(u8, first.id);
+    var first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
+
+    defer first.deinit();
+    const first_id = try std.testing.allocator.dupe(u8, first.pane_id);
     defer std.testing.allocator.free(first_id);
-    const second = try manager.splitPane(first_id, .horizontal, .{ .shell = "/bin/sh", .command = "cat" });
-    try std.testing.expect(!std.mem.eql(u8, first_id, second.id));
+    var second = try manager.splitPane(first_id, .horizontal, .{ .shell = "/bin/sh", .command = "cat" });
+    defer second.deinit();
+    try std.testing.expect(!std.mem.eql(u8, first_id, second.pane_id));
 
     const snapshot = try manager.snapshotJson(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
@@ -1508,14 +1731,18 @@ test "removing a nested pane keeps the surviving sibling subtree in layout" {
     var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
-    const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
-    const first_id = try std.testing.allocator.dupe(u8, first.id);
+    var first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
+
+    defer first.deinit();
+    const first_id = try std.testing.allocator.dupe(u8, first.pane_id);
     defer std.testing.allocator.free(first_id);
-    const second = try manager.splitPane(first_id, .vertical, .{ .shell = "/bin/sh", .command = "cat" });
-    const second_id = try std.testing.allocator.dupe(u8, second.id);
+    var second = try manager.splitPane(first_id, .vertical, .{ .shell = "/bin/sh", .command = "cat" });
+    defer second.deinit();
+    const second_id = try std.testing.allocator.dupe(u8, second.pane_id);
     defer std.testing.allocator.free(second_id);
-    const third = try manager.splitPane(first_id, .horizontal, .{ .shell = "/bin/sh", .command = "cat" });
-    const third_id = try std.testing.allocator.dupe(u8, third.id);
+    var third = try manager.splitPane(first_id, .horizontal, .{ .shell = "/bin/sh", .command = "cat" });
+    defer third.deinit();
+    const third_id = try std.testing.allocator.dupe(u8, third.pane_id);
     defer std.testing.allocator.free(third_id);
 
     try std.testing.expect(manager.terminate(first_id));
@@ -1530,20 +1757,24 @@ test "removing a nested pane keeps the surviving sibling subtree in layout" {
         try std.testing.expect(layoutContainsPane(window.layout, third_id));
     }
 
-    const fourth = try manager.splitPane(third_id, .vertical, .{ .shell = "/bin/sh", .command = "cat" });
-    try std.testing.expect(!std.mem.eql(u8, fourth.id, third_id));
+    var fourth = try manager.splitPane(third_id, .vertical, .{ .shell = "/bin/sh", .command = "cat" });
+
+    defer fourth.deinit();
+    try std.testing.expect(!std.mem.eql(u8, fourth.pane_id, third_id));
 }
 
 test "attachClient resolves a session name to its active pane" {
     var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
-    const pane = try manager.createSessionPane(.{
+    var pane = try manager.createSessionPane(.{
         .title = "work",
         .shell = "/bin/sh",
         .command = "cat",
     });
-    const expected_pane_id = try std.testing.allocator.dupe(u8, pane.id);
+
+    defer pane.deinit();
+    const expected_pane_id = try std.testing.allocator.dupe(u8, pane.pane_id);
     defer std.testing.allocator.free(expected_pane_id);
 
     var client = try manager.attachClient("work", 24, 80);
@@ -1555,12 +1786,14 @@ test "attachClient still resolves an explicit pane id" {
     var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
-    const pane = try manager.createSessionPane(.{
+    var pane = try manager.createSessionPane(.{
         .title = "work",
         .shell = "/bin/sh",
         .command = "cat",
     });
-    const pane_id = try std.testing.allocator.dupe(u8, pane.id);
+
+    defer pane.deinit();
+    const pane_id = try std.testing.allocator.dupe(u8, pane.pane_id);
     defer std.testing.allocator.free(pane_id);
 
     var client = try manager.attachClient(pane_id, 24, 80);
@@ -1572,11 +1805,11 @@ test "attachClient on an unknown name returns PaneNotFound" {
     var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
-    _ = try manager.createSessionPane(.{
+    discardHandle(try manager.createSessionPane(.{
         .title = "work",
         .shell = "/bin/sh",
         .command = "cat",
-    });
+    }));
     try std.testing.expectError(error.PaneNotFound, manager.attachClient("ghost", 24, 80));
 }
 
@@ -1584,12 +1817,14 @@ test "session-targeted APIs resolve pane id session id and session name" {
     var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
-    const pane = try manager.createSessionPane(.{
+    var pane = try manager.createSessionPane(.{
         .title = "work",
         .shell = "/bin/sh",
         .command = "cat",
     });
-    const pane_id = try std.testing.allocator.dupe(u8, pane.id);
+
+    defer pane.deinit();
+    const pane_id = try std.testing.allocator.dupe(u8, pane.pane_id);
     defer std.testing.allocator.free(pane_id);
     const session_id = try std.testing.allocator.dupe(u8, pane.session_id);
     defer std.testing.allocator.free(session_id);
@@ -1612,12 +1847,14 @@ test "terminate by session id removes the whole session" {
     var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
-    const first = try manager.createSessionPane(.{ .title = "work", .shell = "/bin/sh", .command = "cat" });
-    const first_id = try std.testing.allocator.dupe(u8, first.id);
+    var first = try manager.createSessionPane(.{ .title = "work", .shell = "/bin/sh", .command = "cat" });
+
+    defer first.deinit();
+    const first_id = try std.testing.allocator.dupe(u8, first.pane_id);
     defer std.testing.allocator.free(first_id);
     const session_id = try std.testing.allocator.dupe(u8, first.session_id);
     defer std.testing.allocator.free(session_id);
-    _ = try manager.splitPane(first_id, .horizontal, .{ .shell = "/bin/sh", .command = "cat" });
+    discardHandle(try manager.splitPane(first_id, .horizontal, .{ .shell = "/bin/sh", .command = "cat" }));
 
     try std.testing.expectEqual(@as(usize, 1), manager.sessionCount());
     try std.testing.expectEqual(@as(usize, 2), manager.paneCount());
@@ -1630,8 +1867,10 @@ test "mux key binding executes tmux-like split command" {
     var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
-    const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
-    const first_id = try std.testing.allocator.dupe(u8, first.id);
+    var first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
+
+    defer first.deinit();
+    const first_id = try std.testing.allocator.dupe(u8, first.pane_id);
     defer std.testing.allocator.free(first_id);
     try manager.bindKey("prefix", "%", "split-window -h", false);
     const command = try manager.executeBinding("prefix", "%", first_id);
@@ -1644,8 +1883,10 @@ test "command exec split-window passes trailing shell command to new pane" {
     var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
-    const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
-    const first_id = try std.testing.allocator.dupe(u8, first.id);
+    var first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
+
+    defer first.deinit();
+    const first_id = try std.testing.allocator.dupe(u8, first.pane_id);
     defer std.testing.allocator.free(first_id);
 
     try manager.executeCommandLine("split-window -h /bin/echo SPLIT_CMD_RAN", first_id);
@@ -1665,8 +1906,10 @@ test "command exec new-window honors name and shell command" {
     var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
-    const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
-    const first_id = try std.testing.allocator.dupe(u8, first.id);
+    var first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
+
+    defer first.deinit();
+    const first_id = try std.testing.allocator.dupe(u8, first.pane_id);
     defer std.testing.allocator.free(first_id);
 
     try manager.executeCommandLine("new-window -n logs /bin/echo NEW_CMD_RAN", first_id);
@@ -1685,8 +1928,10 @@ test "command exec rejects unsupported flags instead of dropping them" {
     var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
-    const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
-    const first_id = try std.testing.allocator.dupe(u8, first.id);
+    var first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
+
+    defer first.deinit();
+    const first_id = try std.testing.allocator.dupe(u8, first.pane_id);
     defer std.testing.allocator.free(first_id);
 
     try std.testing.expectError(error.UnsupportedCommand, manager.executeCommandLine("split-window -x", first_id));
@@ -1699,11 +1944,14 @@ test "switchClient moves a logical client to another pane" {
     var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
-    const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
-    const first_id = try std.testing.allocator.dupe(u8, first.id);
+    var first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
+
+    defer first.deinit();
+    const first_id = try std.testing.allocator.dupe(u8, first.pane_id);
     defer std.testing.allocator.free(first_id);
-    const second = try manager.splitPane(first_id, .vertical, .{ .shell = "/bin/sh", .command = "cat" });
-    const second_id = try std.testing.allocator.dupe(u8, second.id);
+    var second = try manager.splitPane(first_id, .vertical, .{ .shell = "/bin/sh", .command = "cat" });
+    defer second.deinit();
+    const second_id = try std.testing.allocator.dupe(u8, second.pane_id);
     defer std.testing.allocator.free(second_id);
 
     var client = try manager.attachClient(first_id, 25, 90);
@@ -1723,8 +1971,10 @@ test "snapshot omits dead pane silence field and reports attached clients active
     var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
-    const pane = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
-    var client = try manager.attachClient(pane.id, 24, 80);
+    var pane = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
+
+    defer pane.deinit();
+    var client = try manager.attachClient(pane.pane_id, 24, 80);
     defer client.deinit(std.testing.allocator);
 
     const snapshot = try manager.snapshotJson(std.testing.allocator);
@@ -1737,11 +1987,14 @@ test "terminating a split pane collapses layout and keeps the remaining pane" {
     var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
-    const first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
-    const first_id = try std.testing.allocator.dupe(u8, first.id);
+    var first = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
+
+    defer first.deinit();
+    const first_id = try std.testing.allocator.dupe(u8, first.pane_id);
     defer std.testing.allocator.free(first_id);
-    const second = try manager.splitPane(first_id, .horizontal, .{ .shell = "/bin/sh", .command = "cat" });
-    const second_id = try std.testing.allocator.dupe(u8, second.id);
+    var second = try manager.splitPane(first_id, .horizontal, .{ .shell = "/bin/sh", .command = "cat" });
+    defer second.deinit();
+    const second_id = try std.testing.allocator.dupe(u8, second.pane_id);
     defer std.testing.allocator.free(second_id);
 
     try std.testing.expectEqual(@as(usize, 2), manager.count());
@@ -1775,8 +2028,10 @@ test "attachClient returns an owned snapshot that survives detach" {
     var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
-    const pane = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
-    const pane_id = try std.testing.allocator.dupe(u8, pane.id);
+    var pane = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat" });
+
+    defer pane.deinit();
+    const pane_id = try std.testing.allocator.dupe(u8, pane.pane_id);
     defer std.testing.allocator.free(pane_id);
 
     var client = try manager.attachClient(pane_id, 24, 80);
@@ -1789,7 +2044,7 @@ test "manager count ignores terminated panes for idle accounting" {
     var manager = Manager.init(std.testing.allocator, std.testing.io, null);
     defer manager.deinit();
 
-    _ = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "true" });
+    discardHandle(try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "true" }));
 
     const io = std.testing.io;
     const deadline = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(2));

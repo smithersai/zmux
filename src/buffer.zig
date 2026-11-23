@@ -5,11 +5,15 @@ const Allocator = std.mem.Allocator;
 pub const default_capacity = 10 * 1024 * 1024;
 pub const max_capacity = 64 * 1024 * 1024;
 
+pub const Tail = struct { bytes: []u8, start_offset: u64, end_offset: u64 };
+
 pub const ScrollbackBuffer = struct {
     allocator: Allocator,
     data: []u8,
     start: usize = 0,
     len: usize = 0,
+    /// Total bytes ever appended.
+    total_appended: u64 = 0,
 
     pub fn init(allocator: Allocator, capacity_bytes: usize) !ScrollbackBuffer {
         const clamped = @max(capacity_bytes, 1);
@@ -31,6 +35,7 @@ pub const ScrollbackBuffer = struct {
 
     pub fn append(self: *ScrollbackBuffer, bytes: []const u8) void {
         if (bytes.len == 0) return;
+        self.total_appended += bytes.len;
 
         if (bytes.len >= self.data.len) {
             const tail = bytes[bytes.len - self.data.len ..];
@@ -72,7 +77,39 @@ pub const ScrollbackBuffer = struct {
         return out;
     }
 
+    /// Total bytes ever appended.
+    pub fn endOffset(self: *const ScrollbackBuffer) u64 {
+        return self.total_appended;
+    }
+
+    /// Copy the newest `min(len, max_bytes)` bytes with their stream offsets.
+    pub fn snapshotTail(self: *const ScrollbackBuffer, allocator: Allocator, max_bytes: usize) !Tail {
+        const n = @min(self.len, max_bytes);
+        const bytes = try allocator.alloc(u8, n);
+        const skip = self.len - n;
+        var i: usize = 0;
+        while (i < n) : (i += 1) bytes[i] = self.data[(self.start + skip + i) % self.data.len];
+        return .{
+            .bytes = bytes,
+            .start_offset = self.total_appended - n,
+            .end_offset = self.total_appended,
+        };
+    }
+
     pub fn captureLastLines(self: *const ScrollbackBuffer, allocator: Allocator, max_lines: usize) ![]u8 {
+        return self.captureLastLinesBounded(allocator, max_lines, self.capacity());
+    }
+
+    /// Phase 0 stub (T1 owns): `max_bytes` caps the returned slice, not the
+    /// intermediate snapshot.
+    pub fn captureLastLinesBounded(self: *const ScrollbackBuffer, allocator: Allocator, max_lines: usize, max_bytes: usize) ![]u8 {
+        const capture = try self.captureLastLinesUnbounded(allocator, max_lines);
+        if (capture.len <= max_bytes) return capture;
+        defer allocator.free(capture);
+        return allocator.dupe(u8, capture[capture.len - max_bytes ..]);
+    }
+
+    fn captureLastLinesUnbounded(self: *const ScrollbackBuffer, allocator: Allocator, max_lines: usize) ![]u8 {
         if (max_lines == 0 or self.len == 0) return allocator.dupe(u8, "");
 
         const snap = try self.snapshot(allocator);

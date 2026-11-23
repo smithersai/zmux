@@ -10,6 +10,14 @@ pub const session_exited_method = "session_exited";
 pub const pane_output_method = "pane_output";
 pub const pane_activity_method = "pane_activity";
 pub const pane_bell_method = "pane_bell";
+pub const pane_output_dropped_method = "pane_output_dropped";
+pub const pane_respawned_method = "pane_respawned";
+pub const client_detached_method = "client_detached";
+
+/// Upper bounds enforced on incoming JSON-RPC requests before the value tree
+/// is built.
+pub const max_json_depth: usize = 64;
+pub const max_json_nodes: usize = 100_000;
 
 pub const ErrorCode = struct {
     pub const parse_error = -32700;
@@ -20,11 +28,16 @@ pub const ErrorCode = struct {
     pub const session_error = -32000;
 };
 
+pub const ParseRequestError = error{ ParseError, InvalidRequest, InvalidId, NestingTooDeep, BatchUnsupported, OutOfMemory };
+
 pub const Request = struct {
     allocator: Allocator,
     parsed: std.json.Parsed(Value),
+    /// `"null"` when `!has_id`.
     id_json: []u8,
     method: []u8,
+    /// False for JSON-RPC notifications (no `"id"` member).
+    has_id: bool,
 
     pub fn deinit(self: *Request) void {
         self.allocator.free(self.id_json);
@@ -43,6 +56,7 @@ pub const ForegroundChangedParams = struct {
     pid: std.posix.pid_t,
     comm: []const u8,
     argv: []const []const u8,
+    argv_truncated: bool = false,
 };
 
 pub const SessionExitedParams = struct {
@@ -50,33 +64,64 @@ pub const SessionExitedParams = struct {
     pid: std.posix.pid_t,
     exit_code: ?u32 = null,
     signal: ?u32 = null,
+    generation: u64 = 0,
 };
 
 pub const PaneOutputParams = struct {
     pane_id: []const u8,
     data_base64: []const u8,
+    /// Stream offset of the first byte in `data_base64`.
+    offset: u64 = 0,
+    generation: u64 = 0,
 };
 
 pub const PaneActivityParams = struct {
     pane_id: []const u8,
     last_activity_ms: i64,
+    generation: u64 = 0,
 };
 
 pub const PaneBellParams = struct {
     pane_id: []const u8,
     last_bell_ms: i64,
+    generation: u64 = 0,
 };
 
-pub fn parseRequest(allocator: Allocator, line: []const u8) !Request {
-    var parsed = try std.json.parseFromSlice(Value, allocator, line, .{});
+pub const PaneOutputDroppedParams = struct {
+    pane_id: []const u8,
+    dropped_bytes: u64,
+    resume_offset: u64,
+};
+
+pub const PaneRespawnedParams = struct {
+    pane_id: []const u8,
+    generation: u64,
+    pid: std.posix.pid_t,
+};
+
+pub const ClientDetachedParams = struct {
+    client_id: []const u8,
+    /// `"pane_removed"`, `"session_removed"`, or `"remote_detach"`.
+    reason: []const u8,
+};
+
+/// Phase 0 stub (T1 owns): depth/node pre-scan, `jsonrpc` validation, batch
+/// and id-type rejection are not enforced yet. std.json syntax failures map to
+/// `error.ParseError`.
+pub fn parseRequest(allocator: Allocator, line: []const u8) ParseRequestError!Request {
+    var parsed = std.json.parseFromSlice(Value, allocator, line, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.ParseError,
+    };
     errdefer parsed.deinit();
 
     if (parsed.value != .object) return error.InvalidRequest;
     const method_value = parsed.value.object.get("method") orelse return error.InvalidRequest;
     if (method_value != .string) return error.InvalidRequest;
 
+    const has_id = parsed.value.object.get("id") != null;
     const id_value = parsed.value.object.get("id") orelse Value.null;
-    const id_json = try jsonValueAlloc(allocator, id_value);
+    const id_json = jsonValueAlloc(allocator, id_value) catch return error.OutOfMemory;
     errdefer allocator.free(id_json);
 
     const method = try allocator.dupe(u8, method_value.string);
@@ -87,7 +132,116 @@ pub fn parseRequest(allocator: Allocator, line: []const u8) !Request {
         .parsed = parsed,
         .id_json = id_json,
         .method = method,
+        .has_id = has_id,
     };
+}
+
+pub fn isNotification(req: *const Request) bool {
+    return !req.has_id;
+}
+
+pub const ErrorKind = enum {
+    parse,
+    invalid_request,
+    method_not_found,
+    invalid_params,
+    not_found,
+    terminated,
+    conflict,
+    limit,
+    spawn_failed,
+    io,
+    internal,
+};
+
+pub const ErrorMapping = struct { code: i32, kind: ErrorKind };
+
+/// Global error-name to JSON-RPC code table (review K0).
+pub fn errorCodeFor(err: anyerror) ErrorMapping {
+    const Entry = struct { names: []const []const u8, mapping: ErrorMapping };
+    const table = [_]Entry{
+        .{ .names = &.{ "ParseError", "SyntaxError", "UnexpectedEndOfInput" }, .mapping = .{ .code = ErrorCode.parse_error, .kind = .parse } },
+        .{ .names = &.{ "InvalidRequest", "InvalidId", "NestingTooDeep", "BatchUnsupported", "MessageTooLarge", "TruncatedFrame" }, .mapping = .{ .code = ErrorCode.invalid_request, .kind = .invalid_request } },
+        .{ .names = &.{"MethodNotFound"}, .mapping = .{ .code = ErrorCode.method_not_found, .kind = .method_not_found } },
+        .{ .names = &.{ "InvalidParams", "InvalidSpawnArgument", "UnknownKey", "ScrollbackBytesTooLarge", "InvalidName", "InvalidAxis", "InvalidDimensions" }, .mapping = .{ .code = ErrorCode.invalid_params, .kind = .invalid_params } },
+        .{ .names = &.{ "SessionNotFound", "WindowNotFound", "PaneNotFound", "ClientNotFound" }, .mapping = .{ .code = ErrorCode.session_error, .kind = .not_found } },
+        .{ .names = &.{"SessionTerminated"}, .mapping = .{ .code = ErrorCode.session_error, .kind = .terminated } },
+        .{ .names = &.{ "DuplicateSessionName", "NameShadowsId", "PaneRunning" }, .mapping = .{ .code = ErrorCode.session_error, .kind = .conflict } },
+        .{ .names = &.{"LimitExceeded"}, .mapping = .{ .code = ErrorCode.session_error, .kind = .limit } },
+        .{ .names = &.{ "OpenPtyFailed", "ForkFailed", "ChildSetupFailed", "SpawnFailed" }, .mapping = .{ .code = ErrorCode.session_error, .kind = .spawn_failed } },
+        .{ .names = &.{ "InputTimeout", "InputClosed", "BrokenPipe", "InputOutput", "WriteZero" }, .mapping = .{ .code = ErrorCode.session_error, .kind = .io } },
+    };
+    const name = @errorName(err);
+    inline for (table) |entry| {
+        for (entry.names) |candidate| {
+            if (std.mem.eql(u8, name, candidate)) return entry.mapping;
+        }
+    }
+    return .{ .code = ErrorCode.internal_error, .kind = .internal };
+}
+
+/// `{"jsonrpc":"2.0","id":<id>,"error":{"code":C,"message":"M","data":{"kind":"K"}}}`
+pub fn errorWithKind(allocator: Allocator, id_json: []const u8, code: i32, message: []const u8, kind: ErrorKind) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.print(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"error\":{{\"code\":{},\"message\":",
+        .{ id_json, code },
+    );
+    try writeJsonStringLossy(&out.writer, message);
+    try out.writer.print(",\"data\":{{\"kind\":\"{s}\"}}}}}}\n", .{@tagName(kind)});
+    return out.toOwnedSlice();
+}
+
+/// Always emits a JSON string. Invalid UTF-8 sequences become U+FFFD.
+pub fn writeJsonStringLossy(writer: *std.Io.Writer, bytes: []const u8) !void {
+    if (std.unicode.utf8ValidateSlice(bytes)) {
+        try std.json.Stringify.value(bytes, .{}, writer);
+        return;
+    }
+    try writer.writeByte('"');
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const len = std.unicode.utf8ByteSequenceLength(bytes[i]) catch 0;
+        if (len == 0 or i + len > bytes.len or !std.unicode.utf8ValidateSlice(bytes[i .. i + len])) {
+            try writer.writeAll("\u{FFFD}");
+            i += 1;
+            continue;
+        }
+        try writeJsonStringBody(writer, bytes[i .. i + len]);
+        i += len;
+    }
+    try writer.writeByte('"');
+}
+
+fn writeJsonStringBody(writer: *std.Io.Writer, valid_utf8: []const u8) !void {
+    for (valid_utf8) |byte| switch (byte) {
+        '"' => try writer.writeAll("\\\""),
+        '\\' => try writer.writeAll("\\\\"),
+        '\n' => try writer.writeAll("\\n"),
+        '\r' => try writer.writeAll("\\r"),
+        '\t' => try writer.writeAll("\\t"),
+        0...0x08, 0x0b, 0x0c, 0x0e...0x1f => try writer.print("\\u{x:0>4}", .{byte}),
+        else => try writer.writeByte(byte),
+    };
+}
+
+/// Copy `bytes`, replacing each invalid UTF-8 byte with U+FFFD.
+pub fn sanitizeUtf8Alloc(allocator: Allocator, bytes: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const len = std.unicode.utf8ByteSequenceLength(bytes[i]) catch 0;
+        if (len == 0 or i + len > bytes.len or !std.unicode.utf8ValidateSlice(bytes[i .. i + len])) {
+            try out.appendSlice(allocator, "\u{FFFD}");
+            i += 1;
+            continue;
+        }
+        try out.appendSlice(allocator, bytes[i .. i + len]);
+        i += len;
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 pub fn result(allocator: Allocator, id_json: []const u8, value: anytype) ![]u8 {

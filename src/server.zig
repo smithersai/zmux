@@ -561,7 +561,8 @@ pub const Server = struct {
             }
         };
         defer create_args.deinit();
-        _ = try self.manager.newWindow(session_id, create_args.opts);
+        var handle = try self.manager.newWindow(session_id, create_args.opts);
+        handle.deinit();
         try self.writeSnapshotResponse(connection, req.id_json);
     }
 
@@ -579,7 +580,8 @@ pub const Server = struct {
             }
         };
         defer create_args.deinit();
-        _ = try self.manager.splitPane(pane_id, axisParam(req.params()), create_args.opts);
+        var handle = try self.manager.splitPane(pane_id, axisParam(req.params()), create_args.opts);
+        handle.deinit();
         try self.writeSnapshotResponse(connection, req.id_json);
     }
 
@@ -636,7 +638,9 @@ pub const Server = struct {
         const pane_id = paneIdParam(req.params()) orelse {
             return self.writeError(connection, req.id_json, protocol.ErrorCode.invalid_params, "paneId is required");
         };
-        const active = try self.manager.respawnPane(pane_id);
+        // Phase 0: `kill = true` preserves the v0.3.0 wire behavior until T4
+        // wires the `kill` request param.
+        const active = try self.manager.respawnPane(pane_id, .{ .kill = true });
         defer active.release();
         try self.writeSnapshotResponse(connection, req.id_json);
     }
@@ -990,7 +994,7 @@ pub const Server = struct {
                 params,
             ),
             .session_exited => |params| blk: {
-                self.manager.markExited(params.session_id);
+                self.manager.markExited(params.session_id, params.generation);
                 break :blk protocol.notification(
                     self.allocator,
                     protocol.session_exited_method,
@@ -998,7 +1002,7 @@ pub const Server = struct {
                 );
             },
             .pane_output => |params| blk: {
-                self.manager.markActivity(params.pane_id);
+                self.manager.markActivity(params.pane_id, params.generation, std.Io.Clock.real.now(self.io).toMilliseconds());
                 const encoded = base64Encode(self.allocator, params.data) catch return;
                 defer self.allocator.free(encoded);
                 break :blk protocol.notification(
@@ -1007,28 +1011,32 @@ pub const Server = struct {
                     protocol.PaneOutputParams{
                         .pane_id = params.pane_id,
                         .data_base64 = encoded,
+                        .offset = params.offset,
+                        .generation = params.generation,
                     },
                 );
             },
             .pane_activity => |params| blk: {
-                self.manager.markActivity(params.pane_id);
+                self.manager.markActivity(params.pane_id, params.generation, params.last_activity_ms);
                 break :blk protocol.notification(
                     self.allocator,
                     protocol.pane_activity_method,
                     protocol.PaneActivityParams{
                         .pane_id = params.pane_id,
                         .last_activity_ms = params.last_activity_ms,
+                        .generation = params.generation,
                     },
                 );
             },
             .pane_bell => |params| blk: {
-                self.manager.markBell(params.pane_id);
+                self.manager.markBell(params.pane_id, params.generation, params.last_bell_ms);
                 break :blk protocol.notification(
                     self.allocator,
                     protocol.pane_bell_method,
                     protocol.PaneBellParams{
                         .pane_id = params.pane_id,
                         .last_bell_ms = params.last_bell_ms,
+                        .generation = params.generation,
                     },
                 );
             },
@@ -1968,7 +1976,8 @@ test "server idle timeout ignores terminated panes" {
     var server = try Server.init(allocator, test_io, socket_path, 1);
     defer server.deinit();
 
-    _ = try server.manager.createSessionPane(.{ .shell = "/bin/sh", .command = "true" });
+    var handle = try server.manager.createSessionPane(.{ .shell = "/bin/sh", .command = "true" });
+    handle.deinit();
 
     const deadline = std.Io.Clock.awake.now(test_io).addDuration(.fromSeconds(2));
     while (std.Io.Clock.awake.now(test_io).compare(.lt, deadline)) {

@@ -109,7 +109,10 @@ pub fn sendAll(fd: fd_t, bytes: []const u8) (WriteError || error{WriteZero})!voi
 
 /// `dup2(2)`: make `new_fd` refer to the same open file as `old_fd`.
 /// Async-signal-safe; suitable for use between `fork` and `exec`.
+/// When `old_fd == new_fd`, clears `FD_CLOEXEC` instead so the descriptor
+/// survives `exec`.
 pub fn dup2(old_fd: fd_t, new_fd: fd_t) UnexpectedError!void {
+    if (old_fd == new_fd) return clearCloseOnExec(new_fd);
     while (true) {
         switch (posix.errno(c.dup2(old_fd, new_fd))) {
             .SUCCESS => return,
@@ -143,6 +146,13 @@ pub fn setCloseOnExec(fd: fd_t) SetCloexecError!void {
     const flags = c.fcntl(fd, c.F.GETFD);
     if (flags < 0) return unexpected(posix.errno(flags));
     if (c.fcntl(fd, c.F.SETFD, flags | c.FD_CLOEXEC) < 0) return unexpected(posix.errno(@as(c_int, -1)));
+}
+
+/// Async-signal-safe.
+pub fn clearCloseOnExec(fd: fd_t) UnexpectedError!void {
+    const flags = c.fcntl(fd, c.F.GETFD);
+    if (flags < 0) return unexpected(posix.errno(flags));
+    if (c.fcntl(fd, c.F.SETFD, flags & ~@as(c_int, c.FD_CLOEXEC)) < 0) return unexpected(posix.errno(@as(c_int, -1)));
 }
 
 pub fn setNonBlocking(fd: fd_t) UnexpectedError!void {
@@ -728,6 +738,154 @@ fn execErr(err: posix.E) ExecError {
 /// The process environment block as a NULL-terminated `envp` array.
 pub fn currentEnviron() [*:null]const ?[*:0]const u8 {
     return @ptrCast(c.environ);
+}
+
+// ---------------------------------------------------------------------------
+// Review round-1 contract (owned by T2). Phase 0 stubs: signatures are final;
+// bodies are minimal and T2 hardens them.
+
+pub const PrivateDirError = error{ NotDirectory, ForeignOwner, InsecurePermissions, SymlinkParent, NameTooLong, AccessDenied, FileNotFound, Unexpected };
+
+/// mkdir 0700 if missing, then open `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC` and
+/// require owner == euid and `mode & 0o077 == 0`. Returns the pinned dir fd;
+/// the caller closes it. Phase 0 stub: no ancestor creation, no repair.
+pub fn ensurePrivateDir(path: []const u8) PrivateDirError!fd_t {
+    mkdir(path, 0o700) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        error.NameTooLong => return error.NameTooLong,
+        error.AccessDenied, error.ReadOnlyFileSystem => return error.AccessDenied,
+        error.FileNotFound => return error.FileNotFound,
+        error.NotDir => return error.NotDirectory,
+        error.SymLinkLoop => return error.SymlinkParent,
+        else => return error.Unexpected,
+    };
+    const fd = openDirNoFollow(path) catch |err| switch (err) {
+        error.NameTooLong => return error.NameTooLong,
+        error.AccessDenied => return error.AccessDenied,
+        error.FileNotFound => return error.FileNotFound,
+        error.NotDir, error.SymLinkLoop => return error.NotDirectory,
+        else => return error.Unexpected,
+    };
+    errdefer close(fd);
+    const st = fstat(fd) catch return error.Unexpected;
+    if (!st.isDir()) return error.NotDirectory;
+    if (st.uid != geteuid()) return error.ForeignOwner;
+    if (st.permissions() & 0o077 != 0) return error.InsecurePermissions;
+    return fd;
+}
+
+/// `openat(dir_fd, name, flags|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC, mode)`, then
+/// require a regular file owned by euid and clear `O_NONBLOCK`.
+pub fn openOwnedRegularAt(dir_fd: fd_t, name: []const u8, flags: c.O, mode: mode_t) (OpenError || error{ NotRegularFile, ForeignOwner })!fd_t {
+    var path_buf: [posix.PATH_MAX]u8 = undefined;
+    const name_z = try toPathZ(&path_buf, name);
+    var open_flags = flags;
+    open_flags.NOFOLLOW = true;
+    open_flags.NONBLOCK = true;
+    open_flags.CLOEXEC = true;
+    const fd: fd_t = while (true) {
+        const rc = c.openat(dir_fd, name_z, open_flags, @as(c_uint, mode));
+        switch (posix.errno(rc)) {
+            .SUCCESS => break @intCast(rc),
+            .INTR => continue,
+            .ACCES, .PERM => return error.AccessDenied,
+            .NOENT => return error.FileNotFound,
+            .NOTDIR => return error.NotDir,
+            .LOOP => return error.SymLinkLoop,
+            .NAMETOOLONG => return error.NameTooLong,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            else => |err| return unexpected(err),
+        }
+    };
+    errdefer close(fd);
+    const st = fstat(fd) catch return error.Unexpected;
+    if (st.kind() != posix.S.IFREG) return error.NotRegularFile;
+    if (st.uid != geteuid()) return error.ForeignOwner;
+    const fl = c.fcntl(fd, c.F.GETFL);
+    if (fl < 0) return unexpected(posix.errno(fl));
+    const nonblock: c_int = @bitCast(c.O{ .NONBLOCK = true });
+    if (c.fcntl(fd, c.F.SETFL, fl & ~nonblock) < 0) return unexpected(posix.errno(@as(c_int, -1)));
+    return fd;
+}
+
+extern "c" fn getpeereid(fd: fd_t, euid: *uid_t, egid: *c.gid_t) c_int;
+
+/// Effective uid of the peer on a connected `AF_UNIX` socket.
+pub fn peerEuid(fd: fd_t) error{ PeerCredentialsUnavailable, Unexpected }!uid_t {
+    if (builtin.os.tag == .linux) {
+        const Ucred = extern struct { pid: pid_t, uid: uid_t, gid: c.gid_t };
+        var cred: Ucred = undefined;
+        var len: c.socklen_t = @sizeOf(Ucred);
+        if (c.getsockopt(fd, c.SOL.SOCKET, c.SO.PEERCRED, &cred, &len) != 0) return error.PeerCredentialsUnavailable;
+        if (len != @sizeOf(Ucred)) return error.PeerCredentialsUnavailable;
+        return cred.uid;
+    }
+    if (is_darwin) {
+        var uid: uid_t = undefined;
+        var gid: c.gid_t = undefined;
+        if (getpeereid(fd, &uid, &gid) != 0) return error.PeerCredentialsUnavailable;
+        return uid;
+    }
+    return error.PeerCredentialsUnavailable;
+}
+
+/// Non-blocking connect + poll(POLLOUT) + SO_ERROR against the monotonic
+/// `deadline_ms` (see `monotonicMs`). Phase 0 stub: blocking connect; the
+/// deadline is checked only before connecting.
+pub fn connectUnixDeadline(path: []const u8, deadline_ms: i64) (SocketError || ConnectError || error{ NameTooLong, Timeout })!fd_t {
+    if (monotonicMs() >= deadline_ms) return error.Timeout;
+    return connectUnix(path);
+}
+
+/// `flock(LOCK_EX)` retried until `deadline_ms` (monotonic) or until `stop`
+/// becomes true.
+pub fn flockExclusiveDeadline(fd: fd_t, deadline_ms: i64, stop: ?*const std.atomic.Value(bool)) error{ Timeout, Interrupted, Unexpected }!void {
+    while (true) {
+        switch (posix.errno(c.flock(fd, posix.LOCK.EX | posix.LOCK.NB))) {
+            .SUCCESS => return,
+            .INTR => {},
+            .AGAIN => {},
+            else => return error.Unexpected,
+        }
+        if (stop) |flag| if (flag.load(.seq_cst)) return error.Interrupted;
+        if (monotonicMs() >= deadline_ms) return error.Timeout;
+        std.Options.debug_io.sleep(.fromMilliseconds(10), .awake) catch return error.Interrupted;
+    }
+}
+
+/// Milliseconds on the monotonic (awake) clock.
+pub fn monotonicMs() i64 {
+    return std.Io.Clock.awake.now(std.Options.debug_io).toMilliseconds();
+}
+
+/// Async-signal-safe. Close every descriptor `>= low_fd`.
+pub fn closeFrom(low_fd: fd_t) void {
+    if (builtin.os.tag == .linux) {
+        const rc = std.os.linux.close_range(low_fd, std.math.maxInt(fd_t), .{ .UNSHARE = false, .CLOEXEC = false });
+        if (std.os.linux.errno(rc) == .SUCCESS) return;
+    }
+    var limit: c.rlimit = undefined;
+    const max_fd: fd_t = if (c.getrlimit(.NOFILE, &limit) == 0)
+        @intCast(@min(limit.cur, 65536))
+    else
+        1024;
+    var fd = low_fd;
+    while (fd < max_fd) : (fd += 1) _ = c.close(fd);
+}
+
+/// Async-signal-safe. Restore default dispositions for job-control and
+/// termination signals and clear the signal mask.
+pub fn resetChildSignals() void {
+    const act: posix.Sigaction = .{
+        .handler = .{ .handler = posix.SIG.DFL },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    const signals = [_]posix.SIG{ .HUP, .INT, .QUIT, .TERM, .PIPE, .CHLD, .TSTP, .TTIN, .TTOU, .WINCH };
+    for (signals) |sig| posix.sigaction(sig, &act, null);
+    const empty = posix.sigemptyset();
+    posix.sigprocmask(posix.SIG.SETMASK, &empty, null);
 }
 
 test "unix address rejects paths longer than sun_path" {
