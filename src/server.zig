@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const log = @import("log.zig");
 const mux = @import("mux.zig");
 const native_mod = @import("native.zig");
 const protocol = @import("protocol.zig");
@@ -23,7 +24,18 @@ const broadcast_queue_max_bytes: usize = 1024 * 1024;
 const socket_send_timeout_seconds: isize = 2;
 pub const max_client_connections: usize = 256;
 const accept_backoff_ms: i64 = 50;
-const socket_bind_umask: std.c.mode_t = 0o177;
+
+/// Longest socket path `bind(2)` accepts: `sun_path` minus its NUL terminator
+/// (103 bytes on macOS, 107 on Linux).
+pub const max_socket_path_len: usize = @field(@as(posix.sockaddr.un, undefined), "path").len - 1;
+
+/// Name of the socket inside its private staging directory. Kept to one byte so
+/// the staging path fits in `sun_path` for nearly every valid socket path.
+const staged_socket_name = "s";
+const staging_dir_prefix = ".zmux-";
+const staging_dir_random_hex_max = 8;
+const staging_dir_random_hex_min = 4;
+const staging_dir_attempts = 16;
 
 const ClientConnection = struct {
     allocator: Allocator,
@@ -125,7 +137,14 @@ const ClientConnection = struct {
             return error.ConnectionClosed;
         }
         if (owned.len > broadcast_queue_max_bytes or self.queued_bytes > broadcast_queue_max_bytes - owned.len) {
+            const queued_bytes = self.queued_bytes;
             self.queue_mutex.unlock();
+            // Sizes only: the queued bytes are PTY output and are never logged.
+            log.warn("client_backlogged", .{
+                .queued_bytes = queued_bytes,
+                .rejected_bytes = owned.len,
+                .max_queued_bytes = broadcast_queue_max_bytes,
+            });
             self.close();
             return error.ConnectionBacklogged;
         }
@@ -228,22 +247,24 @@ pub const Server = struct {
     shutdown_probe: ?ShutdownProbe = null,
 
     pub fn init(allocator: Allocator, socket_path: []const u8, idle_timeout_seconds: i64) !Server {
+        // Reject before touching the filesystem: an over-long path can never
+        // be bound, and must not leave a parent directory or lock behind.
+        if (socket_path.len > max_socket_path_len) return error.SocketPathTooLong;
+
         try ensureSocketParent(socket_path);
         std.fs.deleteFileAbsolute(socket_path) catch |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
         };
 
-        const address = try std.net.Address.initUnix(socket_path);
         const listener = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
         errdefer posix.close(listener);
-        const previous_umask = std.c.umask(socket_bind_umask);
-        errdefer _ = std.c.umask(previous_umask);
-        try posix.bind(listener, &address.any, address.getOsSockLen());
-        _ = std.c.umask(previous_umask);
 
-        // Set socket permissions to owner-only (0600) for security
-        try setSocketPermissions(allocator, socket_path);
+        // Bind owner-only (0600) without touching the process-wide umask; see
+        // bindPrivateSocket for why the socket is never visible with a wider
+        // mode.
+        try bindPrivateSocket(listener, socket_path);
+        errdefer std.fs.deleteFileAbsolute(socket_path) catch {};
 
         // Size the accept backlog to the connection cap so a burst of clients
         // (e.g. a fleader spawning many attachers at once) is queued rather
@@ -251,10 +272,17 @@ pub const Server = struct {
         // clamps to somaxconn.
         try posix.listen(listener, @intCast(max_client_connections));
         const socket_stat = try socketPathStat(socket_path);
+        const owned_socket_path = try allocator.dupe(u8, socket_path);
+
+        log.info("server_listening", .{
+            .socket_path = socket_path,
+            .backlog = max_client_connections,
+            .idle_timeout_seconds = idle_timeout_seconds,
+        });
 
         return .{
             .allocator = allocator,
-            .socket_path = try allocator.dupe(u8, socket_path),
+            .socket_path = owned_socket_path,
             .socket_stat = socket_stat,
             .listener_fd = listener,
             .manager = mux.Manager.init(allocator, null),
@@ -289,7 +317,13 @@ pub const Server = struct {
         };
         while (!self.shouldStop()) {
             self.manager.reapExitedPanes();
-            if (self.shouldExitForIdle()) break;
+            if (self.shouldExitForIdle()) {
+                log.info("server_idle_exit", .{
+                    .idle_timeout_seconds = self.idle_timeout_seconds,
+                    .idle_seconds = std.time.timestamp() - self.last_activity_seconds.load(.seq_cst),
+                });
+                break;
+            }
 
             var fds = [_]posix.pollfd{.{
                 .fd = self.listener_fd,
@@ -302,23 +336,23 @@ pub const Server = struct {
             if ((fds[0].revents & posix.POLL.IN) == 0) continue;
 
             const client_fd = posix.accept(self.listener_fd, null, null, posix.SOCK.CLOEXEC) catch |err| {
-                switch (err) {
-                    error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => {
-                        logAcceptError(err);
-                        std.Thread.sleep(accept_backoff_ms * std.time.ns_per_ms);
-                    },
-                    else => {
-                        logAcceptError(err);
-                        // In the presence of any temporary listener-level fault,
-                        // avoid an accept/read busy loop. This keeps a failed accept
-                        // from consuming 100% CPU while still allowing the server
-                        // to recover.
-                        std.Thread.sleep(accept_backoff_ms * std.time.ns_per_ms);
-                    },
-                }
+                log.warn("accept_error", .{
+                    .err = err,
+                    .active_connections = self.active_connections.load(.seq_cst),
+                });
+                // Fd exhaustion and every other listener-level fault get the
+                // same backoff: it keeps a failing accept from spinning at
+                // 100% CPU while still letting the server recover.
+                std.Thread.sleep(accept_backoff_ms * std.time.ns_per_ms);
                 continue;
             };
-            if (!peerHasSameEuid(client_fd)) {
+            const peer_euid = peerEuid(client_fd);
+            if (peer_euid == null or peer_euid.? != posix.geteuid()) {
+                log.warn("peer_cred_rejected", .{
+                    .peer_euid = peer_euid,
+                    .euid = posix.geteuid(),
+                    .socket_path = self.socket_path,
+                });
                 posix.close(client_fd);
                 continue;
             }
@@ -327,6 +361,10 @@ pub const Server = struct {
             const previous_connections = self.active_connections.fetchAdd(1, .seq_cst);
             if (previous_connections >= max_client_connections) {
                 _ = self.active_connections.fetchSub(1, .seq_cst);
+                log.warn("connection_limit_reached", .{
+                    .active_connections = previous_connections,
+                    .max_connections = max_client_connections,
+                });
                 writeConnectionLimitError(client_fd);
                 posix.close(client_fd);
                 continue;
@@ -1018,13 +1056,133 @@ fn createPrivateSocketParent(parent: []const u8) !void {
     if ((stat.mode & 0o7777) != 0o700) return error.PermissionDenied;
 }
 
-fn setSocketPermissions(allocator: Allocator, socket_path: []const u8) !void {
-    // Set socket file permissions to owner-only (0600) for security
-    const path_z = try allocator.dupeZ(u8, socket_path);
-    defer allocator.free(path_z);
-    if (std.c.chmod(path_z.ptr, 0o600) != 0) {
-        return error.PermissionDenied;
+/// Bind `listener` at `socket_path` so the socket file is owner-only (0600)
+/// from the instant it becomes reachable, without calling `umask(2)`.
+///
+/// `umask` is process-wide: narrowing it around `bind` races every other
+/// thread that creates a file, which is unacceptable for an embedded server.
+/// POSIX has no `bindat`/mode argument for `bind`, so instead:
+///
+///   1. `mkdir` a staging directory beside the target. Its mode is at most
+///      0700 (umask only clears bits) and `mkdir` fails on any existing name,
+///      so nobody else can enter it or have planted it.
+///   2. `bind` the socket inside it. Whatever mode the umask yields, the file
+///      is unreachable to other users behind the 0700 directory.
+///   3. `chmod` the socket to 0600 and verify it.
+///   4. `rename` it onto `socket_path`. Rename is atomic and keeps the bound
+///      inode, so the public name only ever refers to a 0600 socket.
+///
+/// The staging path is longer than some valid socket paths. When it cannot fit
+/// in `sun_path`, the socket is bound in place only if that is provably
+/// private (see bindSocketInPlace); otherwise the bind is refused rather than
+/// exposed.
+fn bindPrivateSocket(listener: posix.fd_t, socket_path: []const u8) !void {
+    // Linux derives the socket file mode from the socket inode's mode, so this
+    // makes bind create the file 0600 outright. macOS rejects fchmod on
+    // sockets; staging covers both.
+    const mode_preset = builtin.os.tag == .linux and blk: {
+        posix.fchmod(listener, 0o600) catch break :blk false;
+        break :blk true;
+    };
+
+    const dir_prefix = if (std.mem.lastIndexOfScalar(u8, socket_path, '/')) |slash|
+        socket_path[0 .. slash + 1]
+    else
+        "";
+
+    // dir_prefix + staging dir name + "/" + staged_socket_name must fit.
+    const fixed_len = dir_prefix.len + staging_dir_prefix.len + 1 + staged_socket_name.len;
+    if (fixed_len + staging_dir_random_hex_min > max_socket_path_len) {
+        return bindSocketInPlace(listener, socket_path, dir_prefix, mode_preset);
     }
+    const hex_len = @min(staging_dir_random_hex_max, max_socket_path_len - fixed_len);
+
+    var dir_buf: [max_socket_path_len]u8 = undefined;
+    var staging_dir: []const u8 = undefined;
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        var random: [staging_dir_random_hex_max / 2]u8 = undefined;
+        std.crypto.random.bytes(&random);
+        const hex = std.fmt.bytesToHex(random, .lower);
+        staging_dir = std.fmt.bufPrint(&dir_buf, "{s}{s}{s}", .{
+            dir_prefix,
+            staging_dir_prefix,
+            hex[0..hex_len],
+        }) catch unreachable;
+        posix.mkdir(staging_dir, 0o700) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                if (attempt + 1 >= staging_dir_attempts) return err;
+                continue;
+            },
+            else => return err,
+        };
+        break;
+    }
+    defer posix.rmdir(staging_dir) catch {};
+
+    // Hold the directory by fd and validate that fd, so later checks cannot be
+    // redirected by someone swapping the name in a writable parent.
+    const dir_fd = try posix.open(staging_dir, .{
+        .ACCMODE = .RDONLY,
+        .DIRECTORY = true,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    }, 0);
+    defer posix.close(dir_fd);
+    // A umask that clears owner bits would make the directory unusable.
+    try posix.fchmod(dir_fd, 0o700);
+    const dir_stat = try posix.fstat(dir_fd);
+    if (dir_stat.uid != posix.geteuid()) return error.PermissionDenied;
+    if ((dir_stat.mode & 0o7777) != 0o700) return error.PermissionDenied;
+
+    var staged_buf: [max_socket_path_len]u8 = undefined;
+    const staged_path = std.fmt.bufPrint(&staged_buf, "{s}/{s}", .{ staging_dir, staged_socket_name }) catch unreachable;
+
+    const address = try std.net.Address.initUnix(staged_path);
+    try posix.bind(listener, &address.any, address.getOsSockLen());
+    var staged = true;
+    defer if (staged) posix.unlinkat(dir_fd, staged_socket_name, 0) catch {};
+
+    try posix.fchmodat(dir_fd, staged_socket_name, 0o600, 0);
+    const socket_stat = try posix.fstatat(dir_fd, staged_socket_name, posix.AT.SYMLINK_NOFOLLOW);
+    if ((socket_stat.mode & posix.S.IFMT) != posix.S.IFSOCK) return error.PermissionDenied;
+    if ((socket_stat.mode & 0o7777) != 0o600) return error.PermissionDenied;
+    // The path we bound must be the file inside the directory we validated.
+    const path_stat = try posix.fstatat(posix.AT.FDCWD, staged_path, posix.AT.SYMLINK_NOFOLLOW);
+    if (path_stat.dev != socket_stat.dev or path_stat.ino != socket_stat.ino) return error.PermissionDenied;
+
+    try posix.rename(staged_path, socket_path);
+    staged = false;
+}
+
+/// Fallback for socket paths too close to the `sun_path` limit to stage.
+/// Binding in place is race-free only when no other user can reach the file
+/// between `bind` and `chmod`:
+///   * Linux, when the pre-bind `fchmod` succeeded: the file is created 0600.
+///   * Any OS, when the parent directory is self-owned with no group/other
+///     access: nobody else can traverse to the socket.
+/// Anything else would briefly expose a umask-mode socket, so it is refused.
+fn bindSocketInPlace(
+    listener: posix.fd_t,
+    socket_path: []const u8,
+    dir_prefix: []const u8,
+    mode_preset: bool,
+) !void {
+    if (!mode_preset) {
+        const parent = if (dir_prefix.len == 0) "." else dir_prefix;
+        const parent_stat = try posix.fstatat(posix.AT.FDCWD, parent, 0);
+        const private = (parent_stat.mode & posix.S.IFMT) == posix.S.IFDIR and
+            parent_stat.uid == posix.geteuid() and
+            (parent_stat.mode & 0o077) == 0;
+        if (!private) return error.SocketStagingPathTooLong;
+    }
+
+    const address = try std.net.Address.initUnix(socket_path);
+    try posix.bind(listener, &address.any, address.getOsSockLen());
+    errdefer std.fs.deleteFileAbsolute(socket_path) catch {};
+    try posix.fchmodat(posix.AT.FDCWD, socket_path, 0o600, 0);
+    const socket_stat = try socketPathStat(socket_path);
+    if ((socket_stat.mode & 0o7777) != 0o600) return error.PermissionDenied;
 }
 
 fn writeAll(fd: posix.fd_t, bytes: []const u8) !void {
@@ -1231,11 +1389,18 @@ fn base64Decode(allocator: Allocator, encoded: []const u8) ![]u8 {
 }
 
 fn peerHasSameEuid(fd: posix.fd_t) bool {
-    return switch (builtin.os.tag) {
-        .linux => linuxPeerUid(fd) == posix.geteuid(),
-        .macos, .ios, .tvos, .watchos, .visionos => darwinPeerUid(fd) == posix.geteuid(),
-        else => false,
+    const uid = peerEuid(fd) orelse return false;
+    return uid == posix.geteuid();
+}
+
+/// Effective uid of the connected peer, or null when the OS cannot report it.
+fn peerEuid(fd: posix.fd_t) ?std.c.uid_t {
+    const uid = switch (builtin.os.tag) {
+        .linux => linuxPeerUid(fd),
+        .macos, .ios, .tvos, .watchos, .visionos => darwinPeerUid(fd),
+        else => return null,
     };
+    return if (uid == std.math.maxInt(std.c.uid_t)) null else uid;
 }
 
 fn linuxPeerUid(fd: posix.fd_t) std.c.uid_t {
@@ -1263,13 +1428,6 @@ fn darwinPeerUid(fd: posix.fd_t) std.c.uid_t {
 }
 
 extern "c" fn getpeereid(socket: c_int, euid: *std.c.uid_t, egid: *std.c.gid_t) c_int;
-
-fn logAcceptError(err: anytype) void {
-    var buf: [128]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
-    w.interface.print("zmuxd: accept failed: {s}\n", .{@errorName(err)}) catch {};
-    w.interface.flush() catch {};
-}
 
 test "server parses aliases for session id" {
     var parsed = try std.json.parseFromSlice(Value, std.testing.allocator, "{\"id\":\"sess-1\"}", .{});
@@ -1421,6 +1579,160 @@ test "new socket parent is private" {
     try std.testing.expectEqual(@as(u32, 0o700), try dirMode(parent));
 }
 
+test "server init rejects a socket path longer than sun_path before touching the filesystem" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const parent = try tempPath(allocator, "zmx-too-long");
+    defer allocator.free(parent);
+    defer std.fs.deleteTreeAbsolute(parent) catch {};
+
+    const socket_path = try paddedSocketPath(allocator, parent, max_socket_path_len + 1);
+    defer allocator.free(socket_path);
+
+    try std.testing.expectError(error.SocketPathTooLong, Server.init(allocator, socket_path, 0));
+    // Rejected up front: not even the parent directory was created.
+    try std.testing.expectError(error.FileNotFound, socketPathStat(parent));
+}
+
+test "max_socket_path_len matches the platform sun_path capacity" {
+    const expected: usize = switch (builtin.os.tag) {
+        .linux => 107,
+        .macos, .ios, .tvos, .watchos, .visionos => 103,
+        else => return error.SkipZigTest,
+    };
+    try std.testing.expectEqual(expected, max_socket_path_len);
+}
+
+test "server socket is 0600 without mutating the process umask" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const parent = try tempPath(allocator, "zmx-umask");
+    defer allocator.free(parent);
+    defer std.fs.deleteTreeAbsolute(parent) catch {};
+    try std.fs.makeDirAbsolute(parent);
+    // A shared (0755) parent forces the staged bind rather than the
+    // private-parent shortcut.
+    try chmodAbsolute(allocator, parent, 0o755);
+
+    const socket_path = try std.fs.path.join(allocator, &.{ parent, "sessions.sock" });
+    defer allocator.free(socket_path);
+    try requireUnixSocketBind(socket_path);
+
+    // The most permissive umask: a plain bind would create a 0777 socket, so a
+    // 0600 result proves the mode does not come from the umask. umask(2) can
+    // only be read by setting it, so read it back the same way afterwards.
+    const permissive_umask: std.c.mode_t = 0;
+    const original_umask = std.c.umask(permissive_umask);
+    defer _ = std.c.umask(original_umask);
+
+    var server = try Server.init(allocator, socket_path, 0);
+    defer server.deinit();
+
+    const umask_after_init = std.c.umask(permissive_umask);
+    try std.testing.expectEqual(permissive_umask, umask_after_init);
+
+    const stat = try socketPathStat(socket_path);
+    try std.testing.expectEqual(@as(u32, posix.S.IFSOCK), @as(u32, @intCast(stat.mode & posix.S.IFMT)));
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode & 0o7777)));
+    try std.testing.expectEqual(posix.geteuid(), stat.uid);
+
+    // The staging directory is gone: the socket is the parent's only entry.
+    try std.testing.expectEqual(@as(usize, 1), try countDirEntries(parent));
+
+    // The renamed socket is the bound one: a client can connect through it.
+    const address = try std.net.Address.initUnix(socket_path);
+    const client = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(client);
+    try posix.connect(client, &address.any, address.getOsSockLen());
+}
+
+test "server init replaces a stale socket with a private one" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const socket_path = try tempPath(allocator, "zmx-stale-replace");
+    defer allocator.free(socket_path);
+    defer std.fs.deleteFileAbsolute(socket_path) catch {};
+
+    const stale = bindRawUnixListener(socket_path) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    posix.close(stale);
+    const stale_stat = try socketPathStat(socket_path);
+
+    var server = try Server.init(allocator, socket_path, 0);
+    defer server.deinit();
+
+    const stat = try socketPathStat(socket_path);
+    try std.testing.expect(stat.ino != stale_stat.ino or stat.dev != stale_stat.dev);
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode & 0o7777)));
+}
+
+test "socket path at the sun_path limit binds in place under a private parent" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const parent = try tempPath(allocator, "zmx-limit-private");
+    defer allocator.free(parent);
+    defer std.fs.deleteTreeAbsolute(parent) catch {};
+
+    // Parent does not exist, so Server.init creates it 0700. The path is
+    // exactly the limit, which leaves no room for a staging directory.
+    const socket_path = try paddedSocketPath(allocator, parent, max_socket_path_len);
+    defer allocator.free(socket_path);
+
+    const original_umask = std.c.umask(0);
+    defer _ = std.c.umask(original_umask);
+
+    var server = Server.init(allocator, socket_path, 0) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    try std.testing.expectEqual(@as(std.c.mode_t, 0), std.c.umask(0));
+    const stat = try socketPathStat(socket_path);
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode & 0o7777)));
+}
+
+test "socket path at the sun_path limit is never exposed under a shared parent" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const parent = try tempPath(allocator, "zmx-limit-shared");
+    defer allocator.free(parent);
+    defer std.fs.deleteTreeAbsolute(parent) catch {};
+    try std.fs.makeDirAbsolute(parent);
+    try chmodAbsolute(allocator, parent, 0o755);
+
+    const socket_path = try paddedSocketPath(allocator, parent, max_socket_path_len);
+    defer allocator.free(socket_path);
+
+    const original_umask = std.c.umask(0);
+    defer _ = std.c.umask(original_umask);
+
+    if (Server.init(allocator, socket_path, 0)) |created| {
+        // Linux creates the file 0600 at bind time via the pre-bind fchmod.
+        var server = created;
+        defer server.deinit();
+        const stat = try socketPathStat(socket_path);
+        try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode & 0o7777)));
+    } else |err| switch (err) {
+        // Elsewhere there is no race-free way to bind here, so it is refused
+        // and nothing is left behind.
+        error.SocketStagingPathTooLong => {
+            try std.testing.expect(builtin.os.tag != .linux);
+            try std.testing.expectEqual(@as(usize, 0), try countDirEntries(parent));
+        },
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    }
+    try std.testing.expectEqual(@as(std.c.mode_t, 0), std.c.umask(0));
+}
+
 test "server deinit does not unlink a replacement socket" {
     if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
 
@@ -1533,6 +1845,24 @@ fn tempPath(allocator: Allocator, prefix: []const u8) ![]u8 {
         else => "/tmp",
     };
     return std.fmt.allocPrint(allocator, "{s}/{s}-{x:0>16}", .{ root, prefix, nonce });
+}
+
+/// `<parent>/ssss…` padded to exactly `total_len` bytes.
+fn paddedSocketPath(allocator: Allocator, parent: []const u8, total_len: usize) ![]u8 {
+    const path = try allocator.alloc(u8, total_len);
+    @memset(path, 's');
+    @memcpy(path[0..parent.len], parent);
+    path[parent.len] = '/';
+    return path;
+}
+
+fn countDirEntries(path: []const u8) !usize {
+    var dir = try std.fs.openDirAbsolute(path, .{ .iterate = true });
+    defer dir.close();
+    var iterator = dir.iterate();
+    var count: usize = 0;
+    while (try iterator.next()) |_| count += 1;
+    return count;
 }
 
 fn envContains(entries: []const []const u8, expected: []const u8) bool {

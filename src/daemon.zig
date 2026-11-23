@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const log = @import("log.zig");
 const protocol = @import("protocol.zig");
-
 const server_mod = @import("server.zig");
 
 const default_idle_timeout_seconds: i64 = 60 * 60;
@@ -24,7 +24,8 @@ const StartLock = struct {
 pub fn main() !void {
     runMain() catch |err| {
         switch (err) {
-            error.InvalidArguments => {},
+            // Already reported with a specific message.
+            error.InvalidArguments, error.SocketPathTooLong => {},
             else => {
                 var buf: [1024]u8 = undefined;
                 var w = std.fs.File.stderr().writer(&buf);
@@ -44,6 +45,9 @@ fn runMain() !void {
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
 
+    // Environment first; an explicit --log-level below overrides it.
+    log.initFromEnv();
+
     var idle_timeout_seconds = default_idle_timeout_seconds;
     var explicit_socket_path: ?[]const u8 = null;
 
@@ -60,6 +64,13 @@ fn runMain() !void {
             idle_timeout_seconds = std.fmt.parseInt(i64, argv[i], 10) catch |err| {
                 return fail("invalid idle timeout value: {s}", .{@errorName(err)});
             };
+        } else if (std.mem.eql(u8, argv[i], "--log-level")) {
+            i += 1;
+            if (i >= argv.len) return fail("missing value for --log-level", .{});
+            const level = log.parseLevel(argv[i]) catch {
+                return fail("invalid log level: {s} (expected error, warn, info, or debug)", .{argv[i]});
+            };
+            log.setLevel(level);
         } else if (std.mem.eql(u8, argv[i], "--version") or std.mem.eql(u8, argv[i], "-V")) {
             show_version = true;
         } else if (std.mem.eql(u8, argv[i], "--help") or std.mem.eql(u8, argv[i], "-h")) {
@@ -81,6 +92,13 @@ fn runMain() !void {
         try socketPath(allocator);
     defer allocator.free(path);
 
+    // Before the lock file or parent directory is created: a path bind(2) can
+    // never accept must not leave anything behind.
+    validateSocketPath(path) catch |err| {
+        reportSocketPathTooLong(path);
+        return err;
+    };
+
     detachFromControllingTerminal();
     resetSigchldDisposition();
     installShutdownHandlers();
@@ -91,7 +109,10 @@ fn runMain() !void {
     // If a server came up while we waited for the lock, this daemon instance
     // has nothing to do. Exiting successfully mirrors tmux's start-server
     // race behavior without unlinking another server's live socket.
-    if (socketPathExists(path) and waitForSocketAcceptsConnection(path, startup_probe_timeout_ms)) return;
+    if (socketPathExists(path) and waitForSocketAcceptsConnection(path, startup_probe_timeout_ms)) {
+        log.info("daemon_already_running", .{ .socket_path = path });
+        return;
+    }
 
     var server = try server_mod.Server.init(allocator, path, idle_timeout_seconds);
     defer server.deinit();
@@ -107,17 +128,72 @@ fn runMain() !void {
         if (writePidFile(allocator, pid_path)) {
             pid_file_written = true;
         } else |err| {
-            _ = @errorName(err);
             // The pid file is advisory; failing after the socket is bound
             // would leave a healthy daemon unavailable and a stale socket.
+            // Keep serving, but say so: tools that read the pid file will not
+            // find this daemon.
+            log.warn("pid_file_write_failed", .{ .err = err, .pid_path = pid_path });
         }
     }
     defer if (pid_file_written) {
         if (pid_file_path) |pid_path| deletePidFile(pid_path);
     };
 
+    log.info("daemon_start", .{
+        .version = protocol.version,
+        .socket_path = path,
+        .idle_timeout_seconds = idle_timeout_seconds,
+        .pid_file_written = pid_file_written,
+        .log_level = log.getLevel(),
+    });
+
     server.shutdown_probe = shutdownRequested;
-    try server.run();
+    server.run() catch |err| {
+        log.err("daemon_shutdown", .{ .reason = "error", .err = err, .socket_path = path });
+        return err;
+    };
+    log.info("daemon_shutdown", .{
+        .reason = if (shutdownRequested()) "signal" else "idle_or_stopped",
+        .socket_path = path,
+    });
+}
+
+/// Longest suffix zmuxd appends to the socket path for a sibling file:
+/// the pid file's temporary name, `<socket>.pid.tmp.<pid>`.
+const longest_derived_suffix_len = ".pid.tmp.".len + std.fmt.count("{d}", .{std.math.maxInt(u64)});
+
+comptime {
+    // `<socket>.lock`, `<socket>.pid`, and the pid temp file are regular files,
+    // so only PATH_MAX bounds them, not sun_path. A socket path that passes
+    // validateSocketPath therefore always yields usable derived paths; this
+    // assertion keeps that true if either limit ever changes.
+    std.debug.assert(server_mod.max_socket_path_len + longest_derived_suffix_len < std.fs.max_path_bytes);
+}
+
+/// Reject a socket path `bind(2)` cannot accept. The `sun_path` cap applies to
+/// the socket path itself; the derived `.lock`/`.pid` paths are covered by the
+/// comptime assertion above.
+fn validateSocketPath(socket_path: []const u8) error{SocketPathTooLong}!void {
+    if (socket_path.len > server_mod.max_socket_path_len) return error.SocketPathTooLong;
+}
+
+fn socketPathTooLongMessage(buf: []u8, socket_path: []const u8) []const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "zmuxd: socket path is too long: {d} bytes, but this OS allows at most {d} bytes for a Unix socket path\n" ++
+            "zmuxd: path: {s}\n" ++
+            "zmuxd: choose a shorter path with --socket or $ZMUX_SOCKET\n",
+        .{ socket_path.len, server_mod.max_socket_path_len, socket_path },
+    ) catch "zmuxd: socket path is too long for a Unix socket\n";
+}
+
+fn reportSocketPathTooLong(socket_path: []const u8) void {
+    log.err("socket_path_too_long", .{
+        .socket_path_len = socket_path.len,
+        .max_socket_path_len = server_mod.max_socket_path_len,
+    });
+    var buf: [std.fs.max_path_bytes + 256]u8 = undefined;
+    std.fs.File.stderr().writeAll(socketPathTooLongMessage(&buf, socket_path)) catch {};
 }
 
 pub fn socketPath(allocator: std.mem.Allocator) ![]u8 {
@@ -273,8 +349,17 @@ fn printUsage() !void {
     var buffer: [1024]u8 = undefined;
     var stdout = std.fs.File.stdout().writer(&buffer);
     try stdout.interface.writeAll(
-        \\Usage: zmuxd [--socket PATH] [--idle-seconds SECONDS]
-        \\       smithers-session-daemon [--socket PATH] [--idle-seconds SECONDS]
+        \\Usage: zmuxd [--socket PATH] [--idle-seconds SECONDS] [--log-level LEVEL]
+        \\       smithers-session-daemon [--socket PATH] [--idle-seconds SECONDS] [--log-level LEVEL]
+        \\
+        \\Options:
+        \\  --socket PATH           Unix socket to listen on (default: $ZMUX_SOCKET, then
+        \\                          $XDG_RUNTIME_DIR/smithers-sessions.sock, then ~/.smithers/sessions.sock)
+        \\  --idle-seconds SECONDS  Exit after this long with no sessions; 0 disables (default: 3600)
+        \\  --log-level LEVEL       error, warn, info, or debug (default: warn). Overrides
+        \\                          $ZMUX_LOG_LEVEL. Diagnostics are one JSON object per stderr line.
+        \\  -V, --version           Print the version and exit
+        \\  -h, --help              Print this help and exit
         \\
     );
     try stdout.interface.flush();
@@ -411,6 +496,57 @@ test "socketAcceptsConnection detects a listening unix socket" {
     try std.testing.expect(socketAcceptsConnection(path));
 }
 
+test "validateSocketPath accepts the sun_path limit and rejects one byte more" {
+    const max = server_mod.max_socket_path_len;
+    const at_limit = "/" ++ "s" ** (max - 1);
+    const too_long = "/" ++ "s" ** max;
+    try std.testing.expectEqual(max, at_limit.len);
+    try validateSocketPath(at_limit);
+    try validateSocketPath("/tmp/zmux-test.sock");
+    try std.testing.expectError(error.SocketPathTooLong, validateSocketPath(too_long));
+}
+
+test "socket path too long message states the actual and maximum byte lengths" {
+    const max = server_mod.max_socket_path_len;
+    const too_long = "/" ++ "s" ** (max + 20);
+    var buf: [std.fs.max_path_bytes + 256]u8 = undefined;
+    const message = socketPathTooLongMessage(&buf, too_long);
+
+    var expected_buf: [96]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&expected_buf, "{d} bytes, but this OS allows at most {d} bytes", .{ max + 21, max });
+    try std.testing.expect(std.mem.indexOf(u8, message, expected) != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, too_long) != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "--socket") != null);
+}
+
+test "derived lock and pid paths stay within PATH_MAX for any valid socket path" {
+    const max = server_mod.max_socket_path_len;
+    const at_limit = "/" ++ "s" ** (max - 1);
+    const pid_path = try pidPath(std.testing.allocator, at_limit);
+    defer std.testing.allocator.free(pid_path);
+    try std.testing.expect(pid_path.len + ".tmp.".len + 20 < std.fs.max_path_bytes);
+    try std.testing.expect(at_limit.len + ".lock".len < std.fs.max_path_bytes);
+}
+
+test "pid file write failure is reported as an error instead of being swallowed" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    var seed: [8]u8 = undefined;
+    std.crypto.random.bytes(&seed);
+    const nonce = std.mem.readInt(u64, &seed, .little);
+    // The parent is a regular file, so neither mkdir nor create can succeed.
+    const blocker = try std.fmt.allocPrint(std.testing.allocator, "/tmp/zmx-pid-blocker-{x:0>16}", .{nonce});
+    defer std.testing.allocator.free(blocker);
+    defer std.fs.deleteFileAbsolute(blocker) catch {};
+    (try std.fs.createFileAbsolute(blocker, .{})).close();
+
+    const pid_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/sessions.sock.pid", .{blocker});
+    defer std.testing.allocator.free(pid_path);
+    if (writePidFile(std.testing.allocator, pid_path)) {
+        return error.TestExpectedError;
+    } else |_| {}
+}
+
 test "pid path is scoped to the socket path" {
     const path = try pidPath(std.testing.allocator, "/tmp/zmux-test.sock");
     defer std.testing.allocator.free(path);
@@ -469,6 +605,7 @@ test "resetSigchldDisposition restores default SIGCHLD handling" {
 test {
     std.testing.refAllDecls(@import("buffer.zig"));
     std.testing.refAllDecls(@import("foreground.zig"));
+    std.testing.refAllDecls(@import("log.zig"));
     std.testing.refAllDecls(@import("native.zig"));
     std.testing.refAllDecls(@import("protocol.zig"));
     std.testing.refAllDecls(@import("pty.zig"));
