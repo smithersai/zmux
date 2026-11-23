@@ -278,6 +278,17 @@ fn runMain(init: std.process.Init) !void {
     resetSigchldDisposition();
     installShutdownHandlers();
 
+    // `path` is absolute from here on and everything else goes through the
+    // pinned directory descriptor, so the daemon lets go of the launcher's
+    // working directory: it must not keep a mount busy or hand an arbitrary
+    // directory to every pane. Panes start in the client's cwd (sent by
+    // zmux-connect) or, without one, in the user's home directory.
+    //
+    // The umask is deliberately left alone: pane shells inherit it, and every
+    // file the daemon creates gets an explicit private mode.
+    leaveLauncherDirectory();
+    const default_cwd = defaultPaneCwd(envGet("HOME"));
+
     // The socket directory is validated (or created 0700) before the lock,
     // PID file, or socket is touched, and everything below goes through the
     // pinned descriptor.
@@ -331,6 +342,7 @@ fn runMain(init: std.process.Init) !void {
     });
 
     server.shutdown_probe = shutdownRequested;
+    server.default_cwd = default_cwd;
     server.run() catch |err| {
         log.err("daemon_shutdown", .{ .reason = "error", .err = err, .socket_path = path });
         return err;
@@ -574,6 +586,21 @@ fn shutdownSignalHandler(_: std.posix.SIG) callconv(.c) void {
 fn detachFromControllingTerminal() void {
     if (builtin.os.tag == .windows) return;
     _ = std.c.setsid();
+}
+
+fn leaveLauncherDirectory() void {
+    if (std.c.chdir("/") != 0) log.warn("daemon_chdir_failed", .{ .errno = @backingInt(posix.errno(-1)) });
+}
+
+/// The directory a pane starts in when its creator names none: `$HOME` when
+/// it is an absolute path to an existing directory, else null (the daemon's
+/// own cwd, `/`).
+fn defaultPaneCwd(home: ?[]const u8) ?[]const u8 {
+    const dir = home orelse return null;
+    if (!std.fs.path.isAbsolute(dir)) return null;
+    if (std.mem.indexOfScalar(u8, dir, 0) != null) return null;
+    const stat = sys.statAt(sys.cwd_fd, dir, true) catch return null;
+    return if (stat.isDir()) dir else null;
 }
 
 fn resetSigchldDisposition() void {
@@ -1166,6 +1193,15 @@ test "pid file write failure is reported as an error instead of being swallowed"
     defer chmodPath(dir.path, 0o700) catch {};
     try std.testing.expectError(error.AccessDenied, writePidFile(dir.fd, "sessions.sock.pid"));
     try std.testing.expectEqual(@as(usize, 0), try dir.entryCount());
+}
+
+test "defaultPaneCwd accepts only an absolute existing directory" {
+    try std.testing.expectEqualStrings("/", defaultPaneCwd("/").?);
+    try std.testing.expect(defaultPaneCwd(null) == null);
+    try std.testing.expect(defaultPaneCwd("") == null);
+    try std.testing.expect(defaultPaneCwd("relative/home") == null);
+    try std.testing.expect(defaultPaneCwd("/zmux/no/such/home") == null);
+    try std.testing.expect(defaultPaneCwd("/bin/sh") == null);
 }
 
 test "resetSigchldDisposition restores default SIGCHLD handling" {

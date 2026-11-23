@@ -1,6 +1,9 @@
 # Changelog
 
-## [0.3.1]
+## [Unreleased]
+
+Round-1 code review fixes (tracks T1-T5 and their integration). Decisions
+D1-D6 change the wire contract.
 
 ### Changed
 
@@ -28,6 +31,23 @@
 - Detached clients receive `client_detached` with the reason. Remote
   switches notify the owning connection with `client_switched`. The
   existing notification field `session_id` carries a pane ID.
+- `foreground_changed` also reports the return to the shell, and carries
+  `argv_truncated`. The shell that owns the terminal at spawn is the
+  baseline and produces no event.
+- `pane_activity` fires once per idle-to-active edge (output after at least
+  one second of silence), not per output chunk.
+- `session.resize` on an exited pane returns `SessionTerminated`
+  (`data.kind: "terminated"`). `pane.respawn` accepts a session ID or name
+  like every other pane target.
+- An empty positional `params` array (`[]`) reads as no parameters.
+  Non-empty arrays and scalars remain `InvalidParams`.
+- `zmuxd` changes its working directory to `/` after resolving its paths.
+  `zmux-connect` sends its working directory when it creates a session.
+  A pane created without `cwd` starts in `$HOME`, or in `/` when `$HOME`
+  is not an existing absolute directory. The umask is inherited unchanged.
+- Terminating a pane sends `SIGHUP` and `SIGCONT` to the foreground and
+  shell process groups, `SIGTERM` 100 ms later, and `SIGKILL` at the
+  deadline, so `HUP` handlers run before the job is killed.
 
 ### Fixed
 
@@ -38,6 +58,26 @@
   EOF and keep reading pane output during a two-second quiet period.
 - Accept reserved names with the explicit `attach` verb. Escape controls
   in human-readable output and print complete error responses with `--json`.
+- Protocol: bound JSON nesting and node count before parsing, accept only
+  string, integer, or null request IDs, and map every handler error through
+  one error table. Lines longer than the reader buffer survive read timeouts.
+- Foreground tracking: the Darwin argv parser no longer reads into the
+  environment block. A failed process lookup reports the `pid-<n>` fallback
+  once and retries with backoff instead of committing it.
+- PTY and sessions: report child setup failures from the forked child, reset
+  signal dispositions and close inherited descriptors before `exec`, emit
+  `session_exited` exactly once after the final output, and serialize input
+  writes per session with a deadline.
+- Mux: fix a use-after-free between concurrent create and terminate, bound
+  panes, clients, key bindings, and total scrollback, and reject duplicate
+  session names. Event sinks are cleared outside the manager lock on every
+  removal path, which removes a shutdown and respawn deadlock.
+- Server: verify peer credentials, bind the socket privately through a pinned
+  directory descriptor, never unlink a path that is not this user's stale
+  socket, and replace the start-lock race with a persistent `flock` file.
+  A create whose response cannot be built is rolled back, and the compact
+  reply buffer is reserved before the mutation commits. One spare descriptor
+  lets a control connection in when the descriptor table is full.
 - Validate releases on each native target and publish only after every
   platform has supplied its archives and checksums.
 

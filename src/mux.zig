@@ -112,12 +112,14 @@ pub const SpawnSpec = struct {
     command: ?[]u8 = null,
     cwd: ?[]u8 = null,
     env: ?[][]const u8 = null,
+    env_mode: native_mod.EnvMode = .merge,
     rows: u16 = 24,
     cols: u16 = 80,
     scrollback_bytes: usize = buffer.default_capacity,
 
     pub fn fromOptions(allocator: Allocator, opts: CreateOptions) !SpawnSpec {
         var spec: SpawnSpec = .{
+            .env_mode = opts.env_mode,
             .rows = opts.rows,
             .cols = opts.cols,
             .scrollback_bytes = opts.scrollback_bytes,
@@ -140,6 +142,7 @@ pub const SpawnSpec = struct {
             .command = self.command,
             .cwd = self.cwd,
             .env = self.env,
+            .env_mode = self.env_mode,
             .rows = self.rows,
             .cols = self.cols,
             .scrollback_bytes = self.scrollback_bytes,
@@ -163,6 +166,9 @@ pub const CreateOptions = struct {
     command: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
     env: ?[]const []const u8 = null,
+    /// `.merge` lays `env` over the daemon environment; `.replace` starts the
+    /// child with `env` only (plus the default `TERM` when it is unset).
+    env_mode: native_mod.EnvMode = .merge,
     rows: u16 = 24,
     cols: u16 = 80,
     scrollback_bytes: usize = buffer.default_capacity,
@@ -753,7 +759,9 @@ pub const Manager = struct {
         {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            const pane = self.findPaneLocked(pane_id) orelse return error.PaneNotFound;
+            // Like every pane target: a pane id, or a session id or name
+            // standing for that session's active pane.
+            const pane = (self.resolveTargetPaneLocked(pane_id) orelse return error.PaneNotFound).pane;
             if (!opts.kill and pane.native.isRunning()) return error.PaneRunning;
             var native_opts = pane.spawn.nativeOptions(pane.id, self.event_sink);
             native_opts.title = pane.title;
@@ -1271,7 +1279,11 @@ pub const Manager = struct {
 
     /// Set the manager sink and apply it to every existing native, so panes
     /// created before the server starts also report events.
+    /// A null `sink` is `clearEventSinks`.
     pub fn setEventSink(self: *Manager, sink: ?native_mod.EventSink) void {
+        // Removing a sink waits for in-flight emits, which must not happen
+        // under the manager mutex.
+        if (sink == null) return self.clearEventSinks();
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.event_sink = sink;
@@ -1290,12 +1302,13 @@ pub const Manager = struct {
         self.mutex.lockUncancelable(self.io);
         self.event_sink = null;
         const natives = self.retainAllNativesLocked() catch {
-            // No memory for the list: null each sink in place. setEventSink
-            // does not wait for an in-flight emit, so this cannot deadlock,
-            // but an emit already running may still finish after return.
+            // No memory for the list: null each sink in place.
+            // dropEventSink does not wait for an in-flight emit, so this
+            // cannot deadlock, but an emit already running may still finish
+            // after return.
             for (self.sessions.items) |session| {
                 for (session.windows.items) |window| {
-                    for (window.panes.items) |pane| pane.native.setEventSink(null);
+                    for (window.panes.items) |pane| pane.native.dropEventSink();
                 }
             }
             self.mutex.unlock(self.io);
@@ -3036,6 +3049,64 @@ test "interruptInput, setEventSink, and clearEventSinks reach existing panes" {
 
     manager.interruptInput();
     try std.testing.expectError(error.InputClosed, handle.native.send("x", false));
+}
+
+/// A sink shaped like the server's: every event takes the manager mutex.
+const LockingSink = struct {
+    manager: *Manager,
+    events: std.atomic.Value(usize) = .init(0),
+
+    fn sink(self: *LockingSink) native_mod.EventSink {
+        return .{ .context = self, .emit = emit };
+    }
+
+    fn emit(context: *anyopaque, event: native_mod.Event) void {
+        const self: *LockingSink = @ptrCast(@alignCast(context));
+        _ = self.events.fetchAdd(1, .seq_cst);
+        switch (event) {
+            .pane_output => |out| self.manager.markActivity(out.pane_id, out.generation, 1),
+            .session_exited => |exit| self.manager.markExited(exit.session_id, exit.generation),
+            else => _ = self.manager.counts(),
+        }
+    }
+};
+
+test "sink removal never waits for an emit while holding the manager mutex" {
+    // Regression: clearing a native sink blocks until in-flight emits return,
+    // and the server's sink takes the manager mutex. Every removal path
+    // (respawn, terminate, setEventSink(null), clearEventSinks, terminateAll)
+    // must therefore clear outside that mutex. A deadlock hangs this test.
+    const io = std.testing.io;
+    var manager = Manager.init(std.testing.allocator, io, null);
+    defer manager.deinit();
+    var locking: LockingSink = .{ .manager = &manager };
+
+    const flood: CreateOptions = .{ .shell = "/bin/sh", .command = "while :; do echo flood; done", .scrollback_bytes = 4096 };
+    for (0..6) |round| {
+        manager.setEventSink(locking.sink());
+        var first = try manager.createSessionPane(flood);
+        defer first.deinit();
+        var second = try manager.splitPane(first.pane_id, .vertical, flood);
+        defer second.deinit();
+
+        // Let both readers get into the sink.
+        const seen = locking.events.load(.seq_cst);
+        const deadline = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(5));
+        while (locking.events.load(.seq_cst) < seen + 20) {
+            if (std.Io.Clock.awake.now(io).compare(.gt, deadline)) return error.MissingEvents;
+            io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+
+        const respawned = try manager.respawnPane(first.pane_id, .{ .kill = true });
+        respawned.release();
+        try std.testing.expect(manager.terminate(second.pane_id));
+        switch (round % 3) {
+            0 => manager.setEventSink(null),
+            1 => manager.clearEventSinks(),
+            else => {},
+        }
+        manager.terminateAll();
+    }
 }
 
 test "paneScrollbackTail returns pane output and rejects unknown panes" {

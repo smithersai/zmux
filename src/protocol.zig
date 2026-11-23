@@ -45,9 +45,14 @@ pub const Request = struct {
         self.parsed.deinit();
     }
 
+    /// The request's `params` member. An empty positional array carries no
+    /// arguments, so it reads as absent: clients that serialize "no params"
+    /// as `[]` are valid JSON-RPC 2.0 and get the same result as `{}`.
     pub fn params(self: *const Request) ?Value {
         if (self.parsed.value != .object) return null;
-        return self.parsed.value.object.get("params");
+        const value = self.parsed.value.object.get("params") orelse return null;
+        if (value == .array and value.array.items.len == 0) return null;
+        return value;
     }
 };
 
@@ -343,10 +348,16 @@ pub fn sanitizeUtf8Alloc(allocator: Allocator, bytes: []const u8) ![]u8 {
 pub fn result(allocator: Allocator, id_json: []const u8, value: anytype) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
-    try out.writer.print("{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":", .{id_json});
-    try std.json.Stringify.value(value, .{}, &out.writer);
-    try out.writer.writeAll("}\n");
+    try writeResult(&out.writer, id_json, value);
     return out.toOwnedSlice();
+}
+
+/// `result` into a caller-owned writer, for a caller that reserved the
+/// response buffer before doing the work it reports.
+pub fn writeResult(writer: *std.Io.Writer, id_json: []const u8, value: anytype) !void {
+    try writer.print("{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":", .{id_json});
+    try std.json.Stringify.value(value, .{}, writer);
+    try writer.writeAll("}\n");
 }
 
 pub fn resultRaw(allocator: Allocator, id_json: []const u8, raw_json: []const u8) ![]u8 {
@@ -685,4 +696,14 @@ test "error and notification never emit integer arrays for invalid UTF-8" {
     var parsed_note = try std.json.parseFromSlice(Value, std.testing.allocator, note, .{});
     defer parsed_note.deinit();
     try std.testing.expect(parsed_note.value.object.get("method").? == .string);
+}
+
+test "empty positional params read as absent" {
+    var empty = try parseRequest(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"daemon.ping\",\"params\":[]}");
+    defer empty.deinit();
+    try std.testing.expect(empty.params() == null);
+
+    var positional = try parseRequest(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"daemon.ping\",\"params\":[1]}");
+    defer positional.deinit();
+    try std.testing.expect(positional.params().? == .array);
 }

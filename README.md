@@ -267,6 +267,17 @@ zero live sessions. Use `--idle-seconds 0` to run until explicit shutdown.
 Sessions and PTY children die with the daemon; zmux does not persist live
 processes across daemon shutdown or operating-system reboot.
 
+After startup `zmuxd` runs in `/`, not in the directory it was launched
+from. A pane starts in the `cwd` its creator passes. `zmux-connect` passes
+its own working directory when it creates a session. Without `cwd`, a pane
+starts in `$HOME`, or in `/` when `$HOME` is not an existing absolute
+directory. Panes inherit the daemon's umask.
+
+Terminating a pane sends `SIGHUP` and `SIGCONT` to its foreground and shell
+process groups, `SIGTERM` 100 ms later, and `SIGKILL` at the deadline.
+Background jobs that a shell moved to their own process group die only if
+the shell forwards `SIGHUP` to them, as bash does and dash does not.
+
 `SIGTERM` and `SIGINT` request graceful shutdown. `SIGHUP` is ignored so an
 auto-spawned daemon survives the spawning client's terminal. You can also
 stop the daemon with `zmux-connect shutdown` or the `daemon.shutdown` RPC.

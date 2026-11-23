@@ -55,11 +55,10 @@ const first_frame_deadline_ms: i64 = 10_000;
 const partial_frame_deadline_ms: i64 = 30_000;
 
 pub const max_client_connections: usize = 256;
+/// Room for a compact mutation result (three generated ids, a generation, and
+/// the envelope), reserved before the mutation commits.
+const compact_reply_reserve_bytes: usize = 512;
 const accept_backoff_ms: i64 = 50;
-/// `pane_activity` is forwarded at most once per pane in this interval: the
-/// first event after a quiet period goes out at once, a busy pane does not
-/// turn into a per-chunk global broadcast.
-const activity_forward_interval_ms: i64 = 1000;
 const stale_probe_timeout_ms: i64 = 1000;
 
 /// Longest socket path `bind(2)` accepts: `sun_path` minus its NUL terminator
@@ -244,6 +243,8 @@ const ClientConnection = struct {
             self.queue.deinit(allocator);
             for (self.dropped.items) |record| allocator.free(record.pane_id);
             self.dropped.deinit(allocator);
+            // A frame larger than the reader's fixed buffer lives on the heap.
+            self.reader.deinit();
             sys.close(self.fd);
             allocator.destroy(self);
         }
@@ -646,9 +647,19 @@ pub const Server = struct {
     dropped_events: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Connections refused at admission (limit, credentials, thread spawn).
     rejected_connections: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    /// Monotonic ms of the last forwarded `pane_activity` per pane id.
-    activity_mutex: std.Io.Mutex = .init,
-    activity_forwarded: std.StringHashMapUnmanaged(i64) = .empty,
+    /// Working directory for a pane whose creator names none; null leaves
+    /// the daemon's own. Borrowed: must outlive the server.
+    default_cwd: ?[]const u8 = null,
+    /// Spare descriptor held open while the server runs. When `accept` fails
+    /// because the descriptor table is full, the server closes it and accepts
+    /// once more, so one control connection (`daemon.ping`,
+    /// `session.terminate`, `daemon.shutdown`) can still get in and free
+    /// resources. Re-armed as soon as a descriptor is available again.
+    spare_fd: posix.fd_t = -1,
+    /// Connections admitted by giving up `spare_fd`.
+    spare_fd_admissions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Test seam for the listener's `accept`.
+    accept_fn: *const fn (listener_fd: posix.fd_t) sys.AcceptError!posix.fd_t = sys.accept,
     /// Seam for credential tests: the effective uid of a connected peer.
     peer_euid_fn: PeerEuidFn = defaultPeerEuid,
     /// Test seam: runs on the worker thread before the connection registers.
@@ -722,12 +733,10 @@ pub const Server = struct {
         self.unpublish();
         if (self.listener_fd >= 0) sys.close(self.listener_fd);
         self.shutdown();
+        self.releaseSpareFd();
         if (self.socket_dir_fd >= 0) sys.close(self.socket_dir_fd);
         self.manager.deinit();
         self.connections.deinit(self.allocator);
-        var activity_keys = self.activity_forwarded.keyIterator();
-        while (activity_keys.next()) |key| self.allocator.free(key.*);
-        self.activity_forwarded.deinit(self.allocator);
         self.allocator.free(self.socket_path);
     }
 
@@ -759,6 +768,7 @@ pub const Server = struct {
             // from the native session's own event.
             self.manager.reapExitedPanes();
             self.drainDetachedClients();
+            self.armSpareFd();
             if (self.shouldExitForIdle()) {
                 log.info("server_idle_exit", .{
                     .idle_timeout_seconds = self.idle_timeout_seconds,
@@ -777,10 +787,10 @@ pub const Server = struct {
             if ((fds[0].revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) return;
             if ((fds[0].revents & posix.POLL.IN) == 0) continue;
 
-            const client_fd = sys.accept(self.listener_fd) catch |err| switch (err) {
+            const client_fd = self.accept_fn(self.listener_fd) catch |err| switch (err) {
                 // The peer went away between poll and accept.
                 error.WouldBlock, error.ConnectionAborted => continue,
-                else => {
+                else => self.acceptWithSpareFd(err) orelse {
                     log.warnRateLimited("accept_error", &accept_error_limiter, .{
                         .err = err,
                         .active_connections = self.active_connections.load(.seq_cst),
@@ -795,6 +805,34 @@ pub const Server = struct {
             };
             self.admit(client_fd);
         }
+    }
+
+    /// Open the spare descriptor when it is not held. Failure is expected
+    /// while the table is full; the next loop iteration tries again.
+    fn armSpareFd(self: *Server) void {
+        if (self.spare_fd >= 0) return;
+        self.spare_fd = sys.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch return;
+    }
+
+    fn releaseSpareFd(self: *Server) void {
+        if (self.spare_fd < 0) return;
+        sys.close(self.spare_fd);
+        self.spare_fd = -1;
+    }
+
+    /// On descriptor exhaustion, trade the spare descriptor for one more
+    /// accepted connection. Null when `err` is something else, no spare is
+    /// held, or the retry fails too.
+    fn acceptWithSpareFd(self: *Server, err: sys.AcceptError) ?posix.fd_t {
+        if (err != error.ProcessFdQuotaExceeded and err != error.SystemFdQuotaExceeded) return null;
+        if (self.spare_fd < 0) return null;
+        self.releaseSpareFd();
+        const client_fd = self.accept_fn(self.listener_fd) catch return null;
+        _ = self.spare_fd_admissions.fetchAdd(1, .monotonic);
+        log.warnRateLimited("accept_used_spare_fd", &accept_error_limiter, .{
+            .active_connections = self.active_connections.load(.seq_cst),
+        });
+        return client_fd;
     }
 
     /// Take ownership of an accepted descriptor: check credentials and the
@@ -1054,11 +1092,15 @@ pub const Server = struct {
         // as the new window/pane title.
         var create_args = try muxCreateArgsFromParams(self.allocator, req.params(), .{ .id_aliases_title = true });
         defer create_args.deinit();
+        self.applyCreateDefaults(&create_args.opts);
 
         var handle = try self.manager.createSessionPane(create_args.opts);
         defer handle.deinit();
+        self.replyCreatedSession(connection, req, &handle) catch |err| return self.undoCreate(&handle, err);
+    }
 
-        // The legacy session info object plus the compact identifiers.
+    /// The legacy session info object plus the compact identifiers.
+    fn replyCreatedSession(self: *Server, connection: *ClientConnection, req: *const protocol.Request, handle: *const mux.PaneHandle) !void {
         const info = try handle.native.infoJson(self.allocator);
         defer self.allocator.free(info);
         const trimmed = std.mem.trimEnd(u8, info, " \t\r\n");
@@ -1080,6 +1122,19 @@ pub const Server = struct {
         try self.replyRaw(connection, req, out.written());
     }
 
+    /// A create whose response could not be built or exceeded a limit is
+    /// undone, so an error response always means nothing was committed
+    /// (M40). A reply lost to a closed connection keeps the work: nobody was
+    /// told it failed, and a named session stays attachable.
+    fn undoCreate(self: *Server, handle: *const mux.PaneHandle, err: anyerror) anyerror {
+        if (err != error.ConnectionClosed) _ = self.manager.terminate(handle.pane_id);
+        return err;
+    }
+
+    fn applyCreateDefaults(self: *Server, opts: *mux.CreateOptions) void {
+        if (opts.cwd == null) opts.cwd = self.default_cwd;
+    }
+
     fn snapshotMux(self: *Server, connection: *ClientConnection, req: *const protocol.Request) !void {
         try self.replySnapshot(connection, req);
     }
@@ -1088,9 +1143,12 @@ pub const Server = struct {
         const session_id = try sessionIdParam(req.params()) orelse return error.InvalidParams;
         var create_args = try muxCreateArgsFromParams(self.allocator, req.params(), .{});
         defer create_args.deinit();
+        self.applyCreateDefaults(&create_args.opts);
+        var out = try self.reserveCompactReply(req);
+        defer out.deinit();
         var handle = try self.manager.newWindow(session_id, create_args.opts);
         defer handle.deinit();
-        try self.replyPaneHandle(connection, req, &handle);
+        self.replyPaneHandle(connection, req, &handle, &out) catch |err| return self.undoCreate(&handle, err);
     }
 
     fn splitPane(self: *Server, connection: *ClientConnection, req: *const protocol.Request) !void {
@@ -1098,20 +1156,38 @@ pub const Server = struct {
         const axis = try axisParam(req.params());
         var create_args = try muxCreateArgsFromParams(self.allocator, req.params(), .{});
         defer create_args.deinit();
+        self.applyCreateDefaults(&create_args.opts);
+        var out = try self.reserveCompactReply(req);
+        defer out.deinit();
         var handle = try self.manager.splitPane(pane_id, axis, create_args.opts);
         defer handle.deinit();
-        try self.replyPaneHandle(connection, req, &handle);
+        self.replyPaneHandle(connection, req, &handle, &out) catch |err| return self.undoCreate(&handle, err);
     }
 
-    /// Compact mutation result: identifiers only, so the reply cannot fail on
-    /// the size of the whole mux snapshot after the work is committed.
-    fn replyPaneHandle(self: *Server, connection: *ClientConnection, req: *const protocol.Request, handle: *const mux.PaneHandle) !void {
-        try self.reply(connection, req, .{
+    /// Reserve the buffer for a compact mutation result before the mutation
+    /// commits, so building the reply afterwards does not allocate.
+    fn reserveCompactReply(self: *Server, req: *const protocol.Request) !std.Io.Writer.Allocating {
+        return std.Io.Writer.Allocating.initCapacity(self.allocator, compact_reply_reserve_bytes + req.id_json.len);
+    }
+
+    /// Compact mutation result: identifiers only, written into the buffer
+    /// reserved by `reserveCompactReply`, so the reply cannot fail on the size
+    /// of the whole mux snapshot after the work is committed.
+    fn replyPaneHandle(
+        self: *Server,
+        connection: *ClientConnection,
+        req: *const protocol.Request,
+        handle: *const mux.PaneHandle,
+        out: *std.Io.Writer.Allocating,
+    ) !void {
+        if (protocol.isNotification(req)) return;
+        try protocol.writeResult(&out.writer, req.id_json, .{
             .sessionId = handle.session_id,
             .windowId = handle.window_id,
             .paneId = handle.pane_id,
             .generation = handle.native.generation(),
         });
+        try self.writeResponse(connection, out.written());
     }
 
     fn selectPane(self: *Server, connection: *ClientConnection, req: *const protocol.Request) !void {
@@ -1174,6 +1250,7 @@ pub const Server = struct {
         defer if (create_args) |*args| args.deinit();
         if (try objectParam(params, "createIfMissing")) |create_params| {
             create_args = try muxCreateArgsFromParams(self.allocator, create_params, .{ .id_aliases_title = true });
+            self.applyCreateDefaults(&create_args.?.opts);
         }
 
         var attached = try self.manager.attachOrCreateClient(target, rows, cols, if (create_args) |args| args.opts else null);
@@ -1223,16 +1300,16 @@ pub const Server = struct {
 
     fn detachMuxClient(self: *Server, connection: *ClientConnection, req: *const protocol.Request) !void {
         const client_id = try clientIdParam(req.params()) orelse return error.InvalidParams;
-        const detached = self.manager.detachClient(client_id);
 
-        // Detaching another connection's client is allowed; its owner is told.
         if (connection.untrackMuxClient(client_id)) {
             // Owned here: nothing to notify.
-        } else if (self.takeClientOwner(client_id)) |owner| {
-            defer owner.release();
-            self.notifyClientDetached(owner, client_id, "remote_detach");
+            if (!self.manager.detachClient(client_id)) return error.ClientNotFound;
+        } else {
+            // Another connection's client: allowed. The manager records the
+            // remote detach and `drainDetachedClients`, which runs after
+            // every request, tells the owner (`client_detached`).
+            if (!self.manager.detachClientRemote(client_id)) return error.ClientNotFound;
         }
-        if (!detached) return error.ClientNotFound;
         try self.replyOk(connection, req);
     }
 
@@ -1368,6 +1445,9 @@ pub const Server = struct {
         const active = try self.requiredSession(req);
         defer active.release();
 
+        // An exited pane has no terminal to resize: the caller learns that
+        // (`terminated`) and can respawn, instead of a silent success.
+        if (!active.isRunning()) return error.SessionTerminated;
         // Through the manager so the pane's spawn spec records the size and a
         // respawn comes back at the same dimensions.
         try self.manager.resizePane(active.id, rows, cols);
@@ -1548,9 +1628,8 @@ pub const Server = struct {
     /// or detached remotely) and stop tracking them.
     fn drainDetachedClients(self: *Server) void {
         const detached = self.manager.takeDetachedClients(self.allocator) catch return;
-        defer self.allocator.free(detached);
+        defer mux.freeDetachedClients(self.allocator, detached);
         for (detached) |entry| {
-            defer self.allocator.free(entry.client_id);
             const owner = self.takeClientOwner(entry.client_id) orelse continue;
             defer owner.release();
             self.notifyClientDetached(owner, entry.client_id, @tagName(entry.reason));
@@ -1713,33 +1792,6 @@ pub const Server = struct {
         for (targets) |connection| self.deliver(connection, payload);
     }
 
-    /// True when a `pane_activity` for `pane_id` should go out now: none was
-    /// forwarded for that pane within `activity_forward_interval_ms`.
-    fn shouldForwardActivity(self: *Server, pane_id: []const u8) bool {
-        const now_ms = sys.monotonicMs();
-        self.activity_mutex.lockUncancelable(self.io);
-        defer self.activity_mutex.unlock(self.io);
-        if (self.activity_forwarded.getPtr(pane_id)) |last_ms| {
-            if (now_ms - last_ms.* < activity_forward_interval_ms) return false;
-            last_ms.* = now_ms;
-            return true;
-        }
-        // Forward when the bookkeeping cannot be stored: an extra event is
-        // better than a missing one.
-        const key = self.allocator.dupe(u8, pane_id) catch return true;
-        self.activity_forwarded.put(self.allocator, key, now_ms) catch {
-            self.allocator.free(key);
-            return true;
-        };
-        return true;
-    }
-
-    fn forgetActivity(self: *Server, pane_id: []const u8) void {
-        self.activity_mutex.lockUncancelable(self.io);
-        defer self.activity_mutex.unlock(self.io);
-        if (self.activity_forwarded.fetchRemove(pane_id)) |removed| self.allocator.free(removed.key);
-    }
-
     fn handleNativeEvent(context: *anyopaque, event: native_mod.Event) void {
         const self: *Server = @ptrCast(@alignCast(context));
         switch (event) {
@@ -1749,7 +1801,6 @@ pub const Server = struct {
                 // The idle interval starts when the last pane exits, not at
                 // the last client request.
                 self.touch();
-                self.forgetActivity(params.session_id);
                 self.broadcastNotification(protocol.session_exited_method, params);
             },
             .pane_output => |params| {
@@ -1757,10 +1808,10 @@ pub const Server = struct {
                 self.broadcastPaneOutput(params);
             },
             .pane_activity => |params| {
-                // The alert state always records the event's own timestamp;
-                // the notification is edge-triggered.
+                // The native session emits this only on the idle-to-active
+                // edge (`native.activity_idle_ms`), so every event is
+                // forwarded. The alert state records the event's timestamp.
                 self.manager.markActivity(params.pane_id, params.generation, params.last_activity_ms);
-                if (!self.shouldForwardActivity(params.pane_id)) return;
                 self.broadcastNotification(protocol.pane_activity_method, protocol.PaneActivityParams{
                     .pane_id = params.pane_id,
                     .last_activity_ms = params.last_activity_ms,
@@ -2332,22 +2383,19 @@ fn muxCreateArgsFromParams(allocator: Allocator, params: ?Value, options: Create
     const env_entries = try envEntriesFromParams(allocator, params);
     errdefer if (env_entries) |entries| freeStringSlice(allocator, entries);
 
-    var opts: mux.CreateOptions = .{
+    // `env` merges over the daemon environment by default (D3); `clearEnv`
+    // asks for full replacement.
+    const opts: mux.CreateOptions = .{
         .title = title,
         .shell = shell,
         .command = command,
         .cwd = cwd,
         .env = if (env_entries) |entries| entries else null,
+        .env_mode = if (clear_env) .replace else .merge,
         .rows = rows,
         .cols = cols,
         .scrollback_bytes = scrollback_bytes,
     };
-    // `env` merges over the daemon environment by default (D3); `clearEnv`
-    // asks for full replacement. The option exists once the mux contract
-    // carries the PTY env mode.
-    if (@hasField(mux.CreateOptions, "env_mode")) {
-        @field(opts, "env_mode") = if (clear_env) .replace else .merge;
-    }
     return .{
         .allocator = allocator,
         .env_entries = env_entries,
@@ -2824,17 +2872,13 @@ test "mux create args parses clearEnv" {
     defer parsed.deinit();
     var args = try muxCreateArgsFromParams(std.testing.allocator, parsed.value, .{});
     defer args.deinit();
-    if (@hasField(mux.CreateOptions, "env_mode")) {
-        try std.testing.expect(@field(args.opts, "env_mode") == .replace);
-    }
+    try std.testing.expect(args.opts.env_mode == .replace);
 
     var merged = try parseJson("{\"env\":{\"A\":\"1\"}}");
     defer merged.deinit();
     var merge_args = try muxCreateArgsFromParams(std.testing.allocator, merged.value, .{});
     defer merge_args.deinit();
-    if (@hasField(mux.CreateOptions, "env_mode")) {
-        try std.testing.expect(@field(merge_args.opts, "env_mode") == .merge);
-    }
+    try std.testing.expect(merge_args.opts.env_mode == .merge);
 }
 
 test "mux create args rejects oversize scrollbackBytes" {
@@ -3129,7 +3173,7 @@ test "pane_output reaches only attached or subscribed connections; lifecycle eve
     try wildcard.expectEmpty();
 }
 
-test "pane_activity is forwarded once per quiet period, per pane" {
+test "every native pane_activity edge is forwarded; pane_output is not an activity notification" {
     if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
 
     var server = try fuzz_hooks.initInMemoryServer(std.testing.allocator, test_io);
@@ -3137,32 +3181,18 @@ test "pane_activity is forwarded once per quiet period, per pane" {
     var probe = try QueueProbe.init(&server);
     defer probe.deinit();
 
-    // A busy pane produces one notification, not one per chunk.
-    var burst: i64 = 0;
-    while (burst < 500) : (burst += 1) {
-        Server.handleNativeEvent(&server, .{ .pane_activity = .{ .pane_id = "busy", .last_activity_ms = burst, .generation = 2 } });
+    // The native session decides the idle-to-active edge; the server adds no
+    // second throttle, so two edges are two notifications.
+    Server.handleNativeEvent(&server, .{ .pane_activity = .{ .pane_id = "busy", .last_activity_ms = 100, .generation = 2 } });
+    try probe.expectNext(&.{ "\"method\":\"pane_activity\"", "\"pane_id\":\"busy\"", "\"last_activity_ms\":100", "\"generation\":2" });
+    Server.handleNativeEvent(&server, .{ .pane_activity = .{ .pane_id = "busy", .last_activity_ms = 1200, .generation = 2 } });
+    try probe.expectNext(&.{ "\"pane_id\":\"busy\"", "\"last_activity_ms\":1200" });
+
+    // Output chunks reach only subscribers and never become activity events.
+    var chunk: u64 = 0;
+    while (chunk < 100) : (chunk += 1) {
+        Server.handleNativeEvent(&server, .{ .pane_output = .{ .pane_id = "busy", .data = "x", .offset = chunk, .generation = 2 } });
     }
-    try probe.expectNext(&.{ "\"method\":\"pane_activity\"", "\"pane_id\":\"busy\"", "\"last_activity_ms\":0", "\"generation\":2" });
-    try probe.expectEmpty();
-
-    // Another pane has its own interval.
-    Server.handleNativeEvent(&server, .{ .pane_activity = .{ .pane_id = "other", .last_activity_ms = 7, .generation = 0 } });
-    try probe.expectNext(&.{"\"pane_id\":\"other\""});
-    try probe.expectEmpty();
-
-    // After the quiet period the next event goes out again.
-    server.activity_forwarded.getPtr("busy").?.* -= activity_forward_interval_ms;
-    Server.handleNativeEvent(&server, .{ .pane_activity = .{ .pane_id = "busy", .last_activity_ms = 900, .generation = 2 } });
-    try probe.expectNext(&.{ "\"pane_id\":\"busy\"", "\"last_activity_ms\":900" });
-    Server.handleNativeEvent(&server, .{ .pane_activity = .{ .pane_id = "busy", .last_activity_ms = 901, .generation = 2 } });
-    try probe.expectEmpty();
-
-    // An exit forgets the pane, so a respawned pane reports at once.
-    Server.handleNativeEvent(&server, .{ .session_exited = .{ .session_id = "busy", .pid = 1, .exit_code = 0, .generation = 2 } });
-    try probe.expectNext(&.{"\"method\":\"session_exited\""});
-    try std.testing.expect(server.activity_forwarded.get("busy") == null);
-    Server.handleNativeEvent(&server, .{ .pane_activity = .{ .pane_id = "busy", .last_activity_ms = 950, .generation = 3 } });
-    try probe.expectNext(&.{ "\"pane_id\":\"busy\"", "\"generation\":3" });
     try probe.expectEmpty();
 }
 
@@ -3959,6 +3989,77 @@ test "run shuts down in order and a second shutdown is a no-op" {
     try std.testing.expectEqual(@as(usize, 0), server.manager.counts().sessions);
     try std.testing.expect(server.manager.event_sink == null);
     server.shutdown();
+}
+
+/// `accept` that reports a full descriptor table while the server still
+/// holds its spare descriptor.
+const ExhaustedAccept = struct {
+    var server: ?*Server = null;
+    var refused: std.atomic.Value(usize) = .init(0);
+
+    fn accept(listener_fd: posix.fd_t) sys.AcceptError!posix.fd_t {
+        if (server.?.spare_fd >= 0) {
+            _ = refused.fetchAdd(1, .seq_cst);
+            return error.ProcessFdQuotaExceeded;
+        }
+        return sys.accept(listener_fd);
+    }
+};
+
+test "H21: at descriptor exhaustion the spare descriptor admits a control connection" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    LateRegistration.reset();
+
+    const socket_path = try tempPath(allocator, "zmx-spare-fd");
+    defer allocator.free(socket_path);
+    defer std.Io.Dir.deleteFileAbsolute(test_io, socket_path) catch {};
+    try requireUnixSocketBind(socket_path);
+
+    var server = try Server.init(allocator, test_io, socket_path, 0);
+    defer server.deinit();
+    server.shutdown_probe = LateRegistration.probe;
+    ExhaustedAccept.server = &server;
+    ExhaustedAccept.refused.store(0, .seq_cst);
+    server.accept_fn = ExhaustedAccept.accept;
+
+    var runner = LateRegistration.Runner{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, LateRegistration.Runner.run, .{&runner});
+
+    // Two clients in a row: each first accept is refused, the spare is given
+    // up, the retry succeeds, and the spare is re-armed for the next one.
+    for (0..2) |round| {
+        const client = try sys.connectUnix(socket_path);
+        defer sys.close(client);
+        try sys.writeAll(client, "{\"id\":1,\"method\":\"daemon.ping\"}\n");
+        const reply = try readLineTimeout(allocator, client, 3000);
+        defer allocator.free(reply);
+        try std.testing.expect(std.mem.indexOf(u8, reply, "\"result\"") != null);
+        try std.testing.expectEqual(@as(u64, round + 1), server.spare_fd_admissions.load(.monotonic));
+    }
+    try std.testing.expectEqual(@as(usize, 2), ExhaustedAccept.refused.load(.seq_cst));
+
+    LateRegistration.stop.store(true, .seq_cst);
+    try std.testing.expect(waitForFlag(&runner.done, 5000));
+    thread.join();
+}
+
+test "M40: a create whose reply cannot be built is undone; a reply lost to a closed peer is kept" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    var server = try fuzz_hooks.initInMemoryServer(std.testing.allocator, test_io);
+    defer fuzz_hooks.deinitInMemoryServer(&server);
+
+    var kept = try server.manager.createSessionPane(.{ .title = "kept", .shell = "/bin/sh", .command = "exec cat" });
+    defer kept.deinit();
+    try std.testing.expectEqual(@as(anyerror, error.ConnectionClosed), server.undoCreate(&kept, error.ConnectionClosed));
+    try std.testing.expectEqual(@as(usize, 1), server.manager.counts().panes);
+
+    var undone = try server.manager.splitPane(kept.pane_id, .vertical, .{ .shell = "/bin/sh", .command = "exec cat" });
+    defer undone.deinit();
+    try std.testing.expectEqual(@as(usize, 2), server.manager.counts().panes);
+    try std.testing.expectEqual(@as(anyerror, error.OutOfMemory), server.undoCreate(&undone, error.OutOfMemory));
+    try std.testing.expectEqual(@as(usize, 1), server.manager.counts().panes);
 }
 
 // -- Socket path safety ----------------------------------------------------------

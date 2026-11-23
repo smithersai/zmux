@@ -4,6 +4,8 @@ const builtin = @import("builtin");
 const buffer = @import("buffer.zig");
 const foreground = @import("foreground.zig");
 const pty = @import("pty.zig");
+
+pub const EnvMode = pty.EnvMode;
 const protocol = @import("protocol.zig");
 const sys = @import("sys.zig");
 
@@ -23,8 +25,16 @@ pub const exit_drain_grace_ms: i64 = 250;
 /// this long without any.
 pub const activity_idle_ms: i64 = 1000;
 
+/// Extra lookups (with doubling backoff) for a foreground group whose
+/// process info could not be read, before the fallback form is accepted.
+const foreground_degraded_retries: u8 = 4;
+
 /// Budget `terminate` gives SIGHUP/SIGTERM before escalating to SIGKILL.
 pub const terminate_grace_ms: i64 = 300;
+
+/// How long SIGHUP gets to work alone before SIGTERM follows. A SIGTERM sent
+/// together with the SIGHUP would kill a job before its HUP handler ran.
+pub const hangup_grace_ms: i64 = 100;
 
 /// After SIGKILL the reap normally completes within milliseconds. This bounds
 /// the wait so an unkillable child (uninterruptible I/O) cannot hang shutdown.
@@ -159,11 +169,17 @@ pub const NativeSession = struct {
     /// master against in-flight writes.
     input_mutex: std.Io.Mutex = .init,
     input_stopped: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Monotonic time at which SIGTERM follows the SIGHUP of
+    /// `beginTerminate`; 0 until teardown begins.
+    term_at_ms: std.atomic.Value(i64) = .init(0),
     /// `stopInput` writes one byte; blocked writers poll the read end.
     stop_pipe: [2]sys.fd_t,
 
     foreground_tracker: foreground.Tracker,
     next_foreground_check_ms: i64 = 0,
+    /// Group whose last lookup was degraded, and how often it was polled.
+    foreground_degraded_pgid: ?std.posix.pid_t = null,
+    foreground_degraded_polls: u8 = 0,
     /// Monotonic time of the last PTY output; reader thread only.
     last_output_ms: ?i64 = null,
 
@@ -237,6 +253,10 @@ pub const NativeSession = struct {
         // Set before the reader exists, so the reader's own transition to
         // `terminated` can never be overwritten.
         native.setState(.running);
+        // The shell owns the terminal at spawn: that is the baseline, not a
+        // change. The first event is the first job, and a later return to
+        // the shell group is reported like any other change.
+        native.foreground_tracker.commit(handle.child_pid);
         if (spawn_reader_hook) |hook| try hook(handle.child_pid);
         native.reader_thread = try std.Thread.spawn(.{}, NativeSession.readerLoop, .{native});
         return native;
@@ -351,20 +371,23 @@ pub const NativeSession = struct {
 
     /// Non-blocking start of teardown: close input (waking blocked writers),
     /// then SIGHUP+SIGCONT to the terminal foreground group and the shell
-    /// group, then SIGTERM to the shell group. All signals are no-ops once
-    /// the child is reaped. Pair with `awaitTerminated`.
+    /// group, which is what a closing terminal delivers. `awaitTerminated`
+    /// continues the ladder: SIGTERM to the shell group `hangup_grace_ms`
+    /// later, SIGKILL at its deadline. All signals are no-ops once the child
+    /// is reaped. Idempotent.
     ///
     /// The master is deliberately not closed here: the reader thread is
     /// polling it, and the reader closes it itself after draining the final
     /// output.
     pub fn beginTerminate(self: *NativeSession) void {
         self.stopInput();
+        if (self.term_at_ms.cmpxchgStrong(0, sys.monotonicMs() + hangup_grace_ms, .seq_cst, .seq_cst) != null) return;
         self.handle.hangupForeground();
-        self.handle.terminate();
     }
 
-    /// Reap until the monotonic `deadline_ms` (`sys.monotonicMs`). At the
-    /// deadline, and only if the child is still not reaped, escalate to
+    /// Reap until the monotonic `deadline_ms` (`sys.monotonicMs`). After a
+    /// `beginTerminate`, SIGTERM follows the SIGHUP once `hangup_grace_ms`
+    /// passed. At the deadline, and only if the child is still not reaped, escalate to
     /// SIGKILL for the foreground and shell groups and keep reaping until
     /// `waitpid` collects the child (bounded by `kill_reap_budget_ms`).
     /// Then give the reader thread a bounded moment to drain the final
@@ -374,10 +397,16 @@ pub const NativeSession = struct {
         defer _ = self.io.swapCancelProtection(previous);
 
         var kill_give_up_ms: ?i64 = null;
+        var term_sent = false;
         while (true) {
             _ = self.reapExited();
             if (self.handle.isReaped()) break;
             const now = sys.monotonicMs();
+            const term_at = self.term_at_ms.load(.seq_cst);
+            if (!term_sent and term_at != 0 and now >= @min(term_at, deadline_ms)) {
+                term_sent = true;
+                self.handle.terminate();
+            }
             if (kill_give_up_ms) |give_up| {
                 if (now >= give_up) {
                     std.log.warn("zmux-native: child {d} not reaped {d} ms after SIGKILL", .{ self.handle.child_pid, kill_reap_budget_ms });
@@ -625,7 +654,7 @@ pub const NativeSession = struct {
         self.scrollback.append(data);
         self.mutex.unlock(self.io);
 
-        self.emitEvent(.{ .pane_output = .{
+        _ = self.emitEvent(.{ .pane_output = .{
             .pane_id = self.id,
             .data = data,
             .offset = offset,
@@ -637,14 +666,14 @@ pub const NativeSession = struct {
         const was_idle = if (self.last_output_ms) |last| mono_ms - last >= activity_idle_ms else true;
         self.last_output_ms = mono_ms;
         if (was_idle) {
-            self.emitEvent(.{ .pane_activity = .{
+            _ = self.emitEvent(.{ .pane_activity = .{
                 .pane_id = self.id,
                 .last_activity_ms = now_ms,
                 .generation = self.generation_value,
             } });
         }
         if (std.mem.indexOfScalar(u8, data, 0x07) != null) {
-            self.emitEvent(.{ .pane_bell = .{
+            _ = self.emitEvent(.{ .pane_bell = .{
                 .pane_id = self.id,
                 .last_bell_ms = now_ms,
                 .generation = self.generation_value,
@@ -657,7 +686,7 @@ pub const NativeSession = struct {
     fn finishReader(self: *NativeSession) void {
         if (self.handle.isReaped()) {
             const exit: ExitInfo = self.exitInfo() orelse .{ .exit_code = null, .signal = null };
-            self.emitEvent(.{ .session_exited = .{
+            _ = self.emitEvent(.{ .session_exited = .{
                 .session_id = self.id,
                 .pid = self.handle.child_pid,
                 .exit_code = exit.exit_code,
@@ -690,25 +719,60 @@ pub const NativeSession = struct {
         if (now_ms < self.next_foreground_check_ms) return;
         self.next_foreground_check_ms = now_ms + foreground.poll_interval_ms;
 
+        // Without a sink nothing can be delivered: skip the lookup and leave
+        // the change uncommitted for whoever subscribes later.
+        if (!self.hasEventSink()) return;
         var process = (try self.foreground_tracker.poll(self.allocator, self.io, self.handle.master_fd)) orelse return;
         defer process.deinit();
 
-        self.emitEvent(.{ .foreground_changed = .{
+        if (process.degraded) {
+            // The lookup fell back to `pid-<n>`. Report that form once per
+            // group, then retry with backoff; a group whose leader stays
+            // unreadable is accepted after `foreground_degraded_retries`.
+            const first = self.foreground_degraded_pgid != process.pid;
+            if (first) {
+                self.foreground_degraded_pgid = process.pid;
+                self.foreground_degraded_polls = 0;
+            }
+            self.foreground_degraded_polls += 1;
+            if (self.foreground_degraded_polls > foreground_degraded_retries) {
+                self.foreground_tracker.commit(process.pid);
+                self.foreground_degraded_pgid = null;
+                return;
+            }
+            const shift: u6 = @intCast(self.foreground_degraded_polls - 1);
+            self.next_foreground_check_ms = now_ms + (foreground.poll_interval_ms << shift);
+            if (!first) return;
+        } else {
+            self.foreground_degraded_pgid = null;
+        }
+
+        const delivered = self.emitEvent(.{ .foreground_changed = .{
             .session_id = self.id,
             .pid = process.pid,
             .comm = process.comm,
             .argv = process.argv,
             .argv_truncated = process.argv_truncated,
         } });
+        // Commit only a fully resolved, delivered change, so a failed lookup
+        // or an undelivered event is retried on a later poll.
+        if (delivered and !process.degraded) self.foreground_tracker.commit(process.pid);
+    }
+
+    fn hasEventSink(self: *NativeSession) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.event_sink != null;
     }
 
     // -- Event sink -------------------------------------------------------
 
-    fn emitEvent(self: *NativeSession, event: Event) void {
+    /// Returns false when no sink was installed, so nothing was delivered.
+    fn emitEvent(self: *NativeSession, event: Event) bool {
         self.mutex.lockUncancelable(self.io);
         const sink = self.event_sink orelse {
             self.mutex.unlock(self.io);
-            return;
+            return false;
         };
         // Counted before unlocking, so `clearEventSink` either sees the sink
         // already null here or waits for this callback to return.
@@ -721,6 +785,7 @@ pub const NativeSession = struct {
         self.in_flight -= 1;
         if (self.in_flight == 0) self.emit_idle.broadcast(self.io);
         self.mutex.unlock(self.io);
+        return true;
     }
 
     /// Replace the sink. Passing null from any thread other than the reader
@@ -746,6 +811,15 @@ pub const NativeSession = struct {
         defer self.mutex.unlock(self.io);
         self.event_sink = null;
         while (self.in_flight != 0) self.emit_idle.waitUncancelable(self.io, &self.mutex);
+    }
+
+    /// Remove the sink without waiting: no new callback starts, but one that
+    /// is already running may finish after this returns. For callers that
+    /// hold a lock the sink itself may take.
+    pub fn dropEventSink(self: *NativeSession) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.event_sink = null;
     }
 
     fn nowMs(self: *NativeSession) i64 {
@@ -1691,6 +1765,43 @@ test "terminate hangs up foreground and background jobs of an interactive shell"
     try std.testing.expect(waitUntilGone(fg_pgid, 3_000));
     try std.testing.expect(waitUntilGone(bg_pid, 3_000));
     try std.testing.expect(!processExists(shell_pid));
+}
+
+test "terminate lets a HUP trap finish before SIGTERM follows" {
+    if (!supported_os) return error.SkipZigTest;
+
+    // Regression: SIGTERM used to be sent in the same instant as SIGHUP, so
+    // a job with a HUP handler died of SIGTERM before the handler ran.
+    var rec: Recorder = .{};
+    defer rec.deinit();
+    const native = try testCreate(&rec, "trap 'echo TRAPPED; exit 3' HUP; echo ready; while :; do sleep 1; done", .{});
+    defer native.destroy();
+    try rec.waitForOutput("ready", 10_000);
+
+    native.terminate();
+    try rec.waitForExit(10_000);
+    try std.testing.expect(rec.outputContains("TRAPPED"));
+    try std.testing.expectEqual(@as(?u32, 3), rec.exit_code);
+    try std.testing.expectEqual(@as(?u32, null), rec.exit_signal);
+}
+
+test "terminate escalates to SIGTERM when SIGHUP is ignored" {
+    if (!supported_os) return error.SkipZigTest;
+
+    var rec: Recorder = .{};
+    defer rec.deinit();
+    const native = try testCreate(&rec, "trap '' HUP; echo ready; exec sleep 100", .{});
+    defer native.destroy();
+    try rec.waitForOutput("ready", 10_000);
+    // `exec` replaced the shell; give it a moment to be the sleep.
+    sys.sleepMs(50);
+
+    const started = sys.monotonicMs();
+    native.terminate();
+    try rec.waitForExit(10_000);
+    // SIGTERM (15) arrived after the HUP grace and before the SIGKILL deadline.
+    try std.testing.expectEqual(@as(?u32, 15), rec.exit_signal);
+    try std.testing.expect(sys.monotonicMs() - started >= hangup_grace_ms);
 }
 
 test "destroy terminates a running child and joins the reader" {

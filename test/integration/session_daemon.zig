@@ -3121,6 +3121,97 @@ test "client resolves relative socket against its working directory" {
     try endDaemon(&daemon, dir.socket);
 }
 
+fn spawnDaemonIn(dir: TestDir, home: ?[]const u8, env: *std.process.Environ.Map) !std.process.Child {
+    const binary = try std.Io.Dir.cwd().realPathFileAlloc(io, build_options.zmuxd_path, test_allocator);
+    defer test_allocator.free(binary);
+    try env.put("PATH", "/usr/bin:/bin");
+    if (home) |value| try env.put("HOME", value);
+    return std.process.spawn(io, .{
+        .argv = &.{ binary, "--socket", dir.socket, "--idle-seconds", "0" },
+        .cwd = .{ .path = dir.path },
+        .environ_map = env,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+}
+
+fn expectPaneStartsIn(dir: TestDir, admin: *Connection, id: i64, name: []const u8, expected: []const u8) !void {
+    const command = try std.fmt.allocPrint(test_allocator, "pwd -P > '{s}/{s}'", .{ dir.path, name });
+    defer test_allocator.free(command);
+    (try rpcOk(admin, id, "session.create", .{ .id = name, .shell = "/bin/sh", .command = command })).deinit();
+    const line = try std.fmt.allocPrint(test_allocator, "{s}\n", .{expected});
+    defer test_allocator.free(line);
+    try waitForFile(dir, name, line, 4_000);
+    const directory = try std.Io.Dir.openDirAbsolute(io, dir.path, .{});
+    defer directory.close(io);
+    const bytes = try directory.readFileAlloc(io, name, test_allocator, .limited(4096));
+    defer test_allocator.free(bytes);
+    try std.testing.expectEqualStrings(line, bytes);
+}
+
+test "daemon_leaves_launcher_cwd: panes start in HOME, else in /" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+
+    // No HOME: a pane without `cwd` inherits the daemon's directory, which is
+    // `/` and not the directory the daemon was launched from.
+    {
+        var env = std.process.Environ.Map.init(test_allocator);
+        defer env.deinit();
+        var daemon = try spawnDaemonIn(dir, null, &env);
+        defer killChild(&daemon);
+        try waitForSocket(dir.socket, 4_000);
+        var admin = try connectClient(dir.socket);
+        defer admin.close();
+        try expectPaneStartsIn(dir, &admin, 1, "where-root", "/");
+        try endDaemon(&daemon, dir.socket);
+    }
+
+    // HOME set: that is the default; an explicit `cwd` still wins.
+    {
+        const home = try std.fs.path.join(test_allocator, &.{ dir.path, "home" });
+        defer test_allocator.free(home);
+        try sys.mkdir(home, 0o700);
+        var env = std.process.Environ.Map.init(test_allocator);
+        defer env.deinit();
+        var daemon = try spawnDaemonIn(dir, home, &env);
+        defer killChild(&daemon);
+        try waitForSocket(dir.socket, 4_000);
+        var admin = try connectClient(dir.socket);
+        defer admin.close();
+        try expectPaneStartsIn(dir, &admin, 1, "where-home", home);
+
+        const command = try std.fmt.allocPrint(test_allocator, "pwd -P > '{s}/where-explicit'", .{dir.path});
+        defer test_allocator.free(command);
+        (try rpcOk(&admin, 2, "session.create", .{ .id = "explicit", .shell = "/bin/sh", .command = command, .cwd = dir.path })).deinit();
+        const expected = try std.fmt.allocPrint(test_allocator, "{s}\n", .{dir.path});
+        defer test_allocator.free(expected);
+        try waitForFile(dir, "where-explicit", expected, 4_000);
+        try endDaemon(&daemon, dir.socket);
+    }
+}
+
+test "connect_created_session_starts_in_client_cwd" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+    var daemon = try spawnDaemon(dir.socket);
+    defer killChild(&daemon);
+    try waitForSocket(dir.socket, 4_000);
+
+    const work = try std.fs.path.join(test_allocator, &.{ dir.path, "work" });
+    defer test_allocator.free(work);
+    try sys.mkdir(work, 0o700);
+    const input = try std.fmt.allocPrint(test_allocator, "pwd -P > '{s}/where-client'; exit 0\n", .{dir.path});
+    defer test_allocator.free(input);
+    try runClientWithInputIn(dir, "here", input, work);
+
+    const expected = try std.fmt.allocPrint(test_allocator, "{s}\n", .{work});
+    defer test_allocator.free(expected);
+    try waitForFile(dir, "where-client", expected, 4_000);
+    try endDaemon(&daemon, dir.socket);
+}
+
 test "relative_socket_no_panic" {
     const dir = try TestDir.init();
     defer dir.deinit();
@@ -3248,6 +3339,13 @@ test "notification_gets_no_reply, nested_id_rejected_daemon_survives, unterminat
 }
 
 fn runClientWithInput(dir: TestDir, name: []const u8, input: []const u8) !void {
+    return runClientWithInputIn(dir, name, input, null);
+}
+
+/// `cwd`: the client's working directory; null keeps the test runner's.
+fn runClientWithInputIn(dir: TestDir, name: []const u8, input: []const u8, cwd: ?[]const u8) !void {
+    const binary = try std.Io.Dir.cwd().realPathFileAlloc(io, build_options.zmux_connect_path, test_allocator);
+    defer test_allocator.free(binary);
     const directory = try std.Io.Dir.openDirAbsolute(io, dir.path, .{});
     defer directory.close(io);
     try directory.writeFile(io, .{ .sub_path = "stdin", .data = input });
@@ -3258,7 +3356,8 @@ fn runClientWithInput(dir: TestDir, name: []const u8, input: []const u8) !void {
     const stderr = try directory.createFile(io, "stderr", .{});
     defer stderr.close(io);
     var client = try std.process.spawn(io, .{
-        .argv = &.{ "/bin/sh", "-c", "cat \"$1\" | \"$2\" --socket \"$3\" -- \"$4\"", "zmux-test", input_path, build_options.zmux_connect_path, dir.socket, name },
+        .argv = &.{ "/bin/sh", "-c", "cat \"$1\" | \"$2\" --socket \"$3\" -- \"$4\"", "zmux-test", input_path, binary, dir.socket, name },
+        .cwd = if (cwd) |path| .{ .path = path } else .inherit,
         .pgid = 0,
         .stdin = .ignore,
         .stdout = .{ .file = stdout },

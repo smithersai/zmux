@@ -204,7 +204,7 @@ fn runMain(init: std.process.Init) !void {
     const socket_fd = try connectWithRetry(allocator, io, path, parsed.spawn_daemon);
     defer sys.close(socket_fd);
     var reader: LineReader = .{};
-    defer deinitReader(&reader);
+    defer reader.deinit();
 
     try warnOnVersionMismatch(allocator, &reader, socket_fd, .fromNow(io, version_handshake_timeout_ms));
 
@@ -310,7 +310,16 @@ fn attachOrCreate(
     command: ?[]const u8,
     deadline: Deadline,
 ) !Response {
-    const create = if (auto_create) CreateParams{ .id = target, .rows = size.rows, .cols = size.cols, .command = command } else null;
+    // A new session starts in this client's working directory, not in the
+    // daemon's.
+    var cwd_buf: [posix.PATH_MAX]u8 = undefined;
+    const create = if (auto_create) CreateParams{
+        .id = target,
+        .rows = size.rows,
+        .cols = size.cols,
+        .command = command,
+        .cwd = currentDirectory(&cwd_buf),
+    } else null;
     const response = try sendAttach(allocator, reader, fd, target, size, create, attach_rpc_id, deadline);
     if (create) |params| {
         if (response.rpcError()) |rpc_err| {
@@ -333,7 +342,17 @@ const CreateParams = struct {
     rows: u16,
     cols: u16,
     command: ?[]const u8,
+    cwd: ?[]const u8 = null,
 };
+
+/// The working directory, or null when it is unavailable (removed, or
+/// unreadable) or not valid UTF-8 for a JSON string.
+fn currentDirectory(buf: *[posix.PATH_MAX]u8) ?[]const u8 {
+    const ptr = std.c.getcwd(buf, buf.len) orelse return null;
+    const cwd = std.mem.sliceTo(@as([*:0]u8, @ptrCast(ptr)), 0);
+    if (cwd.len == 0 or cwd[0] != '/' or !std.unicode.utf8ValidateSlice(cwd)) return null;
+    return cwd;
+}
 
 fn sendAttach(
     allocator: std.mem.Allocator,
@@ -436,10 +455,6 @@ fn exchange(
         error.ReadTimeout => return diagnostic(deadline.io, "timed out waiting for {s}", .{operation}),
         else => return err,
     };
-}
-
-fn deinitReader(reader: *LineReader) void {
-    if (@hasDecl(LineReader, "deinit")) reader.deinit();
 }
 
 fn readRpcResponse(allocator: std.mem.Allocator, reader: *LineReader, fd: posix.fd_t, expected_id: u32, deadline: Deadline) !Response {
@@ -625,7 +640,7 @@ fn runVerb(
     defer sys.close(socket_fd);
 
     var reader: LineReader = .{};
-    defer deinitReader(&reader);
+    defer reader.deinit();
     try executeVerb(
         allocator,
         socket_fd,
@@ -870,8 +885,6 @@ fn runLoop(
     var outbound: WriteQueue = .{};
     defer outbound.bytes.deinit(allocator);
 
-    var partial: std.ArrayList(u8) = .empty;
-    defer partial.deinit(allocator);
     var partial_since: ?i64 = null;
     var pending_output: ?[]u8 = null;
     defer if (pending_output) |bytes| allocator.free(bytes);
@@ -886,30 +899,18 @@ fn runLoop(
     while (true) {
         if (pending_output == null and eof_outcome == null) {
             while (reader.hasBufferedLine()) {
-                const line = (try reader.nextBufferedLineAlloc(allocator, rpc_line_max - partial.items.len)).?;
+                const line = (try reader.nextBufferedLineAlloc(allocator, rpc_line_max)).?;
                 defer allocator.free(line);
-                const full_line = if (partial.items.len == 0) line else blk: {
-                    try partial.appendSlice(allocator, line);
-                    break :blk partial.items;
-                };
-                eof_outcome = try handleServerLine(allocator, full_line, &state, &pending_output, options.io);
-                partial.clearRetainingCapacity();
+                eof_outcome = try handleServerLine(allocator, line, &state, &pending_output, options.io);
                 partial_since = null;
                 if (pending_output != null or eof_outcome != null) break;
             }
-            // The reader's staging buffer is fixed-size. Spill only when it
-            // fills before a newline so large frames never block the loop.
+            // The reader's staging buffer is fixed-size. Move a partial frame
+            // into the reader's heap buffer so large frames never block the
+            // loop; the reader joins it with the rest of the line.
             if (pending_output == null and eof_outcome == null and reader.end > reader.start) {
                 if (partial_since == null) partial_since = sys.monotonicMs();
-                if (@hasDecl(LineReader, "deinit")) {
-                    // The final LineReader retains partial frames itself.
-                    _ = try reader.nextBufferedLineAlloc(allocator, rpc_line_max);
-                } else if (reader.end - reader.start == reader.buffer.len) {
-                    if (partial.items.len + reader.buffer.len >= rpc_line_max) return error.MessageTooLarge;
-                    try partial.appendSlice(allocator, reader.buffer[reader.start..reader.end]);
-                    reader.start = 0;
-                    reader.end = 0;
-                }
+                _ = try reader.nextBufferedLineAlloc(allocator, rpc_line_max);
             }
         }
 
@@ -1648,7 +1649,7 @@ test "RPC reads match numeric ids and accept null-id capacity errors" {
         "{\"id\":2,\"result\":{\"name\":\"error\"}}\n" ++
         "{\"id\":null,\"error\":{\"code\":-32000,\"message\":\"LimitExceeded\",\"data\":{\"kind\":\"limit\"}}}\n");
     var reader: LineReader = .{};
-    defer deinitReader(&reader);
+    defer reader.deinit();
     const deadline = Deadline.fromNow(test_io, 500);
     const success = try readRpcResponse(alloc, &reader, pair[0], 2, deadline);
     defer success.deinit(alloc);
@@ -1665,7 +1666,7 @@ test "RPC read has an absolute timeout" {
     defer sys.close(fds[0]);
     defer sys.close(fds[1]);
     var reader: LineReader = .{};
-    defer deinitReader(&reader);
+    defer reader.deinit();
     try std.testing.expectError(error.ReadTimeout, readRpcResponse(std.testing.allocator, &reader, fds[0], 1, .fromNow(test_io, 20)));
 }
 
@@ -1676,7 +1677,7 @@ test "attach sends createIfMissing in one frame and parses whitespace in replay"
     defer sys.close(pair[1]);
     try sys.sendAll(pair[1], "{\"id\":1,\"result\":{\"paneId\":\"pane-1\",\"clientId\":\"client-1\",\"title\":\"error\",\"replayBase64\" : \"aGVsbG8=\"}}\n");
     var reader: LineReader = .{};
-    defer deinitReader(&reader);
+    defer reader.deinit();
     const deadline = Deadline.fromNow(test_io, 500);
     const response = try attachOrCreate(alloc, &reader, pair[0], "error", .{ .rows = 24, .cols = 80 }, true, "echo hi", deadline);
     defer response.deinit(alloc);
@@ -1684,7 +1685,7 @@ test "attach sends createIfMissing in one frame and parses whitespace in replay"
     defer alloc.free(replay);
     try std.testing.expectEqualStrings("hello", replay);
     var request_reader: LineReader = .{};
-    defer deinitReader(&request_reader);
+    defer request_reader.deinit();
     const request = try request_reader.readLineAllocTimeout(alloc, test_io, pair[1], rpc_line_max, deadline.timeout());
     defer alloc.free(request);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, request, .{});
@@ -1701,7 +1702,7 @@ test "attach requires both canonical IDs" {
     defer sys.close(pair[1]);
     try sys.sendAll(pair[1], "{\"id\":1,\"result\":{\"paneId\":\"pane-1\"}}\n");
     var reader: LineReader = .{};
-    defer deinitReader(&reader);
+    defer reader.deinit();
     try std.testing.expectError(error.InvalidResponse, attachOrCreate(alloc, &reader, pair[0], "work", .{ .rows = 24, .cols = 80 }, true, null, .fromNow(test_io, 500)));
 }
 
@@ -1745,7 +1746,7 @@ test "run loop drains frames already buffered behind the RPC response" {
     try sys.sendAll(pair[1], frames);
     _ = c.shutdown(pair[1], 1);
     var reader: LineReader = .{};
-    defer deinitReader(&reader);
+    defer reader.deinit();
     const response = try readRpcResponse(alloc, &reader, pair[0], 1, .fromNow(test_io, 500));
     defer response.deinit(alloc);
     try std.testing.expect(reader.hasBufferedLine());
@@ -1778,7 +1779,7 @@ test "run loop completes a frame larger than the line reader staging buffer" {
     try sys.sendAll(pair[1], frame);
     _ = c.shutdown(pair[1], 1);
     var reader: LineReader = .{};
-    defer deinitReader(&reader);
+    defer reader.deinit();
     try std.testing.expectEqual(RunOutcome.session_ended, try runLoop(
         input[0],
         1,
@@ -1800,7 +1801,7 @@ test "run loop sends detach while a partial frame is pending" {
     try sys.sendAll(pair[1], "{");
     try sys.writeAll(input[1], "a\x1c");
     var reader: LineReader = .{};
-    defer deinitReader(&reader);
+    defer reader.deinit();
     try std.testing.expectEqual(RunOutcome.detached, try runLoop(
         input[0],
         1,
@@ -1810,7 +1811,7 @@ test "run loop sends detach while a partial frame is pending" {
         .{ .pane_id = "p", .client_id = "c", .detach_key = default_detach_key, .io = test_io },
     ));
     var requests: LineReader = .{};
-    defer deinitReader(&requests);
+    defer requests.deinit();
     const deadline = Deadline.fromNow(test_io, 500);
     const send = try requests.readLineAllocTimeout(alloc, test_io, pair[1], rpc_line_max, deadline.timeout());
     defer alloc.free(send);
@@ -1840,7 +1841,7 @@ test "management JSON prints the complete null-id error envelope and fails" {
     const response = "{\"id\":null,\"error\":{\"message\":\"LimitExceeded\",\"data\":{\"kind\":\"limit\"}}}\n";
     try sys.sendAll(pair[1], response);
     var reader: LineReader = .{};
-    defer deinitReader(&reader);
+    defer reader.deinit();
     try std.testing.expectError(error.RpcError, executeVerb(alloc, pair[0], &reader, .list, null, null, true, out[1], .fromNow(test_io, 500)));
     var bytes: [response.len]u8 = undefined;
     try std.testing.expectEqual(response.len, try posix.read(out[0], &bytes));
@@ -1863,7 +1864,7 @@ test "legacy create fallback branches on kind, independent of the message" {
         "{\"id\":2,\"result\":{\"paneId\":\"p\"}}\n" ++
         "{\"id\":3,\"result\":{\"paneId\":\"p\",\"clientId\":\"c\"}}\n");
     var reader: LineReader = .{};
-    defer deinitReader(&reader);
+    defer reader.deinit();
     const response = try attachOrCreate(
         allocator,
         &reader,

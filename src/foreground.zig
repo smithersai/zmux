@@ -53,27 +53,17 @@ pub const Tracker = struct {
         self.last_pgid = pgid;
     }
 
-    /// Deprecated: use `observe` and `commit`. Removed by T1 after T2 lands.
-    /// Commits immediately and suppresses the shell group, the v0.3.0
-    /// behavior that `poll` still relies on.
-    pub fn shouldEmitForPgid(self: *Tracker, pgid: posix.pid_t) bool {
-        if (pgid <= 0) return false;
-        if (self.last_pgid) |last| {
-            if (last == pgid) return false;
-        }
-        self.last_pgid = pgid;
-        return pgid != self.shell_pid;
-    }
-
-    /// Report the PTY's foreground process group leader when it changed since
-    /// the last call and is not the shell itself. `io` is used to read
-    /// `/proc` on Linux.
+    /// Report the PTY's foreground process group leader when it differs from
+    /// the last committed group. Nothing is recorded: the caller calls
+    /// `commit(info.pid)` after it delivered the result, and skips the commit
+    /// for a `degraded` result so a later poll retries the lookup. `io` is
+    /// used to read `/proc` on Linux.
     pub fn poll(self: *Tracker, allocator: Allocator, io: std.Io, master_fd: posix.fd_t) !?ProcessInfo {
         const pgid = terminalForegroundPgrp(master_fd) catch |err| switch (err) {
             error.NotATerminal => return null,
             else => return err,
         };
-        if (!self.shouldEmitForPgid(pgid)) return null;
+        if (!self.observe(pgid)) return null;
         return try resolveProcessInfo(allocator, io, pgid);
     }
 };
@@ -430,11 +420,6 @@ pub fn parseProcArgs(allocator: Allocator, buffer: []const u8, fallback_path: []
     return .{ .argv = try argv.toOwnedSlice(allocator), .truncated = truncated };
 }
 
-/// `parseProcArgs` without the truncation flag (fuzz and bench entry point).
-pub fn parseProcArgsBuffer(allocator: Allocator, buffer: []const u8, fallback_path: []const u8) Allocator.Error![][]u8 {
-    return (try parseProcArgs(allocator, buffer, fallback_path)).argv;
-}
-
 fn fallbackArgv(allocator: Allocator, fallback_path: []const u8) Allocator.Error![][]u8 {
     if (fallback_path.len == 0) return allocator.alloc([]u8, 0);
 
@@ -480,16 +465,6 @@ fn pgrpFromErrno(rc: c_int, e: posix.E) (ForegroundPgrpError || error{Interrupte
     };
 }
 
-test "tracker deduplicates shell foreground and repeated pgids" {
-    var tracker = Tracker.init(100);
-    try std.testing.expect(!tracker.shouldEmitForPgid(100));
-    try std.testing.expect(!tracker.shouldEmitForPgid(100));
-    try std.testing.expect(tracker.shouldEmitForPgid(200));
-    try std.testing.expect(!tracker.shouldEmitForPgid(200));
-    try std.testing.expect(!tracker.shouldEmitForPgid(100));
-    try std.testing.expect(tracker.shouldEmitForPgid(300));
-}
-
 test "parse proc args buffer extracts argv after exec path" {
     var buffer: [128]u8 = @splat(0);
     std.mem.writeInt(u32, buffer[0..4], 3, builtin.cpu.arch.endian());
@@ -506,8 +481,10 @@ test "parse proc args buffer extracts argv after exec path" {
     @memcpy(buffer[offset .. offset + "--short".len], "--short");
     offset += "--short".len + 1;
 
-    const argv = try parseProcArgsBuffer(std.testing.allocator, buffer[0..offset], "/bin/zsh");
+    const parsed = try parseProcArgs(std.testing.allocator, buffer[0..offset], "/bin/zsh");
+    const argv = parsed.argv;
     defer freeArgv(std.testing.allocator, argv);
+    try std.testing.expect(!parsed.truncated);
 
     try std.testing.expectEqual(@as(usize, 3), argv.len);
     try std.testing.expectEqualStrings("git", argv[0]);
