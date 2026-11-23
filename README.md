@@ -208,7 +208,7 @@ Drive the same daemon programmatically — every method is JSON-RPC 2.0:
 ```sh
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"daemon.ping"}' \
   | nc -U /tmp/zmux.sock
-# {"jsonrpc":"2.0","id":1,"result":{"version":"0.2.0","pid":12345,"socketPath":"/tmp/zmux.sock","sessions":0,"panes":0}}
+# {"jsonrpc":"2.0","id":1,"result":{"version":"0.2.1","pid":12345,"socketPath":"/tmp/zmux.sock","sessions":0,"panes":0}}
 ```
 
 The socket protocol is one JSON document per physical line, terminated by

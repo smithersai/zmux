@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1] - 2026-11-22
+
+### Fixed
+
+- Fixed Linux `createPrivateSocketParent` for Zig 0.15.2 consumers. Opening the
+  directory without `O_PATH` lets `fchmod` enforce mode `0700` under `umask 0022`.
+
 ## [0.2.0] - 2026-11-22
 
 ### Added

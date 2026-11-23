@@ -1039,20 +1039,24 @@ fn ensureSocketParent(socket_path: []const u8) !void {
 /// (0700), self-owned, non-symlink directory. Only used for the fallback paths
 /// zmux itself creates.
 fn createPrivateSocketParent(parent: []const u8) !void {
-    std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+    posix.mkdir(parent, 0o700) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
 
-    {
-        var dir = try std.fs.openDirAbsolute(parent, .{});
-        defer dir.close();
-        _ = std.c.fchmod(dir.fd, 0o700);
-    }
+    // On Linux, iterate avoids O_PATH, which fchmod cannot use.
+    var dir = try std.fs.openDirAbsolute(parent, .{ .iterate = true, .no_follow = true });
+    defer dir.close();
 
-    const stat = try posix.fstatat(posix.AT.FDCWD, parent, posix.AT.SYMLINK_NOFOLLOW);
-    if ((stat.mode & std.posix.S.IFMT) != std.posix.S.IFDIR) return error.NotDir;
-    if (stat.uid != posix.geteuid()) return error.PermissionDenied;
+    const opened = try posix.fstat(dir.fd);
+    const uid = posix.geteuid();
+    if (opened.uid != uid) return error.PermissionDenied;
+    try posix.fchmod(dir.fd, 0o700);
+
+    const stat = try socketPathStat(parent);
+    if ((stat.mode & posix.S.IFMT) != posix.S.IFDIR) return error.NotDir;
+    if (stat.dev != opened.dev or stat.ino != opened.ino) return error.PermissionDenied;
+    if (stat.uid != uid) return error.PermissionDenied;
     if ((stat.mode & 0o7777) != 0o700) return error.PermissionDenied;
 }
 
@@ -1576,6 +1580,26 @@ test "new socket parent is private" {
     defer allocator.free(socket_path);
 
     try ensureSocketParent(socket_path);
+    try std.testing.expectEqual(@as(u32, 0o700), try dirMode(parent));
+}
+
+test "private socket parent is 0700 under umask 0022" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const parent = try tempPath(allocator, "zmx-parent-umask022");
+    defer allocator.free(parent);
+    defer std.fs.deleteTreeAbsolute(parent) catch {};
+
+    const original_umask = std.c.umask(0o022);
+    defer _ = std.c.umask(original_umask);
+
+    try createPrivateSocketParent(parent);
+    try std.testing.expectEqual(@as(u32, 0o700), try dirMode(parent));
+
+    // Also exercise fchmod if the directory already exists with wider permissions.
+    try chmodAbsolute(allocator, parent, 0o755);
+    try createPrivateSocketParent(parent);
     try std.testing.expectEqual(@as(u32, 0o700), try dirMode(parent));
 }
 
