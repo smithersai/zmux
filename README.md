@@ -90,7 +90,9 @@ live processes alive across an operating-system reboot.
 
 ### Prebuilt binaries
 
-GitHub Releases publish tarballs for:
+Starting with v0.2.0, GitHub Releases ship `.tar.gz` archives with matching
+`.sha256` checksums for all four targets below. v0.1.0 shipped raw binaries
+for linux-x64 and macos-arm64.
 
 | Asset | Target |
 |-------|--------|
@@ -206,7 +208,7 @@ Drive the same daemon programmatically — every method is JSON-RPC 2.0:
 ```sh
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"daemon.ping"}' \
   | nc -U /tmp/zmux.sock
-# {"jsonrpc":"2.0","id":1,"result":{"version":"0.1.0","pid":12345,"socketPath":"/tmp/zmux.sock","sessions":0,"panes":0}}
+# {"jsonrpc":"2.0","id":1,"result":{"version":"0.2.0","pid":12345,"socketPath":"/tmp/zmux.sock","sessions":0,"panes":0}}
 ```
 
 The socket protocol is one JSON document per physical line, terminated by
@@ -234,6 +236,14 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"session.create","params":{"id":
 | 3 | `$XDG_RUNTIME_DIR/smithers-sessions.sock` |
 | 4 | `$HOME/.smithers/sessions.sock` |
 | 5 | `/tmp/zmux-<uid>/sessions.sock` when `HOME` is unset |
+
+Unix socket paths are limited to 103 bytes on macOS and 107 bytes on Linux.
+If the resolved path is too long, choose a shorter path with `--socket` or
+`ZMUX_SOCKET`.
+
+Set the verbosity of structured daemon diagnostics on stderr with
+`zmuxd --log-level <error|warn|info|debug>` or the `ZMUX_LOG_LEVEL` environment
+variable. The default is `warn`.
 
 The daemon writes an advisory pid file at `<socket>.pid` and uses
 `<socket>.lock` for startup locking. A second daemon started against a live
@@ -277,7 +287,7 @@ Top-level modules:
 | `zmux.pty` | Low-level `openpty(3)` plus manual fork/exec PTY child spawning |
 | `zmux.protocol` | JSON-RPC framing, error codes, version |
 | `zmux.buffer` | Bounded ring buffer for scrollback |
-| `zmux.foreground` | Foreground-process detection: full comm/argv on macOS, pid-only fallback elsewhere |
+| `zmux.foreground` | Foreground-process detection: full comm/argv on macOS and Linux, pid-only fallback on other platforms |
 | `zmux.connect` | Client implementation (raw mode, SIGWINCH) |
 
 ## Protocol
@@ -310,8 +320,10 @@ use snake_case params. `mux.snapshot` pane alerts expose `activity`, `bell`,
 | `foreground_changed` | `session_id`, `pid`, `comm`, `argv` | Pane's foreground process changed |
 
 On macOS, `foreground_changed.comm` and `argv` come from platform process
-inspection. On Linux and other platforms, `pid` is the useful value;
-`comm` is a `pid-<n>` placeholder and `argv` is empty.
+inspection. On Linux, they come from `/proc/<pid>/comm` and
+`/proc/<pid>/cmdline`, respectively. On other platforms, the notification
+falls back to the process ID, with a `pid-<n>` placeholder for `comm` and an
+empty `argv`.
 
 ### Errors
 

@@ -45,7 +45,11 @@ test "README documents current public wire and lifecycle behavior" {
     try std.testing.expect(std.mem.indexOf(u8, readme, "`pane_activity` | `pane_id`, `last_activity_ms`") != null);
     try std.testing.expect(std.mem.indexOf(u8, readme, "`getpeereid(3)` / `LOCAL_PEERCRED`") != null);
     try std.testing.expect(std.mem.indexOf(u8, readme, "manual fork/exec PTY child spawning") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "pid-only fallback elsewhere") != null);
+    try std.testing.expect(std.mem.indexOf(u8, readme, "full comm/argv on macOS and Linux, pid-only fallback on other platforms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, readme, "`/proc/<pid>/comm`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, readme, "`/proc/<pid>/cmdline`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, readme, "--log-level <error|warn|info|debug>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, readme, "\"version\":\"0.2.0\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, readme, "zmuxd-linux-arm64.tar.gz") != null);
     try std.testing.expect(std.mem.indexOf(u8, readme, ".sha256") != null);
     try std.testing.expect(std.mem.indexOf(u8, readme, "$ZMUX_SOCKET") != null);
