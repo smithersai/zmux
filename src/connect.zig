@@ -1659,15 +1659,15 @@ fn handleServerLineFast(
             if (!std.mem.eql(u8, actual_pane_id, pane_id)) return false;
             const encoded = param_data_b64_camel orelse param_data_b64 orelse return false;
             const decoder = std.base64.standard.Decoder;
-            const decoded_len = try decoder.calcSizeForSlice(encoded);
+            const decoded_len = decoder.calcSizeForSlice(encoded) catch return false;
             var stack_buf: [64 * 1024]u8 = undefined;
             if (decoded_len <= stack_buf.len) {
-                try decoder.decode(stack_buf[0..decoded_len], encoded);
+                decoder.decode(stack_buf[0..decoded_len], encoded) catch return false;
                 try writeAllFd(stdout_fd, stack_buf[0..decoded_len]);
             } else {
                 const decoded = try allocator.alloc(u8, decoded_len);
                 defer allocator.free(decoded);
-                try decoder.decode(decoded, encoded);
+                decoder.decode(decoded, encoded) catch return false;
                 try writeAllFd(stdout_fd, decoded);
             }
             return false;
@@ -2202,6 +2202,48 @@ test "handleServerLine exits only for matching session exit notification" {
 
     try std.testing.expect(try handleServerLine(std.testing.allocator, matching, "pane-1", @as(posix.fd_t, -1)));
     try std.testing.expect(!try handleServerLine(std.testing.allocator, other, "pane-1", @as(posix.fd_t, -1)));
+}
+
+test "handleServerLine ignores corrupt base64 on every parse path without erroring" {
+    // Each frame targets a different path: canonical wire prefix, scanner
+    // (reordered keys / camelCase), and DOM fallback (escaped key). All must
+    // return false rather than surface a base64 decode error to the run loop.
+    const frames = [_][]const u8{
+        "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{\"pane_id\":\"pane-1\",\"data_base64\":\"!!!not-valid-b64!!!\"}}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{\"pane_id\":\"pane-1\",\"data_base64\":\"abc\"}}\n",
+        "{\"method\":\"pane_output\",\"jsonrpc\":\"2.0\",\"params\":{\"dataBase64\":\"=\",\"paneId\":\"pane-1\"}}\n",
+        "{\"method\":\"pane_output\",\"params\":{\"pane_\\u0069d\":\"pane-1\",\"data_base64\":\"a\"}}\n",
+    };
+    for (frames) |frame| {
+        try std.testing.expect(!try handleServerLine(std.testing.allocator, frame, "pane-1", @as(posix.fd_t, -1)));
+    }
+}
+
+test "handleServerLine fast paths match the DOM fallback on valid and escaped frames" {
+    const frames = [_][]const u8{
+        "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{\"pane_id\":\"pane-1\",\"data_base64\":\"aGVsbG8=\"}}\n",
+        "{\"method\":\"pane_output\",\"params\":{\"paneId\":\"pane-1\",\"dataBase64\":\"aGVsbG8=\"},\"jsonrpc\":\"2.0\"}\n",
+        "{\"method\":\"pane_\\u006futput\",\"params\":{\"pane_id\":\"pane-1\",\"data_base64\":\"aGVsbG8=\"}}\n",
+    };
+    for (frames) |frame| {
+        const fast_fds = try sys.pipe();
+        defer sys.close(fast_fds[0]);
+        const slow_fds = try sys.pipe();
+        defer sys.close(slow_fds[0]);
+
+        const fast_exit = try handleServerLine(std.testing.allocator, frame, "pane-1", fast_fds[1]);
+        sys.close(fast_fds[1]);
+        const slow_exit = try handleServerLineFallback(std.testing.allocator, frame, "pane-1", slow_fds[1]);
+        sys.close(slow_fds[1]);
+        try std.testing.expectEqual(slow_exit, fast_exit);
+
+        var fast_buf: [64]u8 = undefined;
+        var slow_buf: [64]u8 = undefined;
+        const fast_n = try sys.read(fast_fds[0], &fast_buf);
+        const slow_n = try sys.read(slow_fds[0], &slow_buf);
+        try std.testing.expectEqualStrings(slow_buf[0..slow_n], fast_buf[0..fast_n]);
+        try std.testing.expectEqualStrings("hello", fast_buf[0..fast_n]);
+    }
 }
 
 test "replayScrollbackFromAttach decodes replay bytes" {

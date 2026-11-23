@@ -433,8 +433,8 @@ pub const NativeSession = struct {
         self.emitEvent(.{ .session_exited = .{
             .session_id = self.id,
             .pid = pid,
-            .exit_code = if (status) |value| if (std.posix.W.IFEXITED(value)) std.posix.W.EXITSTATUS(value) else null else null,
-            .signal = if (status) |value| if (std.posix.W.IFSIGNALED(value)) @backingInt(std.posix.W.TERMSIG(value)) else null else null,
+            .exit_code = if (status) |value| exitCodeOf(value) else null,
+            .signal = if (status) |value| termSignalOf(value) else null,
         } });
     }
 
@@ -448,9 +448,26 @@ pub const NativeSession = struct {
     }
 };
 
+/// Exit code of a `waitpid(2)` status word, or null if the child did not exit
+/// normally. Masks explicitly (like C's `WEXITSTATUS`) rather than calling
+/// `std.posix.W.EXITSTATUS`, whose Darwin implementation `@intCast`s
+/// `status >> 8` to `u8` and panics on any status with bits above 16 set.
+pub fn exitCodeOf(status: u32) ?u32 {
+    if (!std.posix.W.IFEXITED(status)) return null;
+    return (status >> 8) & 0xff;
+}
+
+/// Terminating signal number of a `waitpid(2)` status word, or null if the
+/// child was not killed by a signal. Returns the raw number so unknown signal
+/// values never trip an exhaustive-enum conversion.
+pub fn termSignalOf(status: u32) ?u32 {
+    if (!std.posix.W.IFSIGNALED(status)) return null;
+    return status & 0x7f;
+}
+
 pub fn decodedExitStatus(status: u32) u32 {
-    if (std.posix.W.IFEXITED(status)) return std.posix.W.EXITSTATUS(status);
-    if (std.posix.W.IFSIGNALED(status)) return @backingInt(std.posix.W.TERMSIG(status));
+    if (exitCodeOf(status)) |code| return code;
+    if (termSignalOf(status)) |signal| return signal;
     return status;
 }
 
@@ -560,4 +577,11 @@ test "native session key map covers ctrl, navigation, and function keys" {
 
 test "decoded exit status unwraps waitpid status words" {
     try std.testing.expectEqual(@as(u32, 7), decodedExitStatus(7 << 8));
+    try std.testing.expectEqual(@as(?u32, 7), exitCodeOf(7 << 8));
+    try std.testing.expectEqual(@as(?u32, 9), termSignalOf(9));
+    try std.testing.expectEqual(@as(u32, 9), decodedExitStatus(9));
+    // Garbage high bits must never panic (Darwin std EXITSTATUS would).
+    try std.testing.expectEqual(@as(u32, 0x12), decodedExitStatus(0xABCD_1200));
+    try std.testing.expectEqual(@as(?u32, 0x12), exitCodeOf(0xABCD_1200));
+    try std.testing.expect(termSignalOf(0xABCD_1200) == null);
 }

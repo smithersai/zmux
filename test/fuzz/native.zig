@@ -101,14 +101,22 @@ fn fuzzStateAndExitStatus(_: void, smith: *std.testing.Smith) !void {
     try std.testing.expectEqual(expected, allowed);
     try std.testing.expect(from.label().len > 0);
 
+    // Independent reference decoding that masks like C's WEXITSTATUS/WTERMSIG
+    // (never std.posix.W.EXITSTATUS, which panics on Darwin for status >= 1<<16).
     const status = smith.value(u32);
     const decoded = native.decodedExitStatus(status);
     if (std.posix.W.IFEXITED(status)) {
-        try std.testing.expectEqual(std.posix.W.EXITSTATUS(status), decoded);
+        try std.testing.expectEqual((status >> 8) & 0xff, decoded);
+        try std.testing.expectEqual(@as(?u32, (status >> 8) & 0xff), native.exitCodeOf(status));
+        try std.testing.expect(native.termSignalOf(status) == null);
     } else if (std.posix.W.IFSIGNALED(status)) {
-        try std.testing.expectEqual(@as(u32, @backingInt(std.posix.W.TERMSIG(status))), decoded);
+        try std.testing.expectEqual(status & 0x7f, decoded);
+        try std.testing.expectEqual(@as(?u32, status & 0x7f), native.termSignalOf(status));
+        try std.testing.expect(native.exitCodeOf(status) == null);
     } else {
         try std.testing.expectEqual(status, decoded);
+        try std.testing.expect(native.exitCodeOf(status) == null);
+        try std.testing.expect(native.termSignalOf(status) == null);
     }
 }
 
