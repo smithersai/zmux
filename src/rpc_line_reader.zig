@@ -62,12 +62,12 @@ pub const LineReader = struct {
             const ready = try posix.poll(&fds, @intCast(remaining_ms));
             if (ready == 0) return error.ReadTimeout;
 
-            if ((fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0 and
+            if ((fds[0].revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0 and
                 (fds[0].revents & posix.POLL.IN) == 0)
             {
                 return error.ConnectionClosed;
             }
-            if ((fds[0].revents & posix.POLL.IN) == 0) continue;
+            if ((fds[0].revents & (posix.POLL.IN | posix.POLL.HUP)) == 0) continue;
 
             const n = posix.read(fd, self.buffer[0..]) catch |err| switch (err) {
                 error.WouldBlock => continue,
