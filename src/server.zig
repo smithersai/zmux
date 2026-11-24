@@ -95,6 +95,8 @@ const OutputMeta = struct {
     data_len: u64,
     /// Stream offset one past the last byte.
     end_offset: u64,
+    /// Pane generation; offsets restart at zero in each generation.
+    generation: u64 = 0,
 };
 
 /// One serialized notification shared by every connection it is queued on.
@@ -138,14 +140,23 @@ const PayloadQueue = struct {
     }
 
     fn push(self: *PayloadQueue, allocator: Allocator, payload: *Payload) !void {
-        if (self.len == self.items.len) {
-            const capacity = if (self.items.len == 0) 16 else self.items.len * 2;
-            const next = try allocator.alloc(*Payload, capacity);
-            for (0..self.len) |i| next[i] = self.at(i);
-            allocator.free(self.items);
-            self.items = next;
-            self.head = 0;
-        }
+        try self.reserveOne(allocator);
+        self.pushAssumeCapacity(payload);
+    }
+
+    /// Grow so the next `pushAssumeCapacity` cannot fail.
+    fn reserveOne(self: *PayloadQueue, allocator: Allocator) !void {
+        if (self.len < self.items.len) return;
+        const capacity = if (self.items.len == 0) 16 else self.items.len * 2;
+        const next = try allocator.alloc(*Payload, capacity);
+        for (0..self.len) |i| next[i] = self.at(i);
+        allocator.free(self.items);
+        self.items = next;
+        self.head = 0;
+    }
+
+    fn pushAssumeCapacity(self: *PayloadQueue, payload: *Payload) void {
+        std.debug.assert(self.len < self.items.len);
         self.items[(self.head + self.len) % self.items.len] = payload;
         self.len += 1;
     }
@@ -173,6 +184,24 @@ const DropRecord = struct {
     pane_id: []u8,
     dropped_bytes: u64,
     resume_offset: u64,
+    /// Offsets compare only within one generation.
+    generation: u64 = 0,
+};
+
+/// Sizes of one output eviction, logged after `queue_mutex` is released.
+const DropStats = struct {
+    dropped_bytes: usize = 0,
+    dropped_events: u64 = 0,
+
+    fn report(self: DropStats) void {
+        if (self.dropped_events == 0) return;
+        // Sizes only: the queued bytes are PTY output and are never logged.
+        log.warnRateLimited("client_output_dropped", &output_dropped_limiter, .{
+            .dropped_bytes = self.dropped_bytes,
+            .dropped_events = self.dropped_events,
+            .max_queued_bytes = broadcast_queue_max_bytes,
+        });
+    }
 };
 
 /// A mux client this connection attached, and the pane it currently views.
@@ -221,6 +250,9 @@ const ClientConnection = struct {
             .fd = fd,
             .server = server,
         };
+        // Deadlines come from `io`; the reader must compare them on the same
+        // clock provider.
+        if (comptime @hasField(LineReader, "io")) connection.reader.io = io;
         return connection;
     }
 
@@ -301,9 +333,17 @@ const ClientConnection = struct {
     /// new event is queued. Control notifications past their own cap return
     /// `ConnectionBacklogged`.
     fn enqueue(self: *ClientConnection, payload: *Payload) !void {
+        var stats: DropStats = .{};
+        // Logged after the queue lock is released: a stalled log sink must
+        // never block `close` or shutdown behind this connection's queue.
+        defer stats.report();
         self.queue_mutex.lockUncancelable(self.io);
         defer self.queue_mutex.unlock(self.io);
+        return self.enqueueLocked(payload, &stats);
+    }
 
+    /// Caller holds `queue_mutex`.
+    fn enqueueLocked(self: *ClientConnection, payload: *Payload, stats: *DropStats) !void {
         if (self.isClosed()) return error.ConnectionClosed;
         const len = payload.bytes.len;
 
@@ -313,16 +353,19 @@ const ClientConnection = struct {
                 self.noteDropped(1);
             } else {
                 if (self.queued_output_bytes > broadcast_queue_max_bytes - len) {
-                    try self.dropQueuedOutputLocked();
+                    stats.* = try self.dropQueuedOutputLocked();
                 }
-                try self.queue.push(self.allocator, payload.retain());
+                // Capacity first: a failed growth must not leak the ref.
+                try self.queue.reserveOne(self.allocator);
+                self.queue.pushAssumeCapacity(payload.retain());
                 self.queued_output_bytes += len;
             }
         } else {
             if (len > control_queue_max_bytes or self.queued_control_bytes > control_queue_max_bytes - len) {
                 return error.ConnectionBacklogged;
             }
-            try self.queue.push(self.allocator, payload.retain());
+            try self.queue.reserveOne(self.allocator);
+            self.queue.pushAssumeCapacity(payload.retain());
             self.queued_control_bytes += len;
         }
 
@@ -337,7 +380,7 @@ const ClientConnection = struct {
 
     /// Drop every queued `pane_output`, keeping control notifications in
     /// order. Caller holds `queue_mutex`.
-    fn dropQueuedOutputLocked(self: *ClientConnection) !void {
+    fn dropQueuedOutputLocked(self: *ClientConnection) !DropStats {
         // Record first so an allocation failure leaves the queue untouched.
         var dropped_bytes: usize = 0;
         var dropped_count: u64 = 0;
@@ -363,18 +406,22 @@ const ClientConnection = struct {
         self.queue.len = kept;
         self.queued_output_bytes = 0;
         self.noteDropped(dropped_count);
-
-        // Sizes only: the queued bytes are PTY output and are never logged.
-        log.warnRateLimited("client_output_dropped", &output_dropped_limiter, .{
-            .dropped_bytes = dropped_bytes,
-            .dropped_events = dropped_count,
-            .max_queued_bytes = broadcast_queue_max_bytes,
-        });
+        return .{ .dropped_bytes = dropped_bytes, .dropped_events = dropped_count };
     }
 
+    /// One record per pane. Offsets restart with each generation, so they
+    /// are combined only within a generation: a newer generation resets the
+    /// record, and an older one is ignored once a newer one is recorded.
     fn recordDropLocked(self: *ClientConnection, meta: OutputMeta) !void {
         for (self.dropped.items) |*record| {
             if (std.mem.eql(u8, record.pane_id, meta.pane_id)) {
+                if (meta.generation < record.generation) return;
+                if (meta.generation > record.generation) {
+                    record.generation = meta.generation;
+                    record.dropped_bytes = meta.data_len;
+                    record.resume_offset = meta.end_offset;
+                    return;
+                }
                 record.dropped_bytes += meta.data_len;
                 record.resume_offset = @max(record.resume_offset, meta.end_offset);
                 return;
@@ -386,6 +433,7 @@ const ClientConnection = struct {
             .pane_id = pane_id,
             .dropped_bytes = meta.data_len,
             .resume_offset = meta.end_offset,
+            .generation = meta.generation,
         });
     }
 
@@ -477,11 +525,13 @@ const ClientConnection = struct {
 
     fn takeDropNoticeLocked(self: *ClientConnection) !*Payload {
         const record = self.dropped.items[0];
-        const bytes = try protocol.notification(self.allocator, protocol.pane_output_dropped_method, protocol.PaneOutputDroppedParams{
+        var params: protocol.PaneOutputDroppedParams = .{
             .pane_id = record.pane_id,
             .dropped_bytes = record.dropped_bytes,
             .resume_offset = record.resume_offset,
-        });
+        };
+        if (comptime @hasField(protocol.PaneOutputDroppedParams, "generation")) params.generation = record.generation;
+        const bytes = try protocol.notification(self.allocator, protocol.pane_output_dropped_method, params);
         const payload = Payload.create(self.allocator, bytes, null) catch |err| {
             self.allocator.free(bytes);
             return err;
@@ -528,6 +578,54 @@ const ClientConnection = struct {
             }
         }
         return false;
+    }
+
+    /// Move an owned client to `native`'s pane and queue its
+    /// `client_switched` notice in one `queue_mutex` critical section. Output
+    /// is queued under the same mutex, so nothing from the new pane precedes
+    /// the notice. The replay is read after the route is installed, so output
+    /// before `replayEndOffset` is in the replay and anything later is
+    /// delivered (a client drops the overlap by offset).
+    fn switchRouteAndNotify(self: *ClientConnection, client_id: []const u8, native: *NativeSession) !void {
+        const next = try self.allocator.dupe(u8, native.id);
+        var next_owned = true;
+        defer if (next_owned) self.allocator.free(next);
+
+        self.queue_mutex.lockUncancelable(self.io);
+        defer self.queue_mutex.unlock(self.io);
+        if (self.isClosed()) return error.ConnectionClosed;
+        {
+            self.attachment_mutex.lockUncancelable(self.io);
+            defer self.attachment_mutex.unlock(self.io);
+            const active = for (self.attachments.items) |*active| {
+                if (std.mem.eql(u8, active.client_id, client_id)) break active;
+            } else return error.ClientNotFound;
+            self.allocator.free(active.pane_id);
+            active.pane_id = next;
+            next_owned = false;
+        }
+
+        const generation = native.generation();
+        const tail = try native.scrollbackTail(self.allocator, attach_replay_max_bytes);
+        defer self.allocator.free(tail.bytes);
+        const replay_b64 = try base64Encode(self.allocator, tail.bytes);
+        defer self.allocator.free(replay_b64);
+        const bytes = try protocol.notification(self.allocator, client_switched_method, .{
+            .client_id = client_id,
+            .pane_id = native.id,
+            .generation = generation,
+            .replayBase64 = replay_b64,
+            .replayStartOffset = tail.start_offset,
+            .replayEndOffset = tail.end_offset,
+        });
+        const payload = Payload.create(self.allocator, bytes, null) catch |err| {
+            self.allocator.free(bytes);
+            return err;
+        };
+        defer payload.release();
+        var stats: DropStats = .{};
+        try self.enqueueLocked(payload, &stats);
+        std.debug.assert(stats.dropped_events == 0);
     }
 
     fn untrackMuxClient(self: *ClientConnection, client_id: []const u8) bool {
@@ -621,6 +719,11 @@ pub const Server = struct {
     io: std.Io,
     /// Guards `connections` and `stopping`.
     mutex: std.Io.Mutex = .init,
+    /// Orders every mux-client ownership transition: attach (manager attach
+    /// plus connection tracking), detach, switch (manager, route, notice),
+    /// and the detached-client drain. Lock order: `routing_mutex`, then a
+    /// connection's `write_mutex`, then `manager.mutex`/`mutex`.
+    routing_mutex: std.Io.Mutex = .init,
     socket_path: []u8,
     socket_stat: sys.Stat,
     /// Pinned parent directory of the socket; -1 for an in-memory server.
@@ -681,28 +784,49 @@ pub const Server = struct {
     pub fn init(allocator: Allocator, io: std.Io, socket_path: []const u8, idle_timeout_seconds: i64) !Server {
         // Reject before touching the filesystem: a path that can never be
         // bound must not leave a parent directory or lock behind.
+        try validateSocketPath(socket_path);
+        const dir_fd = try openSocketParent(socket_path, socket_path_mod.processEnv);
+        errdefer sys.close(dir_fd);
+        return initOwnedDir(allocator, io, dir_fd, socket_path, idle_timeout_seconds);
+    }
+
+    /// `init` in a socket directory the caller already opened and validated
+    /// (with `openSocketParent`). `dir_fd` stays the caller's; the server
+    /// keeps its own duplicate, so the caller's lock and PID files and this
+    /// socket are always in the same directory, whatever happens to its
+    /// name.
+    pub fn initAt(allocator: Allocator, io: std.Io, dir_fd: posix.fd_t, socket_path: []const u8, idle_timeout_seconds: i64) !Server {
+        try validateSocketPath(socket_path);
+        const owned_dir = try dupCloexec(dir_fd);
+        errdefer sys.close(owned_dir);
+        return initOwnedDir(allocator, io, owned_dir, socket_path, idle_timeout_seconds);
+    }
+
+    fn validateSocketPath(socket_path: []const u8) !void {
         if (socket_path.len == 0) return error.EmptySocketPath;
         if (std.mem.indexOfScalar(u8, socket_path, 0) != null) return error.SocketPathContainsNul;
         if (!std.fs.path.isAbsolute(socket_path)) return error.SocketPathNotAbsolute;
         if (socket_path.len > max_socket_path_len) return error.SocketPathTooLong;
         if (socket_path[socket_path.len - 1] == '/') return error.SocketPathNotSocket;
-        const socket_name = std.fs.path.basename(socket_path);
+    }
 
-        const dir_fd = try openSocketParent(socket_path, socket_path_mod.processEnv);
-        errdefer sys.close(dir_fd);
+    /// Takes ownership of `dir_fd` on success only.
+    fn initOwnedDir(allocator: Allocator, io: std.Io, dir_fd: posix.fd_t, socket_path: []const u8, idle_timeout_seconds: i64) !Server {
+        const socket_name = std.fs.path.basename(socket_path);
 
         try clearStaleSocket(dir_fd, socket_name, socket_path);
 
         const listener = try sys.unixStreamSocket();
         errdefer sys.close(listener);
 
-        // Bind owner-only (0600) without touching the process-wide umask, and
-        // start listening before the socket gets its public name; see
+        // Bind owner-only (0600) without touching the process-wide umask,
+        // start listening before the socket gets its public name, and never
+        // replace an entry that appeared since the check above; see
         // bindPrivateSocket.
-        try bindPrivateSocket(io, listener, dir_fd, socket_name, socket_path);
-        errdefer sys.unlinkAt(dir_fd, socket_name) catch {};
+        const socket_stat = try bindPrivateSocket(io, listener, dir_fd, socket_name, socket_path);
+        // Only the inode this server bound is ever removed.
+        errdefer unlinkIfSame(dir_fd, socket_name, socket_stat);
 
-        const socket_stat = try sys.statAt(dir_fd, socket_name, false);
         // A non-blocking listener keeps poll-then-accept from stalling the
         // loop when a client resets before accept.
         try sys.setNonBlocking(listener);
@@ -747,18 +871,11 @@ pub const Server = struct {
         if (!self.published) return;
         self.published = false;
         if (self.socket_dir_fd < 0) return;
-        const name = std.fs.path.basename(self.socket_path);
-        const path_stat = sys.statAt(self.socket_dir_fd, name, false) catch return;
-        if (self.socket_stat.sameFile(path_stat)) {
-            sys.unlinkAt(self.socket_dir_fd, name) catch {};
-        }
+        unlinkIfSame(self.socket_dir_fd, std.fs.path.basename(self.socket_path), self.socket_stat);
     }
 
     pub fn run(self: *Server) !void {
-        self.manager.setEventSink(.{
-            .context = self,
-            .emit = Server.handleNativeEvent,
-        });
+        self.installEventSinks();
         // Every exit path (probe, idle, daemon.shutdown, listener fault) runs
         // the same shutdown sequence on this thread.
         defer self.shutdown();
@@ -927,6 +1044,25 @@ pub const Server = struct {
         self.last_activity_seconds.store(monotonicSeconds(self.io), .seq_cst);
     }
 
+    /// Route native events and respawn announcements to this server. The
+    /// server must not move afterwards.
+    fn installEventSinks(self: *Server) void {
+        self.manager.setRespawnListener(.{ .context = self, .notify = Server.handleRespawn });
+        self.manager.setEventSink(.{ .context = self, .emit = Server.handleNativeEvent });
+    }
+
+    /// Every respawn path (`pane.respawn`, `command.exec`, `key.dispatch`)
+    /// announces here, after the old generation's events and before the new
+    /// generation's first event.
+    fn handleRespawn(context: *anyopaque, native: *NativeSession) void {
+        const self: *Server = @ptrCast(@alignCast(context));
+        self.broadcastNotification(protocol.pane_respawned_method, protocol.PaneRespawnedParams{
+            .pane_id = native.id,
+            .generation = native.generation(),
+            .pid = native.handle.child_pid,
+        });
+    }
+
     /// Stop accepting work and tear everything down, in an order that cannot
     /// deadlock: refuse and close connections, wake writers blocked on PTY
     /// input, wait for the workers, silence native events, then terminate the
@@ -976,9 +1112,12 @@ pub const Server = struct {
     }
 
     fn handleClient(self: *Server, connection: *ClientConnection) void {
+        // One absolute deadline for the first request: blank lines neither
+        // count as a request nor extend it.
+        const first_deadline = std.Io.Clock.awake.now(self.io).addDuration(.fromMilliseconds(first_frame_deadline_ms));
         var first_frame = true;
         while (self.running.load(.seq_cst)) {
-            const line = self.readFrame(connection, first_frame) catch |err| {
+            const line = self.readFrame(connection, if (first_frame) first_deadline else null) catch |err| {
                 if (connection.isClosed()) return;
                 // Only an oversized frame is answered before closing. A
                 // truncated frame is never dispatched, and a silent, stalled,
@@ -989,8 +1128,8 @@ pub const Server = struct {
                 return;
             } orelse return;
             defer self.allocator.free(line);
-            first_frame = false;
             if (std.mem.trim(u8, line, &std.ascii.whitespace).len == 0) continue;
+            first_frame = false;
 
             self.touch();
             // A request that arrives after shutdown began is not started.
@@ -1013,9 +1152,10 @@ pub const Server = struct {
     /// Read one frame. The first frame of a connection and any frame that has
     /// started arriving are bounded by deadlines; an idle connection between
     /// frames waits without one, so an attached client can sit quietly.
-    fn readFrame(self: *Server, connection: *ClientConnection, first_frame: bool) !?[]u8 {
+    /// `first_deadline` is set until the connection's first request arrives.
+    fn readFrame(self: *Server, connection: *ClientConnection, first_deadline: ?std.Io.Timestamp) !?[]u8 {
         const reader = &connection.reader;
-        if (!first_frame and reader.end == reader.start) {
+        if (first_deadline == null and reader.end == reader.start) {
             var fds = [_]posix.pollfd{.{
                 .fd = connection.fd,
                 .events = posix.POLL.IN,
@@ -1025,8 +1165,8 @@ pub const Server = struct {
                 if (try posix.poll(&fds, -1) > 0) break;
             }
         }
-        const budget_ms = if (first_frame) first_frame_deadline_ms else partial_frame_deadline_ms;
-        const deadline = std.Io.Clock.awake.now(self.io).addDuration(.fromMilliseconds(budget_ms));
+        const deadline = first_deadline orelse
+            std.Io.Clock.awake.now(self.io).addDuration(.fromMilliseconds(partial_frame_deadline_ms));
         return reader.readFrameAllocMaybeDeadline(self.allocator, connection.fd, max_request_bytes, deadline);
     }
 
@@ -1235,14 +1375,9 @@ pub const Server = struct {
         // `kill` defaults to false: respawning a running pane is a conflict
         // (`PaneRunning`) unless the caller asks for the child to be killed.
         const kill = try optionalBool(req.params(), "kill") orelse false;
+        // The manager's respawn listener (`handleRespawn`) announces it.
         const active = try self.manager.respawnPane(pane_id, .{ .kill = kill });
         defer active.release();
-
-        self.broadcastNotification(protocol.pane_respawned_method, protocol.PaneRespawnedParams{
-            .pane_id = active.id,
-            .generation = active.generation(),
-            .pid = active.handle.child_pid,
-        });
         try self.replySnapshot(connection, req);
     }
 
@@ -1259,29 +1394,45 @@ pub const Server = struct {
             self.applyCreateDefaults(&create_args.?.opts);
         }
 
+        // Manager attach and connection tracking are one ownership step: a
+        // detach or pane removal drained in between would find no owner.
+        self.routing_mutex.lockUncancelable(self.io);
+        var routing_held = true;
+        defer if (routing_held) self.routing_mutex.unlock(self.io);
+
         var attached = try self.manager.attachOrCreateClient(target, rows, cols, if (create_args) |args| args.opts else null);
         defer attached.client.deinit(self.allocator);
         const client = &attached.client;
         errdefer _ = self.manager.detachClient(client.id);
 
         // Hold the write side so the response is on the wire before any
-        // `pane_output` this attach subscribes to. Subscribing before the
-        // snapshot leaves no gap: every output event at or after
-        // `replayEndOffset` is delivered, and anything earlier is in the
-        // replay.
+        // `pane_output` this attach subscribes to, and before any lifecycle
+        // notification (`session_exited`, `pane_respawned`) queued after the
+        // state below is read. Subscribing before the snapshot leaves no
+        // gap: every output event at or after `replayEndOffset` is delivered,
+        // and anything earlier is in the replay.
         connection.write_mutex.lockUncancelable(connection.io);
         defer connection.write_mutex.unlock(connection.io);
 
         try connection.trackMuxClient(client.id, client.pane_id);
         errdefer _ = connection.untrackMuxClient(client.id);
+        self.routing_mutex.unlock(self.io);
+        routing_held = false;
 
-        const tail = try self.manager.paneScrollbackTail(self.allocator, client.pane_id, attach_replay_max_bytes);
+        // Status, generation, and replay all come from one retained native,
+        // read after the write lock: an exit or respawn either shows up here
+        // or is announced after this reply, never in between.
+        const native = self.manager.find(client.pane_id) orelse return error.PaneNotFound;
+        defer native.release();
+        const exit = native.exitInfo();
+        const generation = native.generation();
+        const tail = try native.scrollbackTail(self.allocator, attach_replay_max_bytes);
         defer self.allocator.free(tail.bytes);
         const replay_b64 = try base64Encode(self.allocator, tail.bytes);
         defer self.allocator.free(replay_b64);
 
-        const exit_code: ?u32 = if (attached.exit) |exit| exit.exit_code else null;
-        const signal: ?u32 = if (attached.exit) |exit| exit.signal else null;
+        const exit_code: ?u32 = if (exit) |info| info.exit_code else null;
+        const signal: ?u32 = if (exit) |info| info.signal else null;
         if (protocol.isNotification(req)) return;
         const response = try protocol.result(self.allocator, req.id_json, .{
             .clientId = client.id,
@@ -1291,10 +1442,10 @@ pub const Server = struct {
             .rows = client.rows,
             .cols = client.cols,
             .created = attached.created,
-            .exited = attached.exited,
+            .exited = exit != null,
             .exitCode = exit_code,
             .signal = signal,
-            .generation = attached.generation,
+            .generation = generation,
             .replayBase64 = replay_b64,
             .replayStartOffset = tail.start_offset,
             .replayEndOffset = tail.end_offset,
@@ -1307,40 +1458,51 @@ pub const Server = struct {
     fn detachMuxClient(self: *Server, connection: *ClientConnection, req: *const protocol.Request) !void {
         const client_id = try clientIdParam(req.params()) orelse return error.InvalidParams;
 
-        if (connection.untrackMuxClient(client_id)) {
-            // Owned here: nothing to notify.
-            if (!self.manager.detachClient(client_id)) return error.ClientNotFound;
-        } else {
-            // Another connection's client: allowed. The manager records the
-            // remote detach and `drainDetachedClients`, which runs after
-            // every request, tells the owner (`client_detached`).
-            if (!self.manager.detachClientRemote(client_id)) return error.ClientNotFound;
+        {
+            self.routing_mutex.lockUncancelable(self.io);
+            defer self.routing_mutex.unlock(self.io);
+            if (connection.untrackMuxClient(client_id)) {
+                // Owned here: nothing to notify.
+                if (!self.manager.detachClient(client_id)) return error.ClientNotFound;
+            } else {
+                // Another connection's client: allowed. The manager records
+                // the remote detach and `drainDetachedClients`, which runs
+                // after every request, tells the owner (`client_detached`).
+                if (!self.manager.detachClientRemote(client_id)) return error.ClientNotFound;
+            }
         }
         try self.replyOk(connection, req);
     }
 
+    /// Manager state, output route, and the owner's `client_switched` notice
+    /// change as one transition under `routing_mutex`, so conflicting
+    /// switches cannot leave the route on a pane the manager no longer
+    /// names. A remote owner gets the notice, with the new generation and a
+    /// replay, ahead of any output from the new pane; if the route or notice
+    /// cannot be installed, the owner's connection is closed.
     fn switchMuxClient(self: *Server, connection: *ClientConnection, req: *const protocol.Request) !void {
         const client_id = try clientIdParam(req.params()) orelse return error.InvalidParams;
         const target = try paneIdParam(req.params()) orelse return error.InvalidParams;
-        try self.manager.switchClient(client_id, target);
 
-        // Output routing follows the client to its new pane.
-        const pane_id = blk: {
-            const native = self.manager.find(target) orelse break :blk try self.allocator.dupe(u8, target);
+        {
+            self.routing_mutex.lockUncancelable(self.io);
+            defer self.routing_mutex.unlock(self.io);
+            try self.manager.switchClient(client_id, target);
+
+            const native = self.manager.find(target) orelse return error.PaneNotFound;
             defer native.release();
-            break :blk try self.allocator.dupe(u8, native.id);
-        };
-        defer self.allocator.free(pane_id);
 
-        if (!try connection.switchMuxClientPane(client_id, pane_id)) {
-            if (self.findClientOwner(client_id)) |owner| {
+            if (connection.ownsMuxClient(client_id)) {
+                if (!try connection.switchMuxClientPane(client_id, native.id)) return error.ClientNotFound;
+            } else if (self.findClientOwner(client_id)) |owner| {
                 defer owner.release();
-                if (owner.switchMuxClientPane(client_id, pane_id) catch false) {
-                    self.notifyConnection(owner, client_switched_method, .{
-                        .client_id = client_id,
-                        .pane_id = pane_id,
-                    });
-                }
+                owner.switchRouteAndNotify(client_id, native) catch |err| switch (err) {
+                    error.ConnectionClosed => {},
+                    else => {
+                        owner.close();
+                        return err;
+                    },
+                };
             }
         }
         try self.replySnapshot(connection, req);
@@ -1465,8 +1627,13 @@ pub const Server = struct {
         const active = try self.requiredSession(req);
         defer active.release();
 
-        const text = try active.captureBounded(self.allocator, lines, capture_max_bytes);
-        defer self.allocator.free(text);
+        const captured = try active.captureBounded(self.allocator, lines, capture_max_bytes);
+        defer self.allocator.free(captured);
+        // Keep the newest bytes whose worst-case encoding fits the response
+        // cap, so a control-heavy capture returns a bounded, useful tail
+        // instead of being built at ~6x and then rejected.
+        const reserve = capture_envelope_reserve_bytes +| req.id_json.len +| active.id.len;
+        const text = captured[captureTailStart(captured, max_response_bytes -| reserve)..];
         const text_b64 = try base64Encode(self.allocator, text);
         defer self.allocator.free(text_b64);
 
@@ -1602,6 +1769,8 @@ pub const Server = struct {
     }
 
     fn detachConnectionClients(self: *Server, connection: *ClientConnection) void {
+        self.routing_mutex.lockUncancelable(self.io);
+        defer self.routing_mutex.unlock(self.io);
         var mux_clients = connection.takeMuxClients();
         defer mux_clients.deinit(self.allocator);
         for (mux_clients.items) |attachment| {
@@ -1633,6 +1802,8 @@ pub const Server = struct {
     /// Tell owners about clients the manager pruned (pane or session removed,
     /// or detached remotely) and stop tracking them.
     fn drainDetachedClients(self: *Server) void {
+        self.routing_mutex.lockUncancelable(self.io);
+        defer self.routing_mutex.unlock(self.io);
         const detached = self.manager.takeDetachedClients(self.allocator) catch return;
         defer mux.freeDetachedClients(self.allocator, detached);
         for (detached) |entry| {
@@ -1788,6 +1959,7 @@ pub const Server = struct {
             .pane_id = pane_id,
             .data_len = params.data.len,
             .end_offset = params.offset + params.data.len,
+            .generation = params.generation,
         }) catch {
             self.allocator.free(pane_id);
             self.allocator.free(bytes);
@@ -1803,16 +1975,20 @@ pub const Server = struct {
         switch (event) {
             .foreground_changed => |params| self.broadcastNotification(protocol.foreground_changed_method, params),
             .session_exited => |params| {
-                self.manager.markExited(params.session_id, params.generation);
+                // A stale generation's exit is dropped before any client
+                // sees it: the pane already runs its replacement.
+                if (!self.manager.markExitedIfCurrent(params.session_id, params.generation)) return;
                 // The idle interval starts when the last pane exits, not at
                 // the last client request.
                 self.touch();
                 self.broadcastNotification(protocol.session_exited_method, params);
             },
-            .pane_output => |params| {
-                self.manager.markActivity(params.pane_id, params.generation, std.Io.Clock.real.now(self.io).toMilliseconds());
-                self.broadcastPaneOutput(params);
-            },
+            // No manager lock or clock read per chunk: the activity alert and
+            // its timestamp come from the `pane_activity` edge below. Output
+            // of a replaced generation cannot arrive after its respawn
+            // announcement (the manager drains the old sink first), and
+            // clients order chunks by `generation`.
+            .pane_output => |params| self.broadcastPaneOutput(params),
             .pane_activity => |params| {
                 // The native session emits this only on the idle-to-active
                 // edge (`native.activity_idle_ms`), so every event is
@@ -1886,19 +2062,52 @@ fn rmdirAt(dir_fd: posix.fd_t, name: []const u8) void {
     _ = std.c.unlinkat(dir_fd, name_z, std.c.AT.REMOVEDIR);
 }
 
-fn renameAt(old_dir_fd: posix.fd_t, old_name: []const u8, new_dir_fd: posix.fd_t, new_name: []const u8) !void {
+/// `linkat(2)` without following: fails with `error.AddressInUse` when
+/// `new_name` exists, so publication never replaces a live entry.
+fn linkAt(old_dir_fd: posix.fd_t, old_name: []const u8, new_dir_fd: posix.fd_t, new_name: []const u8) !void {
     var old_buf: [posix.PATH_MAX]u8 = undefined;
     var new_buf: [posix.PATH_MAX]u8 = undefined;
     const old_z = try nameZ(&old_buf, old_name);
     const new_z = try nameZ(&new_buf, new_name);
-    switch (posix.errno(std.c.renameat(old_dir_fd, old_z, new_dir_fd, new_z))) {
-        .SUCCESS => {},
+    while (true) switch (posix.errno(std.c.linkat(old_dir_fd, old_z, new_dir_fd, new_z, 0))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        .EXIST => return error.AddressInUse,
         .NOENT => return error.FileNotFound,
         .ACCES, .PERM, .ROFS => return error.AccessDenied,
         .NOTDIR => return error.NotDir,
-        .ISDIR => return error.IsDir,
+        .NOSPC => return error.NoSpaceLeft,
         else => return error.Unexpected,
+    };
+}
+
+/// Remove `name` only while it still names the inode `expected`. The check
+/// and the unlink are two calls; callers that need exclusion against another
+/// publisher hold the daemon start lock.
+fn unlinkIfSame(dir_fd: posix.fd_t, name: []const u8, expected: sys.Stat) void {
+    const current = sys.statAt(dir_fd, name, false) catch return;
+    if (!current.sameFile(expected)) return;
+    sys.unlinkAt(dir_fd, name) catch {};
+}
+
+fn dupCloexec(fd: posix.fd_t) !posix.fd_t {
+    while (true) {
+        const rc = std.c.fcntl(fd, posix.F.DUPFD_CLOEXEC, @as(c_int, 0));
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .BADF => return error.NotOpenForReading,
+            else => return error.Unexpected,
+        }
     }
+}
+
+/// A directory with the sticky bit set lets its owner rename or remove any
+/// entry, so a shared sticky parent is trusted only when root or this user
+/// owns it.
+fn stickyParentTrusted(stat: sys.Stat, euid: sys.uid_t) bool {
+    return stat.uid == 0 or stat.uid == euid;
 }
 
 /// `openat(dir_fd, name, O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)`.
@@ -1932,7 +2141,9 @@ fn openDirAt(dir_fd: posix.fd_t, name: []const u8) !posix.fd_t {
 ///     that is group- or other-writable, or owned by someone else, is refused.
 ///   * A missing parent is created by zmux and is therefore private too.
 ///   * An existing user-selected parent must be self-owned with no group or
-///     other write permission, or have the sticky bit (such as `/tmp`).
+///     other write permission, or have the sticky bit (such as `/tmp`) and
+///     be owned by root or this user. Another user's sticky directory is
+///     refused: its owner can rename entries inside it.
 pub fn openSocketParent(socket_path: []const u8, getenv: socket_path_mod.GetEnv) !posix.fd_t {
     const parent = std.fs.path.dirname(socket_path) orelse return error.SocketPathNotAbsolute;
 
@@ -1950,7 +2161,7 @@ pub fn openSocketParent(socket_path: []const u8, getenv: socket_path_mod.GetEnv)
     errdefer sys.close(dir_fd);
     const stat = try sys.fstat(dir_fd);
     if (!stat.isDir()) return error.NotDir;
-    const sticky = (stat.mode & 0o1000) != 0;
+    const sticky = (stat.mode & 0o1000) != 0 and stickyParentTrusted(stat, sys.geteuid());
     const owner_only_write = stat.uid == sys.geteuid() and (stat.mode & 0o022) == 0;
     if (!sticky and !owner_only_write) {
         log.err("socket_dir_insecure", .{
@@ -2048,16 +2259,21 @@ fn clearStaleSocket(dir_fd: posix.fd_t, socket_name: []const u8, socket_path: []
 ///   2. `bind` the socket inside it. Whatever mode the umask yields, the file
 ///      is unreachable to other users behind the 0700 directory.
 ///   3. Check ownership, then `fchmodat` the socket to 0600 and verify it.
-///   4. `listen`, then `renameat` it onto the socket name. Rename is atomic
-///      and keeps the bound inode, so the public name only ever refers to a
-///      listening 0600 socket.
+///   4. `listen`, then `linkat` it to the socket name and drop the staged
+///      name. `linkat` is atomic, keeps the bound inode, and fails when the
+///      name exists, so the public name only ever refers to a listening 0600
+///      socket and a publisher that arrived after `clearStaleSocket` is never
+///      replaced (`error.AddressInUse`).
+///
+/// Returns the identity of the bound inode, taken before publication, so a
+/// later cleanup can never remove someone else's socket.
 ///
 /// Every step except `bind` itself is relative to the pinned directory
 /// descriptors. The staging path is longer than some valid socket paths. When
 /// it cannot fit in `sun_path`, the socket is bound in place only if that is
 /// provably private (see bindSocketInPlace); otherwise the bind is refused
 /// rather than exposed.
-fn bindPrivateSocket(io: std.Io, listener: posix.fd_t, dir_fd: posix.fd_t, socket_name: []const u8, socket_path: []const u8) !void {
+fn bindPrivateSocket(io: std.Io, listener: posix.fd_t, dir_fd: posix.fd_t, socket_name: []const u8, socket_path: []const u8) !sys.Stat {
     // Linux derives the socket file mode from the socket inode's mode, so this
     // makes bind create the file 0600 outright. macOS rejects fchmod on
     // sockets; staging covers both.
@@ -2093,6 +2309,12 @@ fn bindPrivateSocket(io: std.Io, listener: posix.fd_t, dir_fd: posix.fd_t, socke
         break;
     }
     defer rmdirAt(dir_fd, staging_name);
+    // A restrictive umask (0777) leaves the new directory 000, which its
+    // unprivileged owner cannot open. Restore 0700 by name first: in a
+    // trusted parent (owner-only, or sticky and owned by root or us) nobody
+    // else can replace the entry just created. The fd checks below still
+    // verify type, owner, and mode.
+    sys.fchmodat(dir_fd, staging_name, 0o700) catch {};
 
     // Hold the directory by fd and validate that fd, so later checks cannot be
     // redirected by someone swapping the name in a writable parent.
@@ -2112,8 +2334,9 @@ fn bindPrivateSocket(io: std.Io, listener: posix.fd_t, dir_fd: posix.fd_t, socke
 
     const address = try sys.UnixAddress.init(staged_path);
     try sys.bind(listener, &address);
-    var staged = true;
-    defer if (staged) sys.unlinkAt(staging_fd, staged_socket_name) catch {};
+    // The staged name always goes: after a successful link the public name
+    // keeps the inode.
+    defer sys.unlinkAt(staging_fd, staged_socket_name) catch {};
 
     const bound = try sys.statAt(staging_fd, staged_socket_name, false);
     if (!bound.isSocket()) return error.PermissionDenied;
@@ -2131,8 +2354,9 @@ fn bindPrivateSocket(io: std.Io, listener: posix.fd_t, dir_fd: posix.fd_t, socke
     // refused while the accept loop drains it. The kernel silently clamps to
     // somaxconn.
     try sys.listen(listener, @intCast(max_client_connections));
-    try renameAt(staging_fd, staged_socket_name, dir_fd, socket_name);
-    staged = false;
+    // No-replace publish; the deferred unlink then drops the staged name.
+    try linkAt(staging_fd, staged_socket_name, dir_fd, socket_name);
+    return socket_stat;
 }
 
 /// Fallback for socket paths too close to the `sun_path` limit to stage.
@@ -2149,7 +2373,7 @@ fn bindSocketInPlace(
     socket_name: []const u8,
     socket_path: []const u8,
     mode_preset: bool,
-) !void {
+) !sys.Stat {
     if (!mode_preset) {
         const parent_stat = try sys.fstat(dir_fd);
         const private = parent_stat.isDir() and
@@ -2158,11 +2382,15 @@ fn bindSocketInPlace(
         if (!private) return error.SocketStagingPathTooLong;
     }
 
+    // `bind` itself fails with `AddressInUse` on an existing name, so this
+    // path never replaces an entry either.
     const address = try sys.UnixAddress.init(socket_path);
     try sys.bind(listener, &address);
-    errdefer sys.unlinkAt(dir_fd, socket_name) catch {};
 
     var socket_stat = try sys.statAt(dir_fd, socket_name, false);
+    // Only the inode just bound is removed on failure.
+    const bound = socket_stat;
+    errdefer unlinkIfSame(dir_fd, socket_name, bound);
     if (!socket_stat.isSocket() or socket_stat.uid != sys.geteuid()) return error.PermissionDenied;
     // With the preset the mode is already at most 0600; this only widens a
     // umask-narrowed socket back to 0600 so its owner can connect.
@@ -2171,7 +2399,9 @@ fn bindSocketInPlace(
         socket_stat = try sys.statAt(dir_fd, socket_name, false);
     }
     if (socket_stat.permissions() != 0o600) return error.PermissionDenied;
+    if (!socket_stat.sameFile(bound)) return error.PermissionDenied;
     try sys.listen(listener, @intCast(max_client_connections));
+    return socket_stat;
 }
 
 // ---------------------------------------------------------------------------
@@ -2452,6 +2682,33 @@ fn freeStringSlice(allocator: Allocator, entries: []const []const u8) void {
     allocator.free(entries);
 }
 
+/// Response bytes reserved for the capture reply's envelope and keys.
+const capture_envelope_reserve_bytes: usize = 4096;
+
+/// Start of the longest tail of `text` whose `text` (lossy JSON string) plus
+/// `textBase64` encodings fit in `budget` bytes, costing every byte at its
+/// worst case: 6 for a control byte (`\u00XX`), 2 for a quote or backslash,
+/// 3 for a byte at or above 0x80 (an invalid byte becomes U+FFFD).
+fn captureTailStart(text: []const u8, budget: usize) usize {
+    var escaped: usize = 2; // the quotes
+    var start = text.len;
+    while (start > 0) {
+        const byte = text[start - 1];
+        const cost: usize = switch (byte) {
+            0...0x1f, 0x7f => 6,
+            '"', '\\' => 2,
+            0x80...0xff => 3,
+            else => 1,
+        };
+        const n = text.len - start + 1;
+        const base64_len = 4 * ((n + 2) / 3) + 2;
+        if (escaped + cost + base64_len > budget) break;
+        escaped += cost;
+        start -= 1;
+    }
+    return start;
+}
+
 fn truncatedReplay(scrollback: []const u8, max_bytes: usize) []const u8 {
     if (scrollback.len <= max_bytes) return scrollback;
     return scrollback[scrollback.len - max_bytes ..];
@@ -2572,10 +2829,7 @@ pub const fuzz_hooks = struct {
 
     /// Route native session events through the server, as `run` does.
     pub fn enableEvents(server: *Server) void {
-        server.manager.setEventSink(.{
-            .context = server,
-            .emit = Server.handleNativeEvent,
-        });
+        server.installEventSinks();
     }
 
     pub fn deinitInMemoryServer(server: *Server) void {
@@ -2967,6 +3221,77 @@ test "axisParam accepts aliases and rejects unknown axes" {
     var wrong_type = try parseJson("{\"axis\":7}");
     defer wrong_type.deinit();
     try std.testing.expectError(error.InvalidParams, axisParam(wrong_type.value));
+}
+
+test "M10: a control-heavy capture keeps a tail whose encoding fits the response cap" {
+    const allocator = std.testing.allocator;
+    const raw = try allocator.alloc(u8, capture_max_bytes);
+    defer allocator.free(raw);
+    @memset(raw, 0x01);
+    raw[raw.len - 1] = '"';
+    raw[raw.len - 2] = 0xff;
+
+    const budget = max_response_bytes - capture_envelope_reserve_bytes;
+    const start = captureTailStart(raw, budget);
+    try std.testing.expect(start > 0);
+    try std.testing.expect(start < raw.len);
+    const text = raw[start..];
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try protocol.writeJsonStringLossy(&out.writer, text);
+    const b64 = try base64Encode(allocator, text);
+    defer allocator.free(b64);
+    try std.testing.expect(out.written().len + b64.len + 2 <= budget);
+    // Plain text is never trimmed below the cap.
+    try std.testing.expectEqual(@as(usize, 0), captureTailStart("hello", budget));
+}
+
+test "M08: a failed queue growth releases nothing it did not retain" {
+    const allocator = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds) != 0) return error.SkipZigTest;
+    defer sys.close(fds[1]);
+    const connection = try ClientConnection.create(allocator, test_io, fds[0], null);
+    defer connection.release();
+    // Swap in the failing allocator for the queue only.
+    connection.allocator = failing.allocator();
+    failing.fail_index = failing.alloc_index;
+
+    for ([_]bool{ false, true }) |output| {
+        const bytes = try allocator.dupe(u8, "{}\n");
+        const pane_id = if (output) try allocator.dupe(u8, "p") else null;
+        const payload = Payload.create(allocator, bytes, if (output) OutputMeta{ .pane_id = pane_id.?, .data_len = 1, .end_offset = 1 } else null) catch unreachable;
+        try std.testing.expectError(error.OutOfMemory, connection.enqueue(payload));
+        // The only reference left is ours: the leak checker fails otherwise.
+        try std.testing.expectEqual(@as(u32, 1), payload.ref_count.load(.seq_cst));
+        payload.release();
+    }
+    connection.allocator = allocator;
+}
+
+test "M09: drop records reset on a newer generation and ignore an older one" {
+    const allocator = std.testing.allocator;
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds) != 0) return error.SkipZigTest;
+    defer sys.close(fds[1]);
+    const connection = try ClientConnection.create(allocator, test_io, fds[0], null);
+    defer connection.release();
+
+    var pane = "p".*;
+    try connection.recordDropLocked(.{ .pane_id = &pane, .data_len = 900, .end_offset = 1000, .generation = 1 });
+    try connection.recordDropLocked(.{ .pane_id = &pane, .data_len = 10, .end_offset = 10, .generation = 2 });
+    try connection.recordDropLocked(.{ .pane_id = &pane, .data_len = 5, .end_offset = 2000, .generation = 1 });
+    try std.testing.expectEqual(@as(usize, 1), connection.dropped.items.len);
+    const record = connection.dropped.items[0];
+    try std.testing.expectEqual(@as(u64, 2), record.generation);
+    try std.testing.expectEqual(@as(u64, 10), record.resume_offset);
+    try std.testing.expectEqual(@as(u64, 10), record.dropped_bytes);
+
+    const notice = try connection.takeDropNoticeLocked();
+    defer notice.release();
+    try std.testing.expect(std.mem.indexOf(u8, notice.bytes, "\"resume_offset\":10") != null);
 }
 
 test "truncatedReplay keeps tail when larger than cap" {
@@ -3805,6 +4130,44 @@ test "detaching another connection's client notifies its owner" {
     try expectRpcError(&again, -32000, "not_found", "ClientNotFound");
 }
 
+test "H10: a remote switch moves the owner's route and notifies it with generation and replay" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var server = try fuzz_hooks.initInMemoryServer(allocator, test_io);
+    defer fuzz_hooks.deinitInMemoryServer(&server);
+    var owner = try TestClient.start(&server);
+    defer owner.stop();
+    var other = try TestClient.start(&server);
+    defer other.stop();
+
+    try owner.send("{\"id\":1,\"method\":\"client.attach\",\"params\":{\"paneId\":\"one\"," ++
+        "\"createIfMissing\":{\"title\":\"one\",\"shell\":\"/bin/sh\",\"command\":\"exec cat\"}}}\n");
+    var attached = try owner.response(1);
+    defer attached.deinit();
+    const client_id = try allocator.dupe(u8, (try resultOf(&attached)).get("clientId").?.string);
+    defer allocator.free(client_id);
+
+    try other.send("{\"id\":1,\"method\":\"session.create\",\"params\":{\"title\":\"two\",\"shell\":\"/bin/sh\",\"command\":\"exec cat\"}}\n");
+    var created = try other.response(1);
+    defer created.deinit();
+    const pane_two = try allocator.dupe(u8, (try resultOf(&created)).get("paneId").?.string);
+    defer allocator.free(pane_two);
+
+    try other.sendFmt("{{\"id\":2,\"method\":\"client.switch\",\"params\":{{\"clientId\":\"{s}\",\"paneId\":\"{s}\"}}}}\n", .{ client_id, pane_two });
+    var switched = try other.response(2);
+    defer switched.deinit();
+
+    var event = try owner.notification(client_switched_method);
+    defer event.deinit();
+    const params = event.value.object.get("params").?.object;
+    try std.testing.expectEqualStrings(client_id, params.get("client_id").?.string);
+    try std.testing.expectEqualStrings(pane_two, params.get("pane_id").?.string);
+    try std.testing.expectEqual(@as(i64, 0), params.get("generation").?.integer);
+    try std.testing.expect(params.get("replayBase64").? == .string);
+    try std.testing.expect(params.get("replayEndOffset").? == .integer);
+}
+
 test "session.capture returns lossy text and the exact bytes" {
     if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -4169,6 +4532,75 @@ test "a second server cannot displace a live one" {
     try std.testing.expectEqual(@as(usize, 1), try countMatchingEntries(std.fs.path.dirname(socket_path).?, std.fs.path.basename(socket_path)));
     const client = try sys.connectUnix(socket_path);
     defer sys.close(client);
+}
+
+test "H02: publication never replaces a socket that appeared after the stale check" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    const socket_path = try tempPath(allocator, "zmx-publish-race");
+    defer allocator.free(socket_path);
+    defer std.Io.Dir.deleteFileAbsolute(test_io, socket_path) catch {};
+    try requireUnixSocketBind(socket_path);
+
+    // The first publisher wins; the second already passed `clearStaleSocket`
+    // (simulated by calling the publication step directly).
+    var server = try Server.init(allocator, test_io, socket_path, 0);
+    defer server.deinit();
+    const before = try socketPathStat(socket_path);
+
+    const listener = try sys.unixStreamSocket();
+    defer sys.close(listener);
+    const parent = std.fs.path.dirname(socket_path).?;
+    const dir_fd = try sys.openDirNoFollow(parent);
+    defer sys.close(dir_fd);
+    try std.testing.expectError(
+        error.AddressInUse,
+        bindPrivateSocket(test_io, listener, dir_fd, std.fs.path.basename(socket_path), socket_path),
+    );
+
+    const after = try socketPathStat(socket_path);
+    try std.testing.expect(before.sameFile(after));
+    const client = try sys.connectUnix(socket_path);
+    sys.close(client);
+
+    // Cleanup removes only the inode this server bound.
+    server.socket_stat.ino +%= 1;
+    server.unpublish();
+    try std.testing.expect((try socketPathStat(socket_path)).sameFile(before));
+    server.socket_stat.ino -%= 1;
+    server.published = true;
+}
+
+test "H03: a sticky parent is trusted only when root or this user owns it" {
+    const euid: sys.uid_t = 1000;
+    const sticky = 0o41777;
+    try std.testing.expect(stickyParentTrusted(.{ .dev = 0, .ino = 0, .mode = sticky, .uid = 0 }, euid));
+    try std.testing.expect(stickyParentTrusted(.{ .dev = 0, .ino = 0, .mode = sticky, .uid = euid }, euid));
+    try std.testing.expect(!stickyParentTrusted(.{ .dev = 0, .ino = 0, .mode = sticky, .uid = 1234 }, euid));
+}
+
+test "M13: startup and restart succeed under umask 0777" {
+    if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+    if (sys.geteuid() == 0) return error.SkipZigTest; // root ignores mode bits
+    const allocator = std.testing.allocator;
+    const parent = try tempPath(allocator, "zmx-umask777");
+    defer allocator.free(parent);
+    sys.close(try sys.ensurePrivateDir(parent));
+    defer std.Io.Dir.cwd().deleteTree(test_io, parent) catch {};
+    const socket_path = try std.fs.path.join(allocator, &.{ parent, "s.sock" });
+    defer allocator.free(socket_path);
+
+    const original_umask = std.c.umask(0o777);
+    defer _ = std.c.umask(original_umask);
+
+    for (0..2) |_| {
+        var server = try Server.init(allocator, test_io, socket_path, 0);
+        const stat = try socketPathStat(socket_path);
+        try std.testing.expect(stat.isSocket());
+        try std.testing.expectEqual(@as(u32, 0o600), stat.permissions());
+        server.deinit();
+    }
 }
 
 test "self-created socket parent is validated as private 0700" {
