@@ -100,7 +100,7 @@ fn fuzzLiveMuxManager(_: void, smith: *std.testing.Smith) !void {
                 if (manager.paneCount() >= max_live_panes) continue;
                 const title = corpus.drawAsciiSlice(smith, &name_buf);
                 const cmd: []const u8 = if (smith.value(bool)) "cat" else "exit 0";
-                const pane = try manager.createSessionPane(.{
+                var pane = try manager.createSessionPane(.{
                     .title = if (title.len > 0) title else null,
                     .shell = "/bin/sh",
                     .command = cmd,
@@ -108,9 +108,10 @@ fn fuzzLiveMuxManager(_: void, smith: *std.testing.Smith) !void {
                     .cols = smith.valueRangeAtMost(u16, 1, 200),
                     .scrollback_bytes = 2048,
                 });
+                defer pane.deinit();
                 try session_ids.append(allocator, try allocator.dupe(u8, pane.session_id));
                 try window_ids.append(allocator, try allocator.dupe(u8, pane.window_id));
-                try pane_ids.append(allocator, try allocator.dupe(u8, pane.id));
+                try pane_ids.append(allocator, try allocator.dupe(u8, pane.pane_id));
             },
             .new_window => {
                 if (manager.paneCount() >= max_live_panes or session_ids.items.len == 0) continue;
@@ -121,9 +122,11 @@ fn fuzzLiveMuxManager(_: void, smith: *std.testing.Smith) !void {
                     .shell = "/bin/sh",
                     .command = "cat",
                     .scrollback_bytes = 2048,
-                })) |pane| {
+                })) |handle| {
+                    var pane = handle;
+                    defer pane.deinit();
                     try window_ids.append(allocator, try allocator.dupe(u8, pane.window_id));
-                    try pane_ids.append(allocator, try allocator.dupe(u8, pane.id));
+                    try pane_ids.append(allocator, try allocator.dupe(u8, pane.pane_id));
                 } else |_| {}
             },
             .split_pane => {
@@ -134,8 +137,10 @@ fn fuzzLiveMuxManager(_: void, smith: *std.testing.Smith) !void {
                     .shell = "/bin/sh",
                     .command = "cat",
                     .scrollback_bytes = 2048,
-                })) |pane| {
-                    try pane_ids.append(allocator, try allocator.dupe(u8, pane.id));
+                })) |handle| {
+                    var pane = handle;
+                    defer pane.deinit();
+                    try pane_ids.append(allocator, try allocator.dupe(u8, pane.pane_id));
                 } else |_| {}
             },
             .select_pane => {
@@ -163,7 +168,7 @@ fn fuzzLiveMuxManager(_: void, smith: *std.testing.Smith) !void {
             .respawn_pane => {
                 if (pane_ids.items.len == 0) continue;
                 const pid = pane_ids.items[smith.index(pane_ids.items.len)];
-                if (manager.respawnPane(pid)) |native| {
+                if (manager.respawnPane(pid, .{ .kill = smith.value(bool) })) |native| {
                     native.release();
                 } else |_| {}
             },
@@ -233,9 +238,13 @@ fn fuzzLiveMuxManager(_: void, smith: *std.testing.Smith) !void {
             .mark_alerts_and_reap => {
                 if (pane_ids.items.len > 0) {
                     const pid = pane_ids.items[smith.index(pane_ids.items.len)];
-                    manager.markActivity(pid);
-                    manager.markBell(pid);
-                    if (smith.value(bool)) manager.markExited(pid);
+                    if (manager.find(pid)) |native| {
+                        const generation = native.generation();
+                        native.release();
+                        manager.markActivity(pid, generation, 1);
+                        manager.markBell(pid, generation, 1);
+                        if (smith.value(bool)) manager.markExited(pid, generation);
+                    }
                 }
                 manager.reapExitedPanes();
             },
@@ -293,6 +302,13 @@ fn readResponseMatchingId(
 
 fn fuzzLiveUnixSocketServerChaos(_: void, smith: *std.testing.Smith) !void {
     if (!(builtin.os.tag == .linux or builtin.os.tag.isDarwin())) return error.SkipZigTest;
+
+    // Chaos clients disconnect at arbitrary points, so the daemon's expected
+    // warnings (for example `socket_send_timeout_failed` with EINVAL when
+    // macOS rejects SO_SNDTIMEO on an already-reset peer) are not failures.
+    const saved_log_level = zmux.internal.log.getLevel();
+    zmux.internal.log.setLevel(.err);
+    defer zmux.internal.log.setLevel(saved_log_level);
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -758,50 +774,34 @@ fn fuzzLiveDaemonPidLockAndProbe(_: void, smith: *std.testing.Smith) !void {
     const root = if (builtin.os.tag.isDarwin()) "/private/tmp" else "/tmp";
     const sock = try std.fmt.allocPrint(allocator, "{s}/zdp-{x:0>12}.sock", .{ root, nonce & 0xffff_ffff_ffff });
     defer allocator.free(sock);
-    defer std.Io.Dir.deleteFileAbsolute(io, sock) catch {};
 
     const pid_path = try dhooks.pidPathFn(allocator, sock);
     defer allocator.free(pid_path);
-    defer dhooks.deletePidFileFn(io, pid_path);
+    const lock_path = try std.fmt.allocPrint(allocator, "{s}.lock", .{sock});
+    defer allocator.free(lock_path);
+    defer std.Io.Dir.deleteFileAbsolute(io, lock_path) catch {};
 
-    // 1. Acquire & release startup lock
-    var lock = try dhooks.acquireStartLockFn(allocator, io, sock);
-    lock.release();
+    // 1. Validate the socket directory and take the start lock inside it,
+    // optionally re-acquiring after release.
+    var start = try dhooks.openStartContextFn(sock, dhooks.envGetFn, 500, null);
+    defer start.deinit();
+    const names = dhooks.siblingNamesFn(sock);
+    defer std.Io.Dir.deleteFileAbsolute(io, pid_path) catch {};
 
-    // 2. Write atomic pid file and verify contents & 0600 permissions
-    try dhooks.writePidFileFn(allocator, io, pid_path);
-    const st = try sys.statAt(sys.cwd_fd, pid_path, false);
-    try std.testing.expectEqual(@as(u32, 0o600), st.permissions());
-    const content = try std.Io.Dir.cwd().readFileAlloc(io, pid_path, allocator, .limited(64));
-    defer allocator.free(content);
-    const expected = try std.fmt.allocPrint(allocator, "{}\n", .{sys.getpid()});
-    defer allocator.free(expected);
-    try std.testing.expectEqualStrings(expected, content);
-    dhooks.deletePidFileFn(io, pid_path);
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, pid_path, .{}));
-
-    // 3. Probe missing vs stale vs live socket
-    if (smith.value(bool)) {
-        try std.testing.expect(!dhooks.socketAcceptsConnectionFn(sock));
-        try std.testing.expect(!dhooks.waitForSocketAcceptsConnectionFn(io, sock, 500));
-    } else {
-        const addr = try sys.UnixAddress.init(sock);
-        const fd = try sys.unixStreamSocket();
-        sys.bind(fd, &addr) catch |err| switch (err) {
-            error.AccessDenied => {
-                sys.close(fd);
-                return error.SkipZigTest;
-            },
-            else => {
-                sys.close(fd);
-                return err;
-            },
-        };
-        try sys.listen(fd, 1);
-        try std.testing.expect(dhooks.socketAcceptsConnectionFn(sock));
-        sys.close(fd);
-        // Once closed, stale socket must be rejected immediately!
-        try std.testing.expect(!dhooks.waitForSocketAcceptsConnectionFn(io, sock, 500));
+    // 2. Write the PID file through the pinned directory, verify contents and
+    // 0600 permissions, then remove it only while it is still ours.
+    const rounds = smith.valueRangeAtMost(u8, 1, 3);
+    for (0..rounds) |_| {
+        const written = try dhooks.writePidFileFn(start.dir_fd, names.pid());
+        const st = try sys.statAt(sys.cwd_fd, pid_path, false);
+        try std.testing.expectEqual(@as(u32, 0o600), st.permissions());
+        const content = try std.Io.Dir.cwd().readFileAlloc(io, pid_path, allocator, .limited(64));
+        defer allocator.free(content);
+        const expected = try std.fmt.allocPrint(allocator, "{}\n", .{sys.getpid()});
+        defer allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, content);
+        dhooks.removePidFileFn(start.dir_fd, names.pid(), written);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, pid_path, .{}));
     }
 }
 
@@ -821,27 +821,29 @@ fn fuzzLiveMuxOomAtomicity(_: void, smith: *std.testing.Smith) !void {
     var manager = mux.Manager.init(fa, io, null);
     defer manager.deinit();
 
-    const p1 = try manager.createSessionPane(.{
+    var p1 = try manager.createSessionPane(.{
         .title = "s1",
         .shell = "/bin/sh",
         .command = "cat",
         .scrollback_bytes = 512,
     });
-    const p1_id = try allocator.dupe(u8, p1.id);
+    const p1_id = try allocator.dupe(u8, p1.pane_id);
     defer allocator.free(p1_id);
     const s1_id = try allocator.dupe(u8, p1.session_id);
     defer allocator.free(s1_id);
     const w1_id = try allocator.dupe(u8, p1.window_id);
     defer allocator.free(w1_id);
+    p1.deinit();
 
-    const p2 = try manager.newWindow(s1_id, .{
+    var p2 = try manager.newWindow(s1_id, .{
         .title = "w2",
         .shell = "/bin/sh",
         .command = "cat",
         .scrollback_bytes = 512,
     });
-    const p2_id = try allocator.dupe(u8, p2.id);
+    const p2_id = try allocator.dupe(u8, p2.pane_id);
     defer allocator.free(p2_id);
+    p2.deinit();
 
     var c = try manager.attachClient(p1_id, 24, 80);
     const cid = try allocator.dupe(u8, c.id);

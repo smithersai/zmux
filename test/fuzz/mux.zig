@@ -229,21 +229,24 @@ fn fuzzMuxCommandLineParser(_: void, smith: *std.testing.Smith) !void {
     };
     defer parsed.deinit(allocator);
 
-    // Verify invariants of parsed commands.
-    var iter = std.mem.tokenizeScalar(u8, line, ' ');
+    // Verify invariants of parsed commands. The scanner splits on any of
+    // " \t\r\n" and unquotes '...', "...", and backslash escapes; compare
+    // the command name literally only when its raw token has no quoting.
+    var iter = std.mem.tokenizeAny(u8, line, " \t\r\n");
     const first = iter.next();
+    const literal = if (first) |f| std.mem.indexOfAny(u8, f, "'\"\\") == null else true;
     switch (parsed) {
         .noop => try std.testing.expect(first == null),
         .split_window => |sw| {
-            try std.testing.expect(std.mem.eql(u8, first.?, "split-window") or std.mem.eql(u8, first.?, "splitw"));
+            if (literal) try std.testing.expect(std.mem.eql(u8, first.?, "split-window") or std.mem.eql(u8, first.?, "splitw"));
             if (sw.command) |c| try std.testing.expect(c.len > 0);
         },
         .new_window => |nw| {
-            try std.testing.expect(std.mem.eql(u8, first.?, "new-window") or std.mem.eql(u8, first.?, "neww"));
+            if (literal) try std.testing.expect(std.mem.eql(u8, first.?, "new-window") or std.mem.eql(u8, first.?, "neww"));
             if (nw.command) |c| try std.testing.expect(c.len > 0);
         },
         .respawn_pane => {
-            try std.testing.expect(std.mem.eql(u8, first.?, "respawn-pane") or std.mem.eql(u8, first.?, "respawnp"));
+            if (literal) try std.testing.expect(std.mem.eql(u8, first.?, "respawn-pane") or std.mem.eql(u8, first.?, "respawnp"));
             try std.testing.expect(iter.next() == null);
         },
     }
@@ -275,7 +278,17 @@ fn fuzzMuxKeyBindingsAndOom(_: void, smith: *std.testing.Smith) !void {
         const cmd = corpus.drawAsciiSlice(smith, &cmd_buf);
         const repeat = smith.value(bool);
 
-        try manager.bindKey(table, key, cmd, repeat);
+        const before = try manager.keysJson(allocator);
+        defer allocator.free(before);
+        // bindKey validates the command line and rejects an empty table or
+        // key; a rejected binding leaves the table untouched.
+        manager.bindKey(table, key, cmd, repeat) catch |err| {
+            try std.testing.expect(err != error.OutOfMemory);
+            const after = try manager.keysJson(allocator);
+            defer allocator.free(after);
+            try std.testing.expectEqualStrings(before, after);
+            continue;
+        };
 
         // Keys JSON must always be a valid single-line JSON array.
         const keys_json = try manager.keysJson(allocator);

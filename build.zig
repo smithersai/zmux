@@ -77,31 +77,18 @@ pub fn build(b: *std.Build) void {
         .root_module = daemon_mod,
     });
 
-    const smithers_daemon_mod = createRootModule(b, target, optimize, "src/daemon.zig");
-    const smithers_daemon = b.addExecutable(.{
-        .name = "smithers-session-daemon",
-        .root_module = smithers_daemon_mod,
-    });
-
-    const connect_mod = createConnectModule(b, target, optimize);
     const connect = b.addExecutable(.{
         .name = "zmux-connect",
-        .root_module = connect_mod,
-    });
-
-    const smithers_connect_mod = createConnectModule(b, target, optimize);
-    const smithers_connect = b.addExecutable(.{
-        .name = "smithers-session-connect",
-        .root_module = smithers_connect_mod,
+        .root_module = createRootModule(b, target, optimize, "src/connect.zig"),
     });
 
     // iOS cannot spawn local PTY child processes; package artifacts are only
     // installed for desktop/server targets.
     if (target.result.os.tag != .ios) {
         b.installArtifact(daemon);
-        b.installArtifact(smithers_daemon);
+        b.getInstallStep().dependOn(&b.addInstallArtifact(daemon, .{ .dest_sub_path = "smithers-session-daemon" }).step);
         b.installArtifact(connect);
-        b.installArtifact(smithers_connect);
+        b.getInstallStep().dependOn(&b.addInstallArtifact(connect, .{ .dest_sub_path = "smithers-session-connect" }).step);
     }
 
     const test_step = b.step("test", "Run zmux unit and integration tests");
@@ -109,20 +96,15 @@ pub fn build(b: *std.Build) void {
     const root_tests = b.addTest(.{ .root_module = createRootModule(b, target, optimize, "src/main.zig") });
     test_step.dependOn(&b.addRunArtifact(root_tests).step);
 
-    const daemon_tests = b.addTest(.{ .root_module = createRootModule(b, target, optimize, "src/daemon.zig") });
-    test_step.dependOn(&b.addRunArtifact(daemon_tests).step);
-
-    const connect_tests = b.addTest(.{ .root_module = createConnectModule(b, target, optimize) });
-    test_step.dependOn(&b.addRunArtifact(connect_tests).step);
-
     // The integration tests are an embedder: they import the exported `zmux`
     // module directly, proving downstream packages inherit libc/libutil/libproc
     // automatically without re-linking them by hand.
     const integration_options = b.addOptions();
-    integration_options.addOptionPath("zmuxd_path", daemon.getEmittedBin());
-    integration_options.addOptionPath("smithers_session_daemon_path", smithers_daemon.getEmittedBin());
-    integration_options.addOptionPath("zmux_connect_path", connect.getEmittedBin());
-    integration_options.addOptionPath("smithers_session_connect_path", smithers_connect.getEmittedBin());
+    const fixtures = b.addWriteFiles();
+    integration_options.addOptionPath("zmuxd_path", fixtures.addCopyFile(daemon.getEmittedBin(), "zmuxd"));
+    integration_options.addOptionPath("smithers_session_daemon_path", fixtures.addCopyFile(daemon.getEmittedBin(), "smithers-session-daemon"));
+    integration_options.addOptionPath("zmux_connect_path", fixtures.addCopyFile(connect.getEmittedBin(), "zmux-connect"));
+    integration_options.addOptionPath("smithers_session_connect_path", fixtures.addCopyFile(connect.getEmittedBin(), "smithers-session-connect"));
     const integration_mod = b.createModule(.{
         .root_source_file = b.path("test/integration/session_daemon.zig"),
         .target = target,
@@ -130,8 +112,10 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "zmux", .module = root_mod }},
     });
     integration_mod.addOptions("test_build_options", integration_options);
+    const integration_filter = b.option([]const u8, "integration-filter", "Run integration tests whose names contain this text");
     const integration_tests = b.addTest(.{
         .root_module = integration_mod,
+        .filters = if (integration_filter) |filter| &.{filter} else &.{},
     });
     test_step.dependOn(&b.addRunArtifact(integration_tests).step);
 
@@ -180,19 +164,19 @@ pub fn build(b: *std.Build) void {
 
     // Granular per-module unit test steps so Smithers PACKAGE.ts can run only
     // affected unit tests when a module changes.
-    addUnitTestStep(b, target, optimize, "test-buffer", "src/buffer.zig", "Run buffer unit tests");
-    addUnitTestStep(b, target, optimize, "test-protocol", "src/protocol.zig", "Run protocol unit tests");
-    addUnitTestStep(b, target, optimize, "test-rpc-line-reader", "src/rpc_line_reader.zig", "Run rpc_line_reader unit tests");
-    addUnitTestStep(b, target, optimize, "test-log", "src/log.zig", "Run log unit tests");
-    addUnitTestStep(b, target, optimize, "test-foreground", "src/foreground.zig", "Run foreground unit tests");
-    addUnitTestStep(b, target, optimize, "test-sys", "src/sys.zig", "Run sys unit tests");
-    addUnitTestStep(b, target, optimize, "test-pty", "src/pty.zig", "Run pty unit tests");
-    addUnitTestStep(b, target, optimize, "test-native", "src/native.zig", "Run native unit tests");
-    addUnitTestStep(b, target, optimize, "test-mux", "src/mux.zig", "Run mux unit tests");
-    addUnitTestStep(b, target, optimize, "test-connect", "src/connect.zig", "Run connect unit tests");
-    addUnitTestStep(b, target, optimize, "test-server", "src/server.zig", "Run server unit tests");
-    addUnitTestStep(b, target, optimize, "test-daemon", "src/daemon.zig", "Run daemon unit tests");
-    addUnitTestStep(b, target, optimize, "test-main", "src/main.zig", "Run main library unit tests");
+    addUnitTestStep(b, target, optimize, test_filters, "test-buffer", "src/buffer.zig", "Run buffer unit tests");
+    addUnitTestStep(b, target, optimize, test_filters, "test-protocol", "src/protocol.zig", "Run protocol unit tests");
+    addUnitTestStep(b, target, optimize, test_filters, "test-rpc-line-reader", "src/rpc_line_reader.zig", "Run rpc_line_reader unit tests");
+    addUnitTestStep(b, target, optimize, test_filters, "test-log", "src/log.zig", "Run log unit tests");
+    addUnitTestStep(b, target, optimize, test_filters, "test-foreground", "src/foreground.zig", "Run foreground unit tests");
+    addUnitTestStep(b, target, optimize, test_filters, "test-sys", "src/sys.zig", "Run sys unit tests");
+    addUnitTestStep(b, target, optimize, test_filters, "test-pty", "src/pty.zig", "Run pty unit tests");
+    addUnitTestStep(b, target, optimize, test_filters, "test-native", "src/native.zig", "Run native unit tests");
+    addUnitTestStep(b, target, optimize, test_filters, "test-mux", "src/mux.zig", "Run mux unit tests");
+    addUnitTestStep(b, target, optimize, test_filters, "test-connect", "src/connect.zig", "Run connect unit tests");
+    addUnitTestStep(b, target, optimize, test_filters, "test-server", "src/server.zig", "Run server unit tests");
+    addUnitTestStep(b, target, optimize, test_filters, "test-daemon", "src/daemon.zig", "Run daemon unit tests");
+    addUnitTestStep(b, target, optimize, test_filters, "test-main", "src/main.zig", "Run main library unit tests");
     const test_integration_step = b.step("test-integration", "Run integration test suite");
     test_integration_step.dependOn(&b.addRunArtifact(integration_tests).step);
 
@@ -285,12 +269,14 @@ fn addUnitTestStep(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    filters: []const []const u8,
     step_name: []const u8,
     root: []const u8,
     description: []const u8,
 ) void {
     const unit_tests = b.addTest(.{
         .root_module = createRootModule(b, target, optimize, root),
+        .filters = filters,
     });
     const step = b.step(step_name, description);
     step.dependOn(&b.addRunArtifact(unit_tests).step);
@@ -347,14 +333,6 @@ fn createRootModule(
     });
     linkPtyLibraries(module, target);
     return module;
-}
-
-fn createConnectModule(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-) *std.Build.Module {
-    return createRootModule(b, target, optimize, "src/connect.zig");
 }
 
 /// `openpty(3)` lives in libutil on Linux; `proc_pidinfo(3)` in libproc on macOS.

@@ -5,7 +5,10 @@ const corpus = @import("corpus.zig");
 const ScrollbackBuffer = zmux.buffer.ScrollbackBuffer;
 const max_capacity = zmux.buffer.max_capacity;
 
-fn referenceCaptureLastLines(allocator: std.mem.Allocator, data: []const u8, max_lines: usize) ![]u8 {
+/// `truncated`: older bytes were evicted, so `data` may begin mid UTF-8
+/// sequence. A capture that starts at the window edge (not after a newline)
+/// then skips up to three continuation bytes.
+fn referenceCaptureLastLines(allocator: std.mem.Allocator, data: []const u8, max_lines: usize, truncated: bool) ![]u8 {
     if (max_lines == 0 or data.len == 0) return allocator.dupe(u8, "");
 
     var end = data.len;
@@ -23,6 +26,10 @@ fn referenceCaptureLastLines(allocator: std.mem.Allocator, data: []const u8, max
                 break;
             }
         }
+    }
+    if (cut == 0 and truncated) {
+        var skipped: usize = 0;
+        while (cut < data.len and skipped < 3 and (data[cut] & 0xc0) == 0x80) : (skipped += 1) cut += 1;
     }
     return allocator.dupe(u8, data[cut..]);
 }
@@ -111,7 +118,7 @@ fn fuzzScrollbackModel(_: void, smith: *std.testing.Smith) !void {
                     reference.items[reference.items.len - expected_cap ..]
                 else
                     reference.items;
-                const expected = try referenceCaptureLastLines(allocator, expected_tail, max_lines);
+                const expected = try referenceCaptureLastLines(allocator, expected_tail, max_lines, reference.items.len > expected_cap);
                 defer allocator.free(expected);
 
                 try std.testing.expectEqualSlices(u8, expected, actual);
@@ -141,6 +148,9 @@ fn fuzzScrollbackModel(_: void, smith: *std.testing.Smith) !void {
         try std.testing.expect(ring.start < ring.capacity());
         const expected_len = @min(reference.items.len, expected_cap);
         try std.testing.expectEqual(expected_len, ring.len);
+        // Stream offsets are monotonic across wraps.
+        try std.testing.expectEqual(@as(u64, reference.items.len), ring.endOffset());
+        try std.testing.expectEqual(@as(u64, reference.items.len - expected_len), ring.startOffset());
     }
 
     // Final full comparison at end of trace.

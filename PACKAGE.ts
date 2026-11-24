@@ -15,13 +15,14 @@ const files = (paths: ReadonlyArray<string>) => [...new Set(paths)].sort().map((
 const bufferSrcs = ["src/buffer.zig"] as const
 const protocolSrcs = ["src/protocol.zig"] as const
 const logSrcs = ["src/log.zig"] as const
-const foregroundSrcs = ["src/foreground.zig"] as const
 const sysSrcs = ["src/sys.zig"] as const
+const foregroundSrcs = ["src/foreground.zig", ...protocolSrcs, ...sysSrcs] as const
+const socketPathSrcs = ["src/socket_path.zig", ...sysSrcs] as const
 const rpcLineReaderSrcs = ["src/rpc_line_reader.zig", ...sysSrcs] as const
 const ptySrcs = ["src/pty.zig", ...sysSrcs] as const
 const nativeSrcs = ["src/native.zig", ...bufferSrcs, ...foregroundSrcs, ...ptySrcs, ...protocolSrcs] as const
 const muxSrcs = ["src/mux.zig", ...bufferSrcs, ...nativeSrcs] as const
-const connectSrcs = ["src/connect.zig", ...rpcLineReaderSrcs, ...protocolSrcs, ...sysSrcs] as const
+const connectSrcs = ["src/connect.zig", ...rpcLineReaderSrcs, ...protocolSrcs, ...socketPathSrcs, ...sysSrcs] as const
 const serverSrcs = [
   "src/server.zig",
   ...logSrcs,
@@ -29,10 +30,11 @@ const serverSrcs = [
   ...nativeSrcs,
   ...protocolSrcs,
   ...rpcLineReaderSrcs,
+  ...socketPathSrcs,
   ...sysSrcs,
   ...bufferSrcs
 ] as const
-const daemonSrcs = ["src/daemon.zig", ...logSrcs, ...protocolSrcs, ...serverSrcs, ...sysSrcs] as const
+const daemonSrcs = ["src/daemon.zig", ...logSrcs, ...protocolSrcs, ...serverSrcs, ...socketPathSrcs, ...sysSrcs] as const
 const mainSrcs = ["src/main.zig", ...daemonSrcs, ...connectSrcs] as const
 
 const unitTest = (step: string, cacheKey: string, srcs: ReadonlyArray<string>) =>

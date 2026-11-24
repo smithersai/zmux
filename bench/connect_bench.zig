@@ -42,68 +42,68 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(attach_resp);
 
     // 1. handleServerLine (matching pane_output: 1 KiB, 8 KiB, 64 KiB).
-    const HandleCtx = struct { allocator: std.mem.Allocator, line: []const u8, pane_id: []const u8, out_fd: sys.fd_t };
     try runner.run("handleServerLine_pane_output_1KiB", .{ .bytes_per_op = 1024 }, HandleCtx{
         .allocator = allocator,
+        .io = io,
         .line = notif_1k,
         .pane_id = "pane-1-deadbeef",
         .out_fd = devnull,
     }, struct {
         fn f(ctx: HandleCtx) !void {
-            const exited = try hooks.handleServerLineFn(ctx.allocator, ctx.line, ctx.pane_id, ctx.out_fd);
-            bench.doNotOptimize(exited);
+            try handleLine(ctx);
         }
     }.f);
 
     try runner.run("handleServerLine_pane_output_8KiB", .{ .bytes_per_op = 8 * 1024 }, HandleCtx{
         .allocator = allocator,
+        .io = io,
         .line = notif_8k,
         .pane_id = "pane-1-deadbeef",
         .out_fd = devnull,
     }, struct {
         fn f(ctx: HandleCtx) !void {
-            const exited = try hooks.handleServerLineFn(ctx.allocator, ctx.line, ctx.pane_id, ctx.out_fd);
-            bench.doNotOptimize(exited);
+            try handleLine(ctx);
         }
     }.f);
 
     try runner.run("handleServerLine_pane_output_64KiB", .{ .bytes_per_op = 64 * 1024 }, HandleCtx{
         .allocator = allocator,
+        .io = io,
         .line = notif_64k,
         .pane_id = "pane-1-deadbeef",
         .out_fd = devnull,
     }, struct {
         fn f(ctx: HandleCtx) !void {
-            const exited = try hooks.handleServerLineFn(ctx.allocator, ctx.line, ctx.pane_id, ctx.out_fd);
-            bench.doNotOptimize(exited);
+            try handleLine(ctx);
         }
     }.f);
 
     try runner.run("handleServerLine_other_pane_8KiB_skip", .{ .bytes_per_op = notif_8k.len }, HandleCtx{
         .allocator = allocator,
+        .io = io,
         .line = notif_8k,
         .pane_id = "pane-99-other",
         .out_fd = devnull,
     }, struct {
         fn f(ctx: HandleCtx) !void {
-            const exited = try hooks.handleServerLineFn(ctx.allocator, ctx.line, ctx.pane_id, ctx.out_fd);
-            bench.doNotOptimize(exited);
+            try handleLine(ctx);
         }
     }.f);
 
     try runner.run("handleServerLine_pane_activity_ignore", .{ .bytes_per_op = activity_notif.len }, HandleCtx{
         .allocator = allocator,
+        .io = io,
         .line = activity_notif,
         .pane_id = "pane-1-deadbeef",
         .out_fd = devnull,
     }, struct {
         fn f(ctx: HandleCtx) !void {
-            const exited = try hooks.handleServerLineFn(ctx.allocator, ctx.line, ctx.pane_id, ctx.out_fd);
-            bench.doNotOptimize(exited);
+            try handleLine(ctx);
         }
     }.f);
 
-    // 2. replayScrollbackFromAttach (256 KiB).
+    // 2. replayScrollbackFromAttach (256 KiB): parse the attach response, then
+    //    decode and write its replay, as readRpcResponse + replayScrollback do.
     const ReplayCtx = struct { allocator: std.mem.Allocator, payload: []const u8, out_fd: sys.fd_t };
     try runner.run("replayScrollbackFromAttach_256KiB", .{ .bytes_per_op = 256 * 1024 }, ReplayCtx{
         .allocator = allocator,
@@ -111,18 +111,21 @@ pub fn main(init: std.process.Init) !void {
         .out_fd = devnull,
     }, struct {
         fn f(ctx: ReplayCtx) !void {
-            try hooks.replayScrollbackFromAttachFn(ctx.allocator, ctx.payload, ctx.out_fd);
+            var parsed = try std.json.parseFromSlice(std.json.Value, ctx.allocator, ctx.payload, .{});
+            defer parsed.deinit();
+            try hooks.replayScrollbackFromAttachFn(ctx.allocator, parsed.value.object.get("result").?, ctx.out_fd);
         }
     }.f);
 
-    // 3. matchesRpcId on notification & matching response.
+    // 3. matchesRpcId on a notification: readRpcResponse's fast reject of a
+    //    backslash-free line with no "id" key, before any DOM parse.
     const MatchCtx = struct { allocator: std.mem.Allocator, line: []const u8 };
     try runner.run("matchesRpcId_notification_skip_8KiB", .{ .bytes_per_op = notif_8k.len }, MatchCtx{
         .allocator = allocator,
         .line = notif_8k,
     }, struct {
         fn f(ctx: MatchCtx) void {
-            bench.doNotOptimize(hooks.matchesRpcIdFn(ctx.allocator, ctx.line, 1));
+            bench.doNotOptimize(hooks.mayHaveKeyFn(ctx.line, "\"id\""));
         }
     }.f);
 
@@ -146,7 +149,9 @@ pub fn main(init: std.process.Init) !void {
         .line = session_list_resp,
     }, struct {
         fn f(ctx: MatchCtx) !void {
-            const out = try hooks.formatSessionListFn(ctx.allocator, ctx.line);
+            var parsed = try std.json.parseFromSlice(std.json.Value, ctx.allocator, ctx.line, .{});
+            defer parsed.deinit();
+            const out = try hooks.formatSessionListFn(ctx.allocator, parsed.value.object.get("result").?);
             bench.doNotOptimize(out.ptr);
             ctx.allocator.free(out);
         }
@@ -170,6 +175,19 @@ pub fn main(init: std.process.Init) !void {
     }.f);
 
     try runner.finish();
+}
+
+const HandleCtx = struct { allocator: std.mem.Allocator, io: std.Io, line: []const u8, pane_id: []const u8, out_fd: sys.fd_t };
+
+/// One run-loop step: decode a server line, then write any pane output.
+fn handleLine(ctx: HandleCtx) !void {
+    var state: hooks.RunStateKind = .{ .pane_id = ctx.pane_id, .client_id = "client-1", .generation = null, .next_offset = null };
+    defer if (state.switched_pane) |pane| ctx.allocator.free(pane);
+    var output: ?[]u8 = null;
+    defer if (output) |bytes| ctx.allocator.free(bytes);
+    const outcome = try hooks.handleServerLineFn(ctx.allocator, ctx.line, &state, &output, ctx.io);
+    bench.doNotOptimize(outcome);
+    if (output) |bytes| try sys.writeAll(ctx.out_fd, bytes);
 }
 
 fn makePaneOutputNotif(allocator: std.mem.Allocator, pane_id: []const u8, raw_len: usize) ![]u8 {

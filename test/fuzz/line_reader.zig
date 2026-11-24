@@ -57,6 +57,7 @@ fn fuzzLineReaderStreaming(_: void, smith: *std.testing.Smith) !void {
     sys.close(fds[1]);
 
     var reader: LineReader = .{};
+    defer reader.deinit();
     var cursor: usize = 0;
 
     while (true) {
@@ -145,9 +146,14 @@ fn fuzzLineReaderBufferedAndOom(_: void, smith: *std.testing.Smith) !void {
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_idx });
     const fa = failing.allocator();
 
-    while (true) {
+    // An oversized frame is MessageTooLarge, after which the reader
+    // resynchronizes on the next frame, so keep extracting. A trailing
+    // partial line moves into `pending` (owned by the reader until deinit).
+    var rounds: usize = 0;
+    while (rounds <= data.len + 1) : (rounds += 1) {
         const res = reader.nextBufferedLineAlloc(fa, max_len) catch |err| {
-            try std.testing.expect(err == error.MessageTooLarge or err == error.OutOfMemory);
+            if (err == error.MessageTooLarge) continue;
+            try std.testing.expectEqual(error.OutOfMemory, err);
             break;
         };
         const line = res orelse break;
@@ -155,10 +161,15 @@ fn fuzzLineReaderBufferedAndOom(_: void, smith: *std.testing.Smith) !void {
         try std.testing.expect(line.len >= 1);
         try std.testing.expectEqual(@as(u8, '\n'), line[line.len - 1]);
         try std.testing.expect(line.len <= max_len);
+        try std.testing.expect(std.mem.indexOfScalar(u8, line[0 .. line.len - 1], '\n') == null);
     }
+    try std.testing.expect(rounds <= data.len + 1);
 
     try std.testing.expect(reader.start <= reader.end);
     try std.testing.expect(reader.end <= reader.buffer.len);
+    try std.testing.expect(std.mem.indexOfScalar(u8, reader.pending.items, '\n') == null);
+    try std.testing.expect(reader.pending.items.len <= max_len);
+    reader.deinit();
     try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }
 

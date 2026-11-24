@@ -24,10 +24,13 @@ fn fuzzLinuxProcParsers(_: void, smith: *std.testing.Smith) !void {
     const argv = try foreground.parseLinuxProcCmdline(allocator, raw);
     defer foreground.freeArgv(allocator, argv);
 
-    const trimmed = std.mem.trimEnd(u8, raw, "\x00");
-    if (trimmed.len == 0) {
+    // Every argument is NUL-terminated: only the single final NUL is
+    // stripped, so empty arguments (`a\0\0` -> ["a", ""]) survive.
+    if (raw.len == 0) {
         try std.testing.expectEqual(@as(usize, 0), argv.len);
     } else {
+        const trimmed = if (raw[raw.len - 1] == 0) raw[0 .. raw.len - 1] else raw;
+        try std.testing.expectEqual(std.mem.count(u8, trimmed, "\x00") + 1, argv.len);
         var reconstructed: std.ArrayList(u8) = .empty;
         defer reconstructed.deinit(allocator);
         for (argv, 0..) |arg, idx| {
@@ -62,13 +65,12 @@ fn fuzzDarwinProcArgsBuffer(_: void, smith: *std.testing.Smith) !void {
     const argv = try foreground.parseProcArgsBuffer(allocator, raw, fallback);
     defer foreground.freeArgv(allocator, argv);
 
-    // Every parsed argument must be non-empty and NUL-free (unless fallback was
-    // returned verbatim with embedded NULs).
-    if (argv.len == 1 and fallback.len > 0 and std.mem.eql(u8, argv[0], fallback)) {
+    // Every parsed argument must be NUL-free (unless fallback was returned
+    // verbatim with embedded NULs). Empty arguments are legal: `git commit -m ""`.
+    if (argv.len == 1 and std.mem.eql(u8, argv[0], fallback)) {
         // Fallback path accepted verbatim.
     } else {
         for (argv) |arg| {
-            try std.testing.expect(arg.len > 0);
             try std.testing.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, arg, 0));
         }
     }
@@ -103,15 +105,22 @@ fn fuzzForegroundTracker(_: void, smith: *std.testing.Smith) !void {
             3 => smith.valueRangeAtMost(i32, 1, 8),
             else => smith.value(i32),
         };
-        const got = tracker.shouldEmitForPgid(pgid);
+        // `observe` is pure: it reports a change against the last committed
+        // group (the shell group included) and records nothing.
+        const got = tracker.observe(pgid);
+        try std.testing.expectEqual(got, tracker.observe(pgid));
         const expected = blk: {
             if (pgid <= 0) break :blk false;
-            if (ref_last) |last| {
-                if (last == pgid) break :blk false;
-            }
-            ref_last = pgid;
-            break :blk pgid != shell_pid;
+            if (ref_last) |last| break :blk last != pgid;
+            break :blk true;
         };
+        // The emit may fail; only a successful emit commits, so a failed
+        // one is retried on the next poll.
+        if (got and smith.value(bool)) {
+            tracker.commit(pgid);
+            ref_last = pgid;
+            try std.testing.expect(!tracker.observe(pgid));
+        }
         try std.testing.expectEqual(expected, got);
     }
 }
@@ -155,4 +164,15 @@ test "fuzz: foreground Darwin KERN_PROCARGS2 binary parser and OOM safety" {
 
 test "fuzz: foreground.Tracker PGID deduplication state machine" {
     try std.testing.fuzz({}, fuzzForegroundTracker, .{});
+}
+
+test "parseProcArgs: OOM in fallback after an empty argv area does not double free" {
+    // argc = 1 and no argv bytes: the parser discards its argv list and
+    // falls back. Fail the fallback allocation (index 1; index 0 is the argv
+    // capacity) so the errdefer runs over the discarded list.
+    var raw: [8]u8 = @splat(0);
+    std.mem.writeInt(u32, raw[0..4], 1, builtin.cpu.arch.endian());
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, foreground.parseProcArgsBuffer(failing.allocator(), &raw, "/bin/sh"));
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }

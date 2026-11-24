@@ -78,21 +78,25 @@ pub fn main(init: std.process.Init) !void {
             const title = try std.fmt.bufPrint(&title_buf, "session-{d}", .{s});
             var s_opts = opts;
             s_opts.title = title;
-            const p0 = try manager.createSessionPane(s_opts);
+            var p0 = try manager.createSessionPane(s_opts);
+            defer p0.deinit();
             const s_id = try allocator.dupe(u8, p0.session_id);
             defer allocator.free(s_id);
-            const p0_id = try allocator.dupe(u8, p0.id);
+            const p0_id = try allocator.dupe(u8, p0.pane_id);
             try pane_ids.append(allocator, p0_id);
 
-            const p1 = try manager.splitPane(p0_id, .horizontal, opts);
-            try pane_ids.append(allocator, try allocator.dupe(u8, p1.id));
+            var p1 = try manager.splitPane(p0_id, .horizontal, opts);
+            defer p1.deinit();
+            try pane_ids.append(allocator, try allocator.dupe(u8, p1.pane_id));
 
-            const p2 = try manager.newWindow(s_id, opts);
-            const p2_id = try allocator.dupe(u8, p2.id);
+            var p2 = try manager.newWindow(s_id, opts);
+            defer p2.deinit();
+            const p2_id = try allocator.dupe(u8, p2.pane_id);
             try pane_ids.append(allocator, p2_id);
 
-            const p3 = try manager.splitPane(p2_id, .vertical, opts);
-            try pane_ids.append(allocator, try allocator.dupe(u8, p3.id));
+            var p3 = try manager.splitPane(p2_id, .vertical, opts);
+            defer p3.deinit();
+            try pane_ids.append(allocator, try allocator.dupe(u8, p3.pane_id));
         }
 
         var attached_clients: std.ArrayList([]u8) = .empty;
@@ -137,9 +141,15 @@ pub fn main(init: std.process.Init) !void {
             }
         }.f);
 
-        try runner.run("manager_markActivity_last_of_16_panes", .{}, MgrIdCtx{ .mgr = &manager, .id = last_pane_id }, struct {
-            fn f(ctx: MgrIdCtx) void {
-                ctx.mgr.markActivity(ctx.id);
+        const MgrMarkCtx = struct { mgr: *mux.Manager, id: []const u8, generation: u64 };
+        const last_generation = blk: {
+            const native = manager.find(last_pane_id).?;
+            defer native.release();
+            break :blk native.generation();
+        };
+        try runner.run("manager_markActivity_last_of_16_panes", .{}, MgrMarkCtx{ .mgr = &manager, .id = last_pane_id, .generation = last_generation }, struct {
+            fn f(ctx: MgrMarkCtx) void {
+                ctx.mgr.markActivity(ctx.id, ctx.generation, 1);
             }
         }.f);
 

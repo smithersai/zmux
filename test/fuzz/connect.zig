@@ -58,16 +58,43 @@ fn fuzzConnectParsersAndFormatters(_: void, smith: *std.testing.Smith) !void {
     var req_obj = try corpus.parseSingleLineJsonObject(allocator, req_frame);
     defer req_obj.deinit();
 
-    // 4. Response parsers on arbitrary untrusted server lines
-    const expected_id = smith.value(u32);
-    _ = hooks.matchesRpcIdFn(allocator, raw, expected_id);
-    _ = hooks.isPaneNotFoundFn(raw);
+    // 4. Response parsers on arbitrary untrusted server lines. The old string
+    //    helpers (rpcErrorMessage, isPaneNotFound, paneId/clientIdFromAttach)
+    //    became `RpcError.fromEnvelope` and `requiredString` over one DOM.
+    const verb_target: ?[]const u8 = if (verb == .kill or verb == .rename) s1 else null;
+    const verb_name: ?[]const u8 = if (verb == .rename) s2 else null;
+    var raw_parsed: ?std.json.Parsed(std.json.Value) = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch null;
+    defer if (raw_parsed) |*p| p.deinit();
+    if (raw_parsed) |p| {
+        const envelope = p.value;
+        if (hooks.rpcErrorFromEnvelopeFn(envelope)) |rpc_err| {
+            try std.testing.expect(rpc_err.message.len > 0);
+        }
+        const result = if (envelope == .object) envelope.object.get("result") orelse .null else .null;
+        if (hooks.requiredStringFn(result, "paneId")) |pid| try std.testing.expect(pid.len > 0) else |_| {}
+        if (hooks.requiredStringFn(result, "clientId")) |cid| try std.testing.expect(cid.len > 0) else |_| {}
+        if (hooks.formatSessionListFn(allocator, result)) |out| allocator.free(out) else |_| {}
+        if (hooks.formatVerbResultFn(allocator, verb, verb_target, verb_name, result)) |out| allocator.free(out) else |_| {}
+    }
 
-    if (hooks.paneIdFromAttachFn(allocator, raw)) |pid| allocator.free(pid) else |_| {}
-    if (hooks.clientIdFromAttachFn(allocator, raw)) |cid| allocator.free(cid) else |_| {}
-    if (hooks.rpcErrorMessageFn(allocator, raw)) |msg| allocator.free(msg);
-    if (hooks.formatSessionListFn(allocator, raw)) |out| allocator.free(out) else |_| {}
-    if (hooks.formatVerbResultFn(allocator, verb, s1, s2, raw)) |out| allocator.free(out) else |_| {}
+    //    matchesRpcId became `readRpcResponse`: it returns only the response
+    //    carrying `expected_id`, or a null-id error envelope.
+    {
+        const expected_id = smith.value(u32);
+        const pair = try sys.socketPair();
+        defer sys.close(pair[0]);
+        sys.sendAll(pair[1], raw) catch {};
+        sys.sendAll(pair[1], "\n") catch {};
+        sys.close(pair[1]);
+        var reader: LineReader = .{};
+        defer reader.deinit();
+        if (hooks.readRpcResponseFn(allocator, &reader, pair[0], expected_id, hooks.RpcDeadline.fromNow(std.testing.io, 200))) |resp| {
+            defer hooks.deinitResponse(resp, allocator);
+            const id = resp.parsed.value.object.get("id").?;
+            try std.testing.expect((id == .integer and id.integer == expected_id) or
+                (id == .null and hooks.rpcErrorFromEnvelopeFn(resp.parsed.value) != null));
+        } else |_| {}
+    }
 
     // 5. replayScrollbackFromAttach + handleServerLine on arbitrary untrusted lines
     // Use a non-blocking pipe or drain pipe after each call so pipes never block.
@@ -77,8 +104,14 @@ fn fuzzConnectParsersAndFormatters(_: void, smith: *std.testing.Smith) !void {
     try sys.setNonBlocking(pipe_fds[0]);
     try sys.setNonBlocking(pipe_fds[1]);
 
-    hooks.replayScrollbackFromAttachFn(allocator, raw, pipe_fds[1]) catch {};
-    _ = hooks.handleServerLineFn(allocator, raw, s1, pipe_fds[1]) catch {};
+    if (raw_parsed) |p| {
+        if (p.value == .object) {
+            const result = p.value.object.get("result") orelse .null;
+            hooks.replayScrollbackFromAttachFn(allocator, result, pipe_fds[1]) catch {};
+        }
+    }
+    // Differential: the backslash-free fast path must agree with the DOM path.
+    try expectFastPathMatchesDom(allocator, raw, s1);
 
     // Also test valid pane_output round-trip through handleServerLine!
     const b64 = try hooks.b64EncodeFn(allocator, raw);
@@ -90,47 +123,35 @@ fn fuzzConnectParsersAndFormatters(_: void, smith: *std.testing.Smith) !void {
     );
     defer allocator.free(valid_output);
 
-    const out_pipe = try sys.pipe();
-    defer sys.close(out_pipe[0]);
-    const should_exit = try hooks.handleServerLineFn(allocator, valid_output, s1, out_pipe[1]);
-    sys.close(out_pipe[1]);
-    try std.testing.expect(!should_exit);
-
-    var got_out: std.ArrayList(u8) = .empty;
-    defer got_out.deinit(allocator);
-    var rbuf: [512]u8 = undefined;
-    while (true) {
-        const n = try sys.read(out_pipe[0], &rbuf);
-        if (n == 0) break;
-        try got_out.appendSlice(allocator, rbuf[0..n]);
+    {
+        var state = newRunState(s1);
+        defer freeRunState(allocator, &state);
+        var output: ?[]u8 = null;
+        defer if (output) |o| allocator.free(o);
+        const outcome = try hooks.handleServerLineFn(allocator, valid_output, &state, &output, std.testing.io);
+        try std.testing.expect(outcome == null);
+        try std.testing.expectEqualSlices(u8, raw, output orelse "");
     }
-    try std.testing.expectEqualSlices(u8, raw, got_out.items);
+    try expectFastPathMatchesDom(allocator, valid_output, s1);
 
-    // 6. connectFailureMessage
-    const errs = [_]anyerror{
-        error.ConnectionRefused,
-        error.FileNotFound,
-        error.DaemonUnavailable,
-        error.AccessDenied,
-    };
-    const chosen_err = errs[smith.index(errs.len)];
-    if (try hooks.connectFailureMessageFn(allocator, s1, chosen_err)) |msg| {
-        defer allocator.free(msg);
-        try std.testing.expect(std.mem.indexOf(u8, msg, s1) != null);
-    }
-
-    // 7. Semantic differential invariants:
-    //    (a) replayScrollbackFromAttach must handle standard JSON whitespace too.
+    // 6. Semantic differential invariants:
+    //    (a) replayScrollback must handle standard JSON whitespace too.
     const pretty_attach = try std.fmt.allocPrint(
         allocator,
         "{{\"jsonrpc\": \"2.0\", \"id\": 1, \"result\": {{\"clientId\": \"c1\", \"paneId\": \"p1\", \"replayBase64\": {f}}}}}\n",
         .{std.json.fmt(b64, .{})},
     );
     defer allocator.free(pretty_attach);
+    var pretty_parsed = try std.json.parseFromSlice(std.json.Value, allocator, pretty_attach, .{});
+    defer pretty_parsed.deinit();
+    const pretty_result = pretty_parsed.value.object.get("result").?;
+    try std.testing.expectEqualStrings("p1", try hooks.requiredStringFn(pretty_result, "paneId"));
+    try std.testing.expectEqualStrings("c1", try hooks.requiredStringFn(pretty_result, "clientId"));
     const replay_pipe = try sys.pipe();
     defer sys.close(replay_pipe[0]);
-    try hooks.replayScrollbackFromAttachFn(allocator, pretty_attach, replay_pipe[1]);
+    try hooks.replayScrollbackFromAttachFn(allocator, pretty_result, replay_pipe[1]);
     sys.close(replay_pipe[1]);
+    var rbuf: [512]u8 = undefined;
     var replay_got: std.ArrayList(u8) = .empty;
     defer replay_got.deinit(allocator);
     while (true) {
@@ -140,26 +161,77 @@ fn fuzzConnectParsersAndFormatters(_: void, smith: *std.testing.Smith) !void {
     }
     try std.testing.expectEqualSlices(u8, raw, replay_got.items);
 
-    //    (b) Corrupt base64 in a pane_output notification must NOT crash handleServerLine.
+    //    (b) Corrupt base64 in a pane_output notification must NOT crash
+    //        handleServerLine, surface an error, or emit output.
     const bad_b64_line = try std.fmt.allocPrint(
         allocator,
         "{{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{{\"pane_id\":{f},\"data_base64\":\"!!!not-valid-b64!!!\"}}}}\n",
         .{std.json.fmt(s1, .{})},
     );
     defer allocator.free(bad_b64_line);
-    const bad_exit = try hooks.handleServerLineFn(allocator, bad_b64_line, s1, pipe_fds[1]);
-    try std.testing.expect(!bad_exit);
+    {
+        var state = newRunState(s1);
+        defer freeRunState(allocator, &state);
+        var output: ?[]u8 = null;
+        defer if (output) |o| allocator.free(o);
+        const bad_outcome = try hooks.handleServerLineFn(allocator, bad_b64_line, &state, &output, std.testing.io);
+        try std.testing.expect(bad_outcome == null);
+        try std.testing.expect(output == null);
+    }
 
-    //    (c) OOM safety on connect response parsers/formatters.
+    //    (c) OOM safety on connect request builders and response formatters.
     const fail_idx = smith.valueRangeAtMost(u8, 0, 8);
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_idx });
     const fa = failing.allocator();
     if (hooks.buildVerbRequestFn(fa, verb, s1, s2)) |r| fa.free(r) else |_| {}
-    if (hooks.formatSessionListFn(fa, raw)) |r| fa.free(r) else |_| {}
-    if (hooks.paneIdFromAttachFn(fa, pretty_attach)) |r| fa.free(r) else |_| {}
-    if (hooks.clientIdFromAttachFn(fa, pretty_attach)) |r| fa.free(r) else |_| {}
-    if (hooks.rpcErrorMessageFn(fa, raw)) |r| fa.free(r);
+    if (raw_parsed) |p| {
+        const result = if (p.value == .object) p.value.object.get("result") orelse .null else .null;
+        if (hooks.formatSessionListFn(fa, result)) |r| fa.free(r) else |_| {}
+    }
+    {
+        var state = newRunState(s1);
+        defer freeRunState(fa, &state);
+        var output: ?[]u8 = null;
+        defer if (output) |o| fa.free(o);
+        _ = hooks.handleServerLineFn(fa, valid_output, &state, &output, std.testing.io) catch {};
+    }
     try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+fn newRunState(pane_id: []const u8) hooks.RunStateKind {
+    return .{ .pane_id = pane_id, .client_id = "client-1", .generation = null, .next_offset = null };
+}
+
+fn freeRunState(allocator: std.mem.Allocator, state: *hooks.RunStateKind) void {
+    if (state.switched_pane) |pane| allocator.free(pane);
+    state.switched_pane = null;
+}
+
+/// `handleServerLine` skips the DOM parse for backslash-free lines; its
+/// outcome, output, and state change must equal `handleServerLineDom`'s.
+fn expectFastPathMatchesDom(allocator: std.mem.Allocator, line: []const u8, pane_id: []const u8) !void {
+    const io = std.testing.io;
+    var fast_state = newRunState(pane_id);
+    defer freeRunState(allocator, &fast_state);
+    var dom_state = newRunState(pane_id);
+    defer freeRunState(allocator, &dom_state);
+    var fast_out: ?[]u8 = null;
+    defer if (fast_out) |o| allocator.free(o);
+    var dom_out: ?[]u8 = null;
+    defer if (dom_out) |o| allocator.free(o);
+
+    const fast = hooks.handleServerLineFn(allocator, line, &fast_state, &fast_out, io);
+    const dom = hooks.handleServerLineDomFn(allocator, line, &dom_state, &dom_out, io);
+    if (dom) |dom_outcome| {
+        try std.testing.expectEqual(dom_outcome, try fast);
+    } else |dom_err| {
+        try std.testing.expectError(dom_err, fast);
+    }
+    try std.testing.expectEqualSlices(u8, dom_out orelse "", fast_out orelse "");
+    try std.testing.expectEqual(dom_out == null, fast_out == null);
+    try std.testing.expectEqualStrings(dom_state.pane_id, fast_state.pane_id);
+    try std.testing.expectEqual(dom_state.generation, fast_state.generation);
+    try std.testing.expectEqual(dom_state.next_offset, fast_state.next_offset);
 }
 
 fn fuzzConnectCliParsers(_: void, smith: *std.testing.Smith) !void {
@@ -240,19 +312,21 @@ fn fuzzConnectProtocolFlows(_: void, smith: *std.testing.Smith) !void {
             // Feed arbitrary interleaved notifications + responses for ids 1, 2, 3, then close write half.
             const scenario = smith.valueRangeAtMost(u8, 0, 4);
             switch (scenario) {
-                0 => try hooks.writeAllFn(pair[1], "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{}}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"clientId\":\"c1\",\"paneId\":\"p1\"}}\n"),
-                1 => try hooks.writeAllFn(pair[1], "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"PaneNotFound\"}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"id\":\"p1\"}}\n{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"clientId\":\"c2\",\"paneId\":\"p2\"}}\n"),
-                2 => try hooks.writeAllFn(pair[1], "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"PaneNotFound\"}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"bad\"}}\n"),
+                0 => try sys.sendAll(pair[1], "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{}}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"clientId\":\"c1\",\"paneId\":\"p1\"}}\n"),
+                1 => try sys.sendAll(pair[1], "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"PaneNotFound\"}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"id\":\"p1\"}}\n{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"clientId\":\"c2\",\"paneId\":\"p2\"}}\n"),
+                2 => try sys.sendAll(pair[1], "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"PaneNotFound\"}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"bad\"}}\n"),
                 3 => {
                     var raw_buf: [256]u8 = undefined;
                     const raw = corpus.drawBytes(smith, &raw_buf);
-                    try hooks.writeAllFn(pair[1], raw);
+                    try sys.sendAll(pair[1], raw);
                 },
-                else => try hooks.writeAllFn(pair[1], "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"other\"}}\n"),
+                else => try sys.sendAll(pair[1], "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"other\"}}\n"),
             }
             _ = std.c.shutdown(pair[1], @intCast(std.posix.SHUT.WR));
 
             var reader: LineReader = .{};
+
+            defer reader.deinit();
             if (hooks.attachOrCreateFn(
                 allocator,
                 &reader,
@@ -263,7 +337,7 @@ fn fuzzConnectProtocolFlows(_: void, smith: *std.testing.Smith) !void {
                 null,
                 hooks.RpcDeadline.fromNow(io, 500),
             )) |resp| {
-                allocator.free(resp);
+                hooks.deinitResponse(resp, allocator);
             } else |_| {}
         },
         .execute_verb => {
@@ -281,14 +355,16 @@ fn fuzzConnectProtocolFlows(_: void, smith: *std.testing.Smith) !void {
             const json_mode = smith.value(bool);
             var raw_buf: [256]u8 = undefined;
             if (smith.value(bool)) {
-                try hooks.writeAllFn(pair[1], "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":[]}\n");
+                try sys.sendAll(pair[1], "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":[]}\n");
             } else {
                 const raw = corpus.drawBytes(smith, &raw_buf);
-                try hooks.writeAllFn(pair[1], raw);
+                try sys.sendAll(pair[1], raw);
             }
             _ = std.c.shutdown(pair[1], @intCast(std.posix.SHUT.WR));
 
             var reader: LineReader = .{};
+
+            defer reader.deinit();
             hooks.executeVerbFn(
                 allocator,
                 pair[0],
@@ -308,13 +384,14 @@ fn fuzzConnectProtocolFlows(_: void, smith: *std.testing.Smith) !void {
 
             var raw_buf: [256]u8 = undefined;
             const raw = corpus.drawBytes(smith, &raw_buf);
-            try hooks.writeAllFn(pair[1], raw);
+            try sys.sendAll(pair[1], raw);
             _ = std.c.shutdown(pair[1], @intCast(std.posix.SHUT.WR));
 
+            // daemonVersion became warnOnVersionMismatch: the same daemon.ping
+            // round trip, which warns instead of returning the version.
             var reader: LineReader = .{};
-            if (hooks.daemonVersionFn(allocator, &reader, pair[0], hooks.RpcDeadline.fromNow(io, 500))) |ver| {
-                allocator.free(ver);
-            } else |_| {}
+            defer reader.deinit();
+            hooks.warnOnVersionMismatchFn(allocator, &reader, pair[0], hooks.RpcDeadline.fromNow(io, 500)) catch {};
         },
         .run_loop => {
             const stdin_fds = try sys.pipe();
@@ -344,9 +421,9 @@ fn fuzzConnectProtocolFlows(_: void, smith: *std.testing.Smith) !void {
             if (smith.value(bool)) {
                 var srv_buf: [256]u8 = undefined;
                 const srv_bytes = corpus.drawBytes(smith, &srv_buf);
-                if (srv_bytes.len > 0) try hooks.writeAllFn(sock_pair[1], srv_bytes);
+                if (srv_bytes.len > 0) try sys.sendAll(sock_pair[1], srv_bytes);
             } else {
-                try hooks.writeAllFn(
+                try sys.sendAll(
                     sock_pair[1],
                     "{\"jsonrpc\":\"2.0\",\"method\":\"session_exited\",\"params\":{\"session_id\":\"pane-1\",\"pid\":1}}\n",
                 );
@@ -357,14 +434,14 @@ fn fuzzConnectProtocolFlows(_: void, smith: *std.testing.Smith) !void {
 
             const detach_key: ?u8 = if (smith.value(bool)) hooks.default_detach else null;
             var reader: LineReader = .{};
+            defer reader.deinit();
             _ = hooks.runLoopFn(
                 stdin_fds[0],
                 stdout_fds[1],
                 sock_pair[0],
                 &reader,
                 allocator,
-                "pane-1",
-                .{ .detach_key = detach_key, .client_id = "client-1" },
+                .{ .pane_id = "pane-1", .detach_key = detach_key, .client_id = "client-1", .io = io },
             ) catch {};
         },
     }

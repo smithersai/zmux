@@ -2,13 +2,20 @@ const std = @import("std");
 const builtin = @import("builtin");
 const rpc_line_reader = @import("rpc_line_reader.zig");
 const protocol = @import("protocol.zig");
+const socket_path = @import("socket_path.zig");
+const c = std.c;
 
 const posix = std.posix;
 const sys = @import("sys.zig");
 const LineReader = rpc_line_reader.LineReader;
 
 const buffer_size: usize = 32 * 1024;
-const rpc_line_max: usize = 1024 * 1024;
+const rpc_line_max: usize = 16 * 1024 * 1024;
+const outbound_max: usize = 1024 * 1024;
+const write_timeout_ms: i64 = 2_000;
+const spawn_timeout_ms: i64 = 4_000;
+const partial_frame_timeout_ms: i64 = 30_000;
+const pipe_quiet_ms: i64 = 2_000;
 const run_loop_poll_timeout_ms: i32 = 100;
 const bootstrap_response_timeout_ms: i64 = 10_000;
 const version_handshake_timeout_ms: i64 = 2_000;
@@ -19,20 +26,25 @@ const version_handshake_timeout_ms: i64 = 2_000;
 // --detach-key (ctrl-<letter> | none).
 const default_detach_key: u8 = 0x1C;
 
-// JSON-RPC ids reserved by the client. Attach/create use 1..3, resize uses 3,
-// send uses 2; keep these distinct so their responses are unambiguous.
 const ping_rpc_id: u32 = 100;
-const detach_rpc_id: u32 = 5;
 const verb_rpc_id: u32 = 1;
+const attach_rpc_id: u32 = 1;
+const first_interactive_id: u32 = 101;
 
-var g_saved_termios: ?posix.termios = null;
+var g_terminal_active = std.atomic.Value(bool).init(false);
+var g_saved_termios: posix.termios = undefined;
+var g_raw_termios: posix.termios = undefined;
 var g_saved_termios_fd: posix.fd_t = 0;
+var g_termios_saved = std.atomic.Value(bool).init(false);
+var g_restore_output = std.atomic.Value(bool).init(false);
+var g_output_fd: posix.fd_t = 1;
+var g_output_flags: c_int = 0;
 var g_winch_flag = std.atomic.Value(bool).init(false);
 
 pub const panic = std.debug.FullPanic(connectPanic);
 
 fn connectPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
-    restoreTermios();
+    leaveTerminal();
     std.debug.defaultPanic(msg, first_trace_addr);
 }
 
@@ -46,6 +58,10 @@ const Deadline = struct {
         return .{ .io = io, .at = .fromNow(io, .{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake }) };
     }
 
+    fn remainingMs(self: Deadline) i64 {
+        return @intCast(@max(0, self.at.durationFromNow(self.io).raw.toNanoseconds() + std.time.ns_per_ms - 1) / std.time.ns_per_ms);
+    }
+
     fn timeout(self: Deadline) std.Io.Timeout {
         return .{ .deadline = self.at };
     }
@@ -54,13 +70,9 @@ const Deadline = struct {
 pub fn main(init: std.process.Init) void {
     runMain(init) catch |err| {
         switch (err) {
-            error.InvalidArguments, error.ReadTimeout, error.RpcError => {},
-            else => {
-                var buf: [1024]u8 = undefined;
-                var w = std.Io.File.stderr().writerStreaming(init.io, &buf);
-                w.interface.print("zmux-connect: {s}\n", .{@errorName(err)}) catch {};
-                w.interface.flush() catch {};
-            },
+            error.InvalidArguments => std.process.exit(2),
+            error.ReportedFailure, error.RpcError => {},
+            else => printDiagnostic(init.io, "{s}", .{@errorName(err)}),
         }
         std.process.exit(1);
     };
@@ -93,28 +105,34 @@ pub const ParseAttachArgsFailure = struct {
 
 pub fn parseAttachArgs(argv: []const []const u8, failure: ?*ParseAttachArgsFailure) ParseAttachArgsError!ParsedAttachArgs {
     var parsed: ParsedAttachArgs = .{};
+    var options = true;
+    var explicit_attach = false;
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
-        if (std.mem.eql(u8, a, "--socket")) {
+        if (options and std.mem.eql(u8, a, "--")) {
+            options = false;
+        } else if (options and std.mem.eql(u8, a, "attach") and parsed.session_id == null and !explicit_attach) {
+            explicit_attach = true;
+        } else if (options and std.mem.eql(u8, a, "--socket")) {
             i += 1;
             if (i >= argv.len) {
                 if (failure) |f| f.* = .{ .err = error.MissingSocketValue };
                 return error.MissingSocketValue;
             }
             parsed.explicit_socket_path = argv[i];
-        } else if (std.mem.eql(u8, a, "--spawn-daemon")) {
+        } else if (options and std.mem.eql(u8, a, "--spawn-daemon")) {
             parsed.spawn_daemon = true;
-        } else if (std.mem.eql(u8, a, "--no-create")) {
+        } else if (options and std.mem.eql(u8, a, "--no-create")) {
             parsed.auto_create = false;
-        } else if (std.mem.eql(u8, a, "--command")) {
+        } else if (options and std.mem.eql(u8, a, "--command")) {
             i += 1;
             if (i >= argv.len) {
                 if (failure) |f| f.* = .{ .err = error.MissingCommandValue };
                 return error.MissingCommandValue;
             }
             parsed.create_command = argv[i];
-        } else if (std.mem.eql(u8, a, "--detach-key")) {
+        } else if (options and std.mem.eql(u8, a, "--detach-key")) {
             i += 1;
             if (i >= argv.len) {
                 if (failure) |f| f.* = .{ .err = error.MissingDetachKeyValue };
@@ -124,12 +142,12 @@ pub fn parseAttachArgs(argv: []const []const u8, failure: ?*ParseAttachArgsFailu
                 if (failure) |f| f.* = .{ .err = error.InvalidDetachKeyValue, .arg = argv[i] };
                 return error.InvalidDetachKeyValue;
             };
-        } else if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "-V")) {
+        } else if (options and (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "-V"))) {
             parsed.show_version = true;
-        } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+        } else if (options and (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h"))) {
             parsed.show_help = true;
             return parsed;
-        } else if (a.len > 0 and a[0] == '-') {
+        } else if (options and a.len > 0 and a[0] == '-') {
             if (failure) |f| f.* = .{ .err = error.UnknownFlag, .arg = a };
             return error.UnknownFlag;
         } else if (parsed.session_id == null) {
@@ -148,12 +166,15 @@ fn runMain(init: std.process.Init) !void {
 
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
 
-    // Management verbs (`ls`, `kill`, `rename`, `shutdown`) are dispatched from
-    // the first positional token. A bare `zmux-connect <name>` still attaches,
-    // so anything that isn't a known verb falls through to the attach path.
-    if (argv.len >= 2) {
-        if (parseVerb(argv[1])) |verb| {
-            return runVerb(allocator, io, init.environ_map, verb, argv[2..]);
+    // Global socket options may precede the management verb.
+    var verb_index: usize = 1;
+    var global_socket: ?[]const u8 = null;
+    while (verb_index + 1 < argv.len and std.mem.eql(u8, argv[verb_index], "--socket")) : (verb_index += 2) {
+        global_socket = argv[verb_index + 1];
+    }
+    if (verb_index < argv.len) {
+        if (parseVerb(argv[verb_index])) |verb| {
+            return runVerb(allocator, io, verb, argv[verb_index + 1 ..], global_socket);
         }
     }
 
@@ -162,9 +183,9 @@ fn runMain(init: std.process.Init) !void {
         error.MissingSocketValue => return fail(io, "missing value for --socket", .{}),
         error.MissingCommandValue => return fail(io, "missing value for --command", .{}),
         error.MissingDetachKeyValue => return fail(io, "missing value for --detach-key", .{}),
-        error.InvalidDetachKeyValue => return fail(io, "invalid --detach-key: {s}", .{failure.arg.?}),
-        error.UnknownFlag => return fail(io, "unknown flag: {s}", .{failure.arg.?}),
-        error.UnexpectedArgument => return fail(io, "unexpected argument: {s}", .{failure.arg.?}),
+        error.InvalidDetachKeyValue => return fail(io, "invalid --detach-key: {f}", .{escaped(failure.arg.?)}),
+        error.UnknownFlag => return fail(io, "unknown flag: {f}", .{escaped(failure.arg.?)}),
+        error.UnexpectedArgument => return fail(io, "unexpected argument: {f}", .{escaped(failure.arg.?)}),
     };
 
     if (parsed.show_help) {
@@ -176,111 +197,65 @@ fn runMain(init: std.process.Init) !void {
         return;
     }
 
-    const session_id = parsed.session_id;
-    const explicit_socket_path = parsed.explicit_socket_path;
-    const spawn_daemon = parsed.spawn_daemon;
-    const auto_create = parsed.auto_create;
-    const create_command = parsed.create_command;
-    const detach_key = parsed.detach_key;
-
-    const sid = session_id orelse return fail(io, "session_id is required", .{});
-
-    const path = if (explicit_socket_path) |value|
-        try allocator.dupe(u8, value)
-    else
-        try resolveSocketPath(allocator, init.environ_map);
+    const sid = parsed.session_id orelse return fail(io, "session_id is required", .{});
+    const path = try resolveSocketPath(allocator, io, parsed.explicit_socket_path);
     defer allocator.free(path);
 
-    const socket_fd = connectWithRetry(allocator, io, path, spawn_daemon) catch |err| {
-        if (try connectFailureMessage(allocator, path, err)) |message| {
-            defer allocator.free(message);
-            return fail(io, "{s}", .{message});
-        }
-        return err;
-    };
+    const socket_fd = try connectWithRetry(allocator, io, path, parsed.spawn_daemon);
     defer sys.close(socket_fd);
-    var socket_reader: LineReader = .{};
+    var reader: LineReader = .{};
+    defer reader.deinit();
 
-    // Probe the daemon's protocol version before attaching. A version skew is
-    // only a warning: the daemon persists across upgrades by design, so we
-    // continue rather than abort. Uses its own short deadline so a hung daemon
-    // here does not eat into the attach budget below.
-    warnOnVersionMismatch(
-        allocator,
-        &socket_reader,
-        socket_fd,
-        .fromNow(io, version_handshake_timeout_ms),
-    );
-
-    const initial_size = terminalSize(0) orelse @as(TerminalSize, .{ .rows = 24, .cols = 80 });
-    const attach_response = try attachOrCreate(
-        allocator,
-        &socket_reader,
-        socket_fd,
-        sid,
-        initial_size,
-        auto_create,
-        create_command,
-        .fromNow(io, bootstrap_response_timeout_ms),
-    );
-    defer allocator.free(attach_response);
-    if (findJsonField(attach_response, "\"error\"")) |_| {
-        try stderrWrite(io, attach_response);
-        std.process.exit(1);
-    }
-
-    // The user may have launched us with a session NAME ("work"), but every
-    // subsequent RPC (`session.send`, `session.resize`) is routed through
-    // the daemon's pane lookup, which is keyed on the auto-generated pane
-    // id. Pull the canonical paneId out of the attach response so we don't
-    // try to resolve a name on every keystroke.
-    const target_pane_id = paneIdFromAttach(allocator, attach_response) catch try allocator.dupe(u8, sid);
-    defer allocator.free(target_pane_id);
-
-    // The logical clientId identifies this attachment to the daemon; we need it
-    // to send `client.detach` when the user hits the detach chord. If the
-    // response somehow omits it we detach locally without notifying the daemon.
-    const client_id: ?[]u8 = clientIdFromAttach(allocator, attach_response) catch null;
-    defer if (client_id) |cid| allocator.free(cid);
+    try warnOnVersionMismatch(allocator, &reader, socket_fd, .fromNow(io, version_handshake_timeout_ms));
 
     const stdin_fd: posix.fd_t = 0;
     const stdout_fd: posix.fd_t = 1;
+    const is_tty = sys.isatty(stdin_fd);
+    const size = currentTerminalSize(stdout_fd, stdin_fd) orelse TerminalSize{ .rows = 24, .cols = 80 };
+    const deadline = Deadline.fromNow(io, bootstrap_response_timeout_ms);
+    var attach = try attachOrCreate(allocator, &reader, socket_fd, sid, size, parsed.auto_create, parsed.create_command, deadline);
+    defer attach.deinit(allocator);
 
-    const stdin_is_tty = sys.isatty(stdin_fd);
-    if (stdin_is_tty) try enterRawMode(stdin_fd);
-    defer restoreTermios();
+    var previous_mask: posix.sigset_t = undefined;
+    const signals = terminalSignalSet();
+    posix.sigprocmask(posix.SIG.BLOCK, &signals, &previous_mask);
+    installTerminalHandlers();
+    g_terminal_active.store(true, .seq_cst);
+    const setup = enterTerminal(stdin_fd, stdout_fd, is_tty);
+    posix.sigprocmask(posix.SIG.SETMASK, &previous_mask, null);
+    defer leaveTerminal();
+    try setup;
 
-    installSigwinchHandler();
-    installExitRestoreHandlers();
-
-    replayScrollbackFromAttach(allocator, attach_response, stdout_fd) catch {};
-
-    // Send an initial resize from our terminal's current size, if known.
-    sendResize(allocator, socket_fd, target_pane_id, stdout_fd) catch {};
-
-    // Detach interception is an interactive feature: only scan for the chord
-    // when stdin is a real terminal so piped input can carry the byte verbatim.
-    const active_detach_key: ?u8 = if (stdin_is_tty) detach_key else null;
-
-    const outcome = runLoop(stdin_fd, stdout_fd, socket_fd, &socket_reader, allocator, target_pane_id, .{
-        .detach_key = active_detach_key,
-        .client_id = client_id,
-    }) catch |err| {
-        restoreTermios();
-        if (err == error.ReadTimeout) {
-            return fail(io, "daemon at {s} is not responding; is zmuxd hung?", .{path});
+    try replayScrollback(allocator, attach.result(), stdout_fd);
+    if (jsonField(attach.result(), "exited") == .bool and jsonField(attach.result(), "exited").bool) {
+        try printExitStatus(io, attach.result());
+        const next = try respawnAndReattach(allocator, &reader, socket_fd, attach.result(), size, .fromNow(io, bootstrap_response_timeout_ms));
+        attach.deinit(allocator);
+        attach = next;
+        try replayScrollback(allocator, attach.result(), stdout_fd);
+        if (jsonField(attach.result(), "exited") == .bool and jsonField(attach.result(), "exited").bool) {
+            try printExitStatus(io, attach.result());
+            try stderrWrite(io, "session ended\n");
+            return;
         }
-        return fail(io, "{s}", .{@errorName(err)});
-    };
+    }
 
-    restoreTermios();
+    const outcome = try runLoop(stdin_fd, stdout_fd, socket_fd, &reader, allocator, .{
+        .pane_id = try requiredString(attach.result(), "paneId"),
+        .client_id = try requiredString(attach.result(), "clientId"),
+        .generation = jsonUnsigned(attach.result(), "generation"),
+        .replay_end = jsonUnsigned(attach.result(), "replayEndOffset"),
+        .detach_key = if (is_tty) parsed.detach_key else null,
+        .piped = !is_tty,
+        .io = io,
+    });
+
+    leaveTerminal();
     switch (outcome) {
-        .detached => stderrWrite(io, "[detached]\n") catch {},
-        .session_ended => stderrWrite(io, "session ended\n") catch {},
-        .connection_lost => {
-            stderrWrite(io, "zmux-connect: daemon connection lost\n") catch {};
-            std.process.exit(1);
-        },
+        .detached => try stderrWrite(io, "[detached]\n"),
+        .detached_remotely => try stderrWrite(io, "[detached remotely]\n"),
+        .session_ended => try stderrWrite(io, "session ended\n"),
+        .connection_lost => return diagnostic(io, "daemon connection lost", .{}),
         .exited => {},
     }
 }
@@ -289,271 +264,229 @@ fn printVersion(io: std.Io) !void {
     try std.Io.File.stdout().writeStreamingAll(io, "zmux-connect " ++ protocol.version ++ "\n");
 }
 
-// Send `client.attach` and, if the daemon reports `PaneNotFound` and
-// `auto_create` is enabled, try `session.create` followed by a second attach.
-// On success the returned slice is the final `client.attach` response and the
-// caller owns it. Errors propagating from the underlying I/O bubble up
-// unchanged. If both attempts return JSON-RPC errors, the latest error
-// payload is returned (so the caller can print it).
+const Response = struct {
+    line: []u8,
+    parsed: std.json.Parsed(std.json.Value),
+
+    fn deinit(self: Response, allocator: std.mem.Allocator) void {
+        self.parsed.deinit();
+        allocator.free(self.line);
+    }
+
+    fn result(self: Response) std.json.Value {
+        return jsonField(self.parsed.value, "result");
+    }
+
+    fn rpcError(self: Response) ?RpcError {
+        return RpcError.fromEnvelope(self.parsed.value);
+    }
+};
+
+const RpcError = struct {
+    message: []const u8,
+    kind: []const u8,
+
+    fn fromEnvelope(envelope: std.json.Value) ?RpcError {
+        const err = jsonField(envelope, "error");
+        if (err != .object) return null;
+        return .{
+            .message = jsonObjectString(err, "message") orelse "unknown RPC error",
+            .kind = jsonObjectString(jsonField(err, "data"), "kind") orelse "",
+        };
+    }
+
+    fn is(self: RpcError, kind: []const u8) bool {
+        return std.mem.eql(u8, self.kind, kind);
+    }
+};
+
 fn attachOrCreate(
     allocator: std.mem.Allocator,
     reader: *LineReader,
-    socket_fd: posix.fd_t,
-    sid: []const u8,
+    fd: posix.fd_t,
+    target: []const u8,
     size: TerminalSize,
     auto_create: bool,
-    create_command: ?[]const u8,
+    command: ?[]const u8,
     deadline: Deadline,
-) ![]u8 {
-    var first = try sendAttach(allocator, reader, socket_fd, sid, size, 1, deadline);
-    // The errdefer is guarded so the manual `allocator.free(first)` below
-    // doesn't double-free if a later step (`sendCreate`, the create
-    // response read, the retry attach) returns an error.
-    errdefer if (first.len != 0) allocator.free(first);
-
-    if (!isPaneNotFound(first)) return first;
-    if (!auto_create) return first;
-
-    allocator.free(first);
-    first = &.{};
-
-    try sendCreate(allocator, socket_fd, sid, size, create_command, 2);
-
-    // The daemon broadcasts pane_output / pane_activity / pane_bell
-    // notifications to every connection as soon as the PTY child starts —
-    // including this connection, which has not attached yet. Filter on the
-    // JSON-RPC `id` so we don't consume a notification as the create
-    // response.
-    const create_response = try readRpcResponse(allocator, reader, socket_fd, 2, deadline);
-    defer allocator.free(create_response);
-    if (findJsonField(create_response, "\"error\"")) |_| {
-        return try allocator.dupe(u8, create_response);
+) !Response {
+    // A new session starts in this client's working directory, not in the
+    // daemon's.
+    var cwd_buf: [posix.PATH_MAX]u8 = undefined;
+    const create = if (auto_create) CreateParams{
+        .id = target,
+        .rows = size.rows,
+        .cols = size.cols,
+        .command = command,
+        .cwd = currentDirectory(&cwd_buf),
+    } else null;
+    const response = try sendAttach(allocator, reader, fd, target, size, create, attach_rpc_id, deadline);
+    if (create) |params| {
+        if (response.rpcError()) |rpc_err| {
+            if (rpc_err.is("not_found")) {
+                // A daemon that implements structured errors but ignores createIfMissing.
+                response.deinit(allocator);
+                const created = try callRpc(allocator, reader, fd, 2, "session.create", params, deadline);
+                defer created.deinit(allocator);
+                if (created.rpcError()) |err| if (!err.is("conflict")) return reportRpcError(deadline.io, err);
+                const retry = try sendAttach(allocator, reader, fd, target, size, null, 3, deadline);
+                return validateAttach(allocator, deadline.io, retry);
+            }
+        }
     }
+    return validateAttach(allocator, deadline.io, response);
+}
 
-    return try sendAttach(allocator, reader, socket_fd, sid, size, 3, deadline);
+const CreateParams = struct {
+    id: []const u8,
+    rows: u16,
+    cols: u16,
+    command: ?[]const u8,
+    cwd: ?[]const u8 = null,
+};
+
+/// The working directory, or null when it is unavailable (removed, or
+/// unreadable) or not valid UTF-8 for a JSON string.
+fn currentDirectory(buf: *[posix.PATH_MAX]u8) ?[]const u8 {
+    const ptr = std.c.getcwd(buf, buf.len) orelse return null;
+    const cwd = std.mem.sliceTo(@as([*:0]u8, @ptrCast(ptr)), 0);
+    if (cwd.len == 0 or cwd[0] != '/' or !std.unicode.utf8ValidateSlice(cwd)) return null;
+    return cwd;
 }
 
 fn sendAttach(
     allocator: std.mem.Allocator,
     reader: *LineReader,
-    socket_fd: posix.fd_t,
-    sid: []const u8,
+    fd: posix.fd_t,
+    target: []const u8,
     size: TerminalSize,
-    rpc_id: u32,
+    create: ?CreateParams,
+    id: u32,
     deadline: Deadline,
-) ![]u8 {
-    const req = try std.fmt.allocPrint(
-        allocator,
-        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"client.attach\",\"params\":{{\"paneId\":{f},\"rows\":{},\"cols\":{}}}}}\n",
-        .{ rpc_id, std.json.fmt(sid, .{}), size.rows, size.cols },
-    );
-    defer allocator.free(req);
-    try writeAll(socket_fd, req);
-    return readRpcResponse(allocator, reader, socket_fd, rpc_id, deadline);
+) !Response {
+    return callRpc(allocator, reader, fd, id, "client.attach", .{
+        .paneId = target,
+        .rows = size.rows,
+        .cols = size.cols,
+        .createIfMissing = create,
+    }, deadline);
 }
 
-// Read newline-delimited JSON-RPC frames until we find the response
-// matching `expected_id`. Notifications (no `id` field) and any
-// out-of-order responses are silently discarded. We keep this helper
-// internal to the bootstrap (attach + create) sequence; once `runLoop`
-// takes over it has its own classifier in `processServerLine`.
-fn readRpcResponse(
+fn validateAttach(allocator: std.mem.Allocator, io: std.Io, response: Response) !Response {
+    errdefer response.deinit(allocator);
+    if (response.rpcError()) |err| return reportRpcError(io, err);
+    _ = try requiredString(response.result(), "paneId");
+    _ = try requiredString(response.result(), "clientId");
+    return response;
+}
+
+fn respawnAndReattach(
     allocator: std.mem.Allocator,
     reader: *LineReader,
     fd: posix.fd_t,
-    expected_id: u32,
+    result: std.json.Value,
+    size: TerminalSize,
     deadline: Deadline,
-) ![]u8 {
-    while (true) {
+) !Response {
+    const pane_id = try requiredString(result, "paneId");
+    const client_id = try requiredString(result, "clientId");
+    const respawned = try callRpc(allocator, reader, fd, 4, "pane.respawn", .{ .paneId = pane_id, .kill = false }, deadline);
+    defer respawned.deinit(allocator);
+    // Another client may have respawned the pane while we were printing replay.
+    if (respawned.rpcError()) |err| if (!err.is("conflict")) return reportRpcError(deadline.io, err);
+    const detached = try callRpc(allocator, reader, fd, 5, "client.detach", .{ .clientId = client_id }, deadline);
+    defer detached.deinit(allocator);
+    if (detached.rpcError()) |err| if (!err.is("not_found")) return reportRpcError(deadline.io, err);
+    const attached = try sendAttach(allocator, reader, fd, pane_id, size, null, 6, deadline);
+    return validateAttach(allocator, deadline.io, attached);
+}
+
+fn printExitStatus(io: std.Io, result: std.json.Value) !void {
+    var buf: [128]u8 = undefined;
+    const message = if (jsonUnsigned(result, "exitCode")) |code|
+        try std.fmt.bufPrint(&buf, "[session exited: code {d}]\n", .{code})
+    else if (jsonUnsigned(result, "signal")) |signal|
+        try std.fmt.bufPrint(&buf, "[session exited: signal {d}]\n", .{signal})
+    else
+        "[session exited]\n";
+    try stderrWrite(io, message);
+}
+
+fn buildFrame(allocator: std.mem.Allocator, id: u32, method: []const u8, params: anytype) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{f}\n", .{std.json.fmt(.{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = method,
+        .params = params,
+    }, .{ .emit_null_optional_fields = false })});
+}
+
+fn callRpc(
+    allocator: std.mem.Allocator,
+    reader: *LineReader,
+    fd: posix.fd_t,
+    id: u32,
+    method: []const u8,
+    params: anytype,
+    deadline: Deadline,
+) !Response {
+    const frame = try buildFrame(allocator, id, method, params);
+    defer allocator.free(frame);
+    return exchange(allocator, reader, fd, id, method, frame, deadline);
+}
+
+fn exchange(
+    allocator: std.mem.Allocator,
+    reader: *LineReader,
+    fd: posix.fd_t,
+    id: u32,
+    operation: []const u8,
+    frame: []const u8,
+    deadline: Deadline,
+) !Response {
+    sendFrame(fd, frame, deadline.remainingMs()) catch |err| switch (err) {
+        error.WriteTimeout => return diagnostic(deadline.io, "timed out sending {s}", .{operation}),
+        // The daemon may close immediately after writing a null-id capacity
+        // error. Read its pending response even when the write loses the race.
+        error.BrokenPipe, error.ConnectionResetByPeer => {},
+        else => return err,
+    };
+    return readRpcResponse(allocator, reader, fd, id, deadline) catch |err| switch (err) {
+        error.ReadTimeout => return diagnostic(deadline.io, "timed out waiting for {s}", .{operation}),
+        else => return err,
+    };
+}
+
+fn readRpcResponse(allocator: std.mem.Allocator, reader: *LineReader, fd: posix.fd_t, expected_id: u32, deadline: Deadline) !Response {
+    while (deadline.remainingMs() > 0) {
         const line = try reader.readLineAllocTimeout(allocator, deadline.io, fd, rpc_line_max, deadline.timeout());
-        if (matchesRpcId(allocator, line, expected_id)) return line;
+        errdefer allocator.free(line);
+        // Fast reject: a line without a backslash spells every key literally,
+        // so it can only carry an `id` member if `"id"` appears verbatim.
+        // Skips a DOM parse of every interleaved pane_output notification.
+        if (!mayHaveKey(line, "\"id\"")) {
+            allocator.free(line);
+            continue;
+        }
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                allocator.free(line);
+                continue;
+            },
+        };
+        const response_id = if (parsed.value == .object) parsed.value.object.get("id") else null;
+        if (response_id) |id| {
+            if ((id == .integer and id.integer == expected_id) or
+                (id == .null and RpcError.fromEnvelope(parsed.value) != null))
+            {
+                return .{ .line = line, .parsed = parsed };
+            }
+        }
+        parsed.deinit();
         allocator.free(line);
     }
-}
-
-fn matchesRpcId(allocator: std.mem.Allocator, line: []const u8, expected_id: u32) bool {
-    // Fast reject: without `"id"` (or a `\u` unicode escape that could spell
-    // `"id"`), a valid JSON object cannot have an `"id"` member.
-    if (!containsSubstrSimd(line, "\"id\"") and !containsSubstrSimd(line, "\\u")) {
-        return false;
-    }
-
-    var scanner = std.json.Scanner.initCompleteInput(allocator, line);
-    defer scanner.deinit();
-
-    const first = scanner.next() catch return false;
-    if (first != .object_begin) return false;
-
-    var matched = false;
-    while (true) {
-        const key_tok = scanner.next() catch return false;
-        switch (key_tok) {
-            .object_end => break,
-            .string => |key| {
-                if (std.mem.eql(u8, key, "id")) {
-                    const val_tok = scanner.next() catch return false;
-                    switch (val_tok) {
-                        .number => |num| {
-                            if (std.fmt.parseInt(i64, num, 10)) |id_int| {
-                                matched = (id_int == @as(i64, expected_id));
-                            } else |_| {
-                                matched = false;
-                            }
-                        },
-                        .object_begin, .array_begin => {
-                            matched = false;
-                            skipComposite(&scanner) catch return false;
-                        },
-                        .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => {
-                            matched = false;
-                            skipRestOfString(&scanner) catch return false;
-                        },
-                        .partial_number => {
-                            matched = false;
-                            skipRestOfNumber(&scanner) catch return false;
-                        },
-                        else => matched = false,
-                    }
-                } else {
-                    scanner.skipValue() catch return false;
-                }
-            },
-            else => return matchesRpcIdFallback(allocator, line, expected_id),
-        }
-    }
-    const end_tok = scanner.next() catch return false;
-    return end_tok == .end_of_document and matched;
-}
-
-fn matchesRpcIdFallback(allocator: std.mem.Allocator, line: []const u8, expected_id: u32) bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    const id_value = parsed.value.object.get("id") orelse return false;
-    if (id_value != .integer) return false;
-    return id_value.integer == @as(i64, expected_id);
-}
-
-fn skipComposite(scanner: *std.json.Scanner) !void {
-    var depth: usize = 1;
-    while (depth > 0) {
-        const tok = try scanner.next();
-        switch (tok) {
-            .object_begin, .array_begin => depth += 1,
-            .object_end, .array_end => depth -= 1,
-            .end_of_document => return error.UnexpectedEndOfInput,
-            else => {},
-        }
-    }
-}
-
-fn skipRestOfString(scanner: *std.json.Scanner) !void {
-    while (true) {
-        const tok = try scanner.next();
-        switch (tok) {
-            .string => return,
-            .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => {},
-            else => return error.SyntaxError,
-        }
-    }
-}
-
-fn skipRestOfNumber(scanner: *std.json.Scanner) !void {
-    while (true) {
-        const tok = try scanner.next();
-        switch (tok) {
-            .number => return,
-            .partial_number => {},
-            else => return error.SyntaxError,
-        }
-    }
-}
-
-fn isPlainJsonAscii(bytes: []const u8) bool {
-    const Vec = @Vector(16, u8);
-    const low: Vec = @splat(0x20);
-    const high: Vec = @splat(0x7f);
-    const quote: Vec = @splat('"');
-    const backslash: Vec = @splat('\\');
-
-    var i: usize = 0;
-    while (i + 16 <= bytes.len) : (i += 16) {
-        const chunk: Vec = bytes[i..][0..16].*;
-        const bad = (chunk < low) | (chunk >= high) | (chunk == quote) | (chunk == backslash);
-        if (@reduce(.Or, bad)) return false;
-    }
-    while (i < bytes.len) : (i += 1) {
-        const b = bytes[i];
-        if (b < 0x20 or b >= 0x7f or b == '"' or b == '\\') return false;
-    }
-    return true;
-}
-
-/// SIMD-accelerated substring check: uses `std.mem.indexOfScalarPos` (which
-/// uses 16-byte SIMD vectors) to scan for `needle[0]`, making searches for
-/// rare delimiters like `"` or `\` over multi-kilobyte base64 payloads >20x
-/// faster than scalar `std.mem.indexOf`.
-fn containsSubstrSimd(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (haystack.len < needle.len) return false;
-    const last_start = haystack.len - needle.len;
-    var pos: usize = 0;
-    while (pos <= last_start) {
-        const hit = std.mem.indexOfScalarPos(u8, haystack[0 .. last_start + 1], pos, needle[0]) orelse return false;
-        if (std.mem.eql(u8, haystack[hit .. hit + needle.len], needle)) return true;
-        pos = hit + 1;
-    }
-    return false;
-}
-
-fn sendCreate(
-    allocator: std.mem.Allocator,
-    socket_fd: posix.fd_t,
-    sid: []const u8,
-    size: TerminalSize,
-    command: ?[]const u8,
-    rpc_id: u32,
-) !void {
-    const req = if (command) |cmd| try std.fmt.allocPrint(
-        allocator,
-        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"session.create\",\"params\":{{\"id\":{f},\"rows\":{},\"cols\":{},\"command\":{f}}}}}\n",
-        .{ rpc_id, std.json.fmt(sid, .{}), size.rows, size.cols, std.json.fmt(cmd, .{}) },
-    ) else try std.fmt.allocPrint(
-        allocator,
-        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"session.create\",\"params\":{{\"id\":{f},\"rows\":{},\"cols\":{}}}}}\n",
-        .{ rpc_id, std.json.fmt(sid, .{}), size.rows, size.cols },
-    );
-    defer allocator.free(req);
-    try writeAll(socket_fd, req);
-}
-
-fn isPaneNotFound(response: []const u8) bool {
-    if (findJsonField(response, "\"error\"") == null) return false;
-    return findJsonField(response, "PaneNotFound") != null;
-}
-
-// Extract `result.paneId` (the daemon's canonical pane id) from a
-// `client.attach` response. The daemon answers every input RPC by looking
-// up the pane via that id, so we use it instead of whatever the user
-// passed on the command line (which may be a session name).
-fn paneIdFromAttach(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.MissingPaneId;
-    const result = parsed.value.object.get("result") orelse return error.MissingPaneId;
-    const pane_id = jsonObjectString(result, "paneId") orelse return error.MissingPaneId;
-    return allocator.dupe(u8, pane_id);
-}
-
-// Extract `result.clientId` (the daemon's logical attachment id) from a
-// `client.attach` response so the client can later send `client.detach`.
-fn clientIdFromAttach(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.MissingClientId;
-    const result = parsed.value.object.get("result") orelse return error.MissingClientId;
-    const client_id = jsonObjectString(result, "clientId") orelse return error.MissingClientId;
-    return allocator.dupe(u8, client_id);
+    return error.ReadTimeout;
 }
 
 fn parseDetachKey(spec: []const u8) !?u8 {
@@ -566,57 +499,25 @@ fn parseDetachKey(spec: []const u8) !?u8 {
 
 // Map a key name to its ASCII control byte: letters => C-a..C-z (0x01..0x1A),
 // and backslash => 0x1C so the default Ctrl-\ chord is expressible.
-fn controlByte(c: u8) ?u8 {
-    if (std.ascii.isAlphabetic(c)) return std.ascii.toUpper(c) - 'A' + 1;
-    if (c == '\\') return 0x1C;
+fn controlByte(key: u8) ?u8 {
+    if (std.ascii.isAlphabetic(key)) return std.ascii.toUpper(key) - 'A' + 1;
+    if (key == '\\') return 0x1C;
     return null;
 }
 
-// Best-effort protocol version probe: send daemon.ping and warn on stderr if
-// the daemon reports a different protocol version than this client compiled
-// against. Never aborts — a version skew is expected across daemon upgrades.
 fn warnOnVersionMismatch(
     allocator: std.mem.Allocator,
     reader: *LineReader,
-    socket_fd: posix.fd_t,
+    fd: posix.fd_t,
     deadline: Deadline,
-) void {
-    const daemon_ver = daemonVersion(allocator, reader, socket_fd, deadline) catch return;
-    defer allocator.free(daemon_ver);
-    if (std.mem.eql(u8, daemon_ver, protocol.version)) return;
-
-    var buf: [256]u8 = undefined;
-    var w = std.Io.File.stderr().writerStreaming(deadline.io, &buf);
-    w.interface.print(
-        "zmux-connect: warning: daemon protocol {s} differs from client {s}; continuing\n",
-        .{ daemon_ver, protocol.version },
-    ) catch {};
-    w.interface.flush() catch {};
-}
-
-fn daemonVersion(
-    allocator: std.mem.Allocator,
-    reader: *LineReader,
-    socket_fd: posix.fd_t,
-    deadline: Deadline,
-) ![]u8 {
-    const req = try std.fmt.allocPrint(
-        allocator,
-        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"daemon.ping\",\"params\":{{}}}}\n",
-        .{ping_rpc_id},
-    );
-    defer allocator.free(req);
-    try writeAll(socket_fd, req);
-
-    const response = try readRpcResponse(allocator, reader, socket_fd, ping_rpc_id, deadline);
-    defer allocator.free(response);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.MissingVersion;
-    const result = parsed.value.object.get("result") orelse return error.MissingVersion;
-    const version = jsonObjectString(result, "version") orelse return error.MissingVersion;
-    return allocator.dupe(u8, version);
+) !void {
+    const response = try callRpc(allocator, reader, fd, ping_rpc_id, "daemon.ping", .{}, deadline);
+    defer response.deinit(allocator);
+    if (response.rpcError()) |err| return reportRpcError(deadline.io, err);
+    const daemon_ver = try requiredString(response.result(), "version");
+    if (!std.mem.eql(u8, daemon_ver, protocol.version)) {
+        printDiagnostic(deadline.io, "warning: daemon protocol {f} differs from client {s}; continuing", .{ escaped(daemon_ver), protocol.version });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -670,23 +571,26 @@ pub fn parseVerbArgs(verb: Verb, rest: []const []const u8, failure: ?*ParseVerbA
     const needs_target = (verb == .kill or verb == .rename);
     const needs_new_name = (verb == .rename);
 
+    var options = true;
     var positionals: usize = 0;
     var i: usize = 0;
     while (i < rest.len) : (i += 1) {
         const a = rest[i];
-        if (std.mem.eql(u8, a, "--socket")) {
+        if (options and std.mem.eql(u8, a, "--")) {
+            options = false;
+        } else if (options and std.mem.eql(u8, a, "--socket")) {
             i += 1;
             if (i >= rest.len) {
                 if (failure) |f| f.* = .{ .err = error.MissingSocketValue };
                 return error.MissingSocketValue;
             }
             parsed.explicit_socket = rest[i];
-        } else if (std.mem.eql(u8, a, "--json")) {
+        } else if (options and std.mem.eql(u8, a, "--json")) {
             parsed.json = true;
-        } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+        } else if (options and (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h"))) {
             parsed.show_help = true;
             return parsed;
-        } else if (a.len > 0 and a[0] == '-') {
+        } else if (options and a.len > 0 and a[0] == '-') {
             if (failure) |f| f.* = .{ .err = error.UnknownFlag, .arg = a };
             return error.UnknownFlag;
         } else if (positionals == 0 and needs_target) {
@@ -715,15 +619,15 @@ pub fn parseVerbArgs(verb: Verb, rest: []const []const u8, failure: ?*ParseVerbA
 fn runVerb(
     allocator: std.mem.Allocator,
     io: std.Io,
-    environ: *const std.process.Environ.Map,
     verb: Verb,
     rest: []const []const u8,
+    global_socket: ?[]const u8,
 ) !void {
     var failure: ParseVerbArgsFailure = .{ .err = error.UnknownFlag };
     const parsed = parseVerbArgs(verb, rest, &failure) catch |err| switch (err) {
         error.MissingSocketValue => return fail(io, "missing value for --socket", .{}),
-        error.UnknownFlag => return fail(io, "unknown flag: {s}", .{failure.arg.?}),
-        error.UnexpectedArgument => return fail(io, "unexpected argument: {s}", .{failure.arg.?}),
+        error.UnknownFlag => return fail(io, "unknown flag: {f}", .{escaped(failure.arg.?)}),
+        error.UnexpectedArgument => return fail(io, "unexpected argument: {f}", .{escaped(failure.arg.?)}),
         error.MissingTarget => return fail(io, "{s} requires a session id", .{verbName(verb)}),
         error.MissingNewName => return fail(io, "rename requires a new name", .{}),
     };
@@ -736,20 +640,14 @@ fn runVerb(
     const target = parsed.target;
     const new_name = parsed.new_name;
     const json = parsed.json;
-    const explicit_socket = parsed.explicit_socket;
-
-    const path = if (explicit_socket) |value|
-        try allocator.dupe(u8, value)
-    else
-        try resolveSocketPath(allocator, environ);
+    const path = try resolveSocketPath(allocator, io, parsed.explicit_socket orelse global_socket);
     defer allocator.free(path);
 
-    const socket_fd = tryConnect(path) catch {
-        return verbError(io, "no daemon reachable at {s}", .{path});
-    };
+    const socket_fd = try connectWithRetry(allocator, io, path, false);
     defer sys.close(socket_fd);
 
     var reader: LineReader = .{};
+    defer reader.deinit();
     try executeVerb(
         allocator,
         socket_fd,
@@ -776,26 +674,25 @@ fn executeVerb(
 ) !void {
     const request = try buildVerbRequest(allocator, verb, target, new_name);
     defer allocator.free(request);
-    try writeAll(socket_fd, request);
+    const operation = switch (verb) {
+        .list => "session.list",
+        .kill => "session.terminate",
+        .rename => "session.rename",
+        .shutdown => "daemon.shutdown",
+    };
+    const response = try exchange(allocator, reader, socket_fd, verb_rpc_id, operation, request, deadline);
+    defer response.deinit(allocator);
 
-    const response = try readRpcResponse(allocator, reader, socket_fd, verb_rpc_id, deadline);
-    defer allocator.free(response);
-
-    if (rpcErrorMessage(allocator, response)) |msg| {
-        defer allocator.free(msg);
-        var buf: [1024]u8 = undefined;
-        var w = std.Io.File.stderr().writer(deadline.io, &buf);
-        w.interface.print("zmux-connect: {s}\n", .{msg}) catch {};
-        w.interface.flush() catch {};
-        return error.RpcError;
-    }
-
+    const rpc_err = response.rpcError();
     if (json) {
-        try writeAllFd(out_fd, response);
+        try writeAllFd(out_fd, response.line);
+        if (rpc_err != null) return error.RpcError;
         return;
     }
+    if (rpc_err) |err| return reportRpcError(deadline.io, err);
+    if (response.result() == .null) return error.InvalidResponse;
 
-    const human = try formatVerbResult(allocator, verb, target, new_name, response);
+    const human = try formatVerbResult(allocator, verb, target, new_name, response.result());
     defer allocator.free(human);
     try writeAllFd(out_fd, human);
 }
@@ -835,211 +732,188 @@ fn formatVerbResult(
     verb: Verb,
     target: ?[]const u8,
     new_name: ?[]const u8,
-    response: []const u8,
+    result: std.json.Value,
 ) ![]u8 {
     return switch (verb) {
-        .list => formatSessionList(allocator, response),
-        .kill => std.fmt.allocPrint(allocator, "killed session {s}\n", .{target.?}),
-        .rename => std.fmt.allocPrint(allocator, "renamed session {s} to {s}\n", .{ target.?, new_name.? }),
+        .list => formatSessionList(allocator, result),
+        .kill => std.fmt.allocPrint(allocator, "killed session {f}\n", .{escaped(target.?)}),
+        .rename => std.fmt.allocPrint(allocator, "renamed session {f} to {f}\n", .{ escaped(target.?), escaped(new_name.?) }),
         .shutdown => allocator.dupe(u8, "daemon shutdown\n"),
     };
 }
 
-// Render a `session.list` result array as one tab-separated line per pane:
-//   <sessionId>\t<paneId>\t<state>\tpid=<pid>\t<title>
-fn formatSessionList(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
-    return formatSessionListFast(allocator, response) catch |err| switch (err) {
-        error.FallbackToDom => formatSessionListFallback(allocator, response),
-        else => return err,
-    };
-}
-
-fn formatSessionListFast(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
-    var scanner = std.json.Scanner.initCompleteInput(allocator, response);
-    defer scanner.deinit();
-
-    if ((try scanner.next()) != .object_begin) return error.InvalidResponse;
-
-    var out: std.Io.Writer.Allocating = try .initCapacity(allocator, 512);
-    errdefer out.deinit();
-    var found_result = false;
-    var item_count: usize = 0;
-
-    while (true) {
-        const key_tok = try scanner.next();
-        switch (key_tok) {
-            .object_end => break,
-            .string => |key| {
-                if (std.mem.eql(u8, key, "result")) {
-                    found_result = true;
-                    if ((try scanner.next()) != .array_begin) return error.InvalidResponse;
-                    while (true) {
-                        const elem = try scanner.next();
-                        switch (elem) {
-                            .array_end => break,
-                            .object_begin => {
-                                item_count += 1;
-                                var session_id: []const u8 = "";
-                                var pane_id: []const u8 = "";
-                                var state: []const u8 = "";
-                                var title: []const u8 = "";
-                                var pid: i64 = 0;
-                                while (true) {
-                                    const fk = try scanner.next();
-                                    switch (fk) {
-                                        .object_end => break,
-                                        .string => |field| {
-                                            if (std.mem.eql(u8, field, "sessionId")) {
-                                                const v = try scanner.next();
-                                                switch (v) {
-                                                    .string => |s| session_id = s,
-                                                    .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => return error.FallbackToDom,
-                                                    .object_begin, .array_begin => try skipComposite(&scanner),
-                                                    .partial_number => try skipRestOfNumber(&scanner),
-                                                    else => {},
-                                                }
-                                            } else if (std.mem.eql(u8, field, "paneId")) {
-                                                const v = try scanner.next();
-                                                switch (v) {
-                                                    .string => |s| pane_id = s,
-                                                    .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => return error.FallbackToDom,
-                                                    .object_begin, .array_begin => try skipComposite(&scanner),
-                                                    .partial_number => try skipRestOfNumber(&scanner),
-                                                    else => {},
-                                                }
-                                            } else if (std.mem.eql(u8, field, "state")) {
-                                                const v = try scanner.next();
-                                                switch (v) {
-                                                    .string => |s| state = s,
-                                                    .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => return error.FallbackToDom,
-                                                    .object_begin, .array_begin => try skipComposite(&scanner),
-                                                    .partial_number => try skipRestOfNumber(&scanner),
-                                                    else => {},
-                                                }
-                                            } else if (std.mem.eql(u8, field, "title")) {
-                                                const v = try scanner.next();
-                                                switch (v) {
-                                                    .string => |s| title = s,
-                                                    .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => return error.FallbackToDom,
-                                                    .object_begin, .array_begin => try skipComposite(&scanner),
-                                                    .partial_number => try skipRestOfNumber(&scanner),
-                                                    else => {},
-                                                }
-                                            } else if (std.mem.eql(u8, field, "pid")) {
-                                                const v = try scanner.next();
-                                                switch (v) {
-                                                    .number => |n| pid = std.fmt.parseInt(i64, n, 10) catch 0,
-                                                    .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => try skipRestOfString(&scanner),
-                                                    .object_begin, .array_begin => try skipComposite(&scanner),
-                                                    .partial_number => try skipRestOfNumber(&scanner),
-                                                    else => {},
-                                                }
-                                            } else {
-                                                try scanner.skipValue();
-                                            }
-                                        },
-                                        else => return error.FallbackToDom,
-                                    }
-                                }
-                                try out.writer.print("{s}\t{s}\t{s}\tpid={d}\t{s}\n", .{
-                                    session_id,
-                                    pane_id,
-                                    state,
-                                    pid,
-                                    title,
-                                });
-                            },
-                            .array_begin => {
-                                item_count += 1;
-                                try skipComposite(&scanner);
-                            },
-                            .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => {
-                                item_count += 1;
-                                try skipRestOfString(&scanner);
-                            },
-                            .partial_number => {
-                                item_count += 1;
-                                try skipRestOfNumber(&scanner);
-                            },
-                            else => item_count += 1,
-                        }
-                    }
-                } else {
-                    try scanner.skipValue();
-                }
-            },
-            else => return error.FallbackToDom,
-        }
-    }
-    if ((try scanner.next()) != .end_of_document) return error.SyntaxError;
-    if (!found_result) return error.InvalidResponse;
-    if (item_count == 0) {
-        try out.writer.writeAll("no sessions\n");
-    }
-    return out.toOwnedSlice();
-}
-
-fn formatSessionListFallback(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
-    defer parsed.deinit();
-
-    var out: std.Io.Writer.Allocating = try .initCapacity(allocator, 256);
-    errdefer out.deinit();
-
-    if (parsed.value != .object) return error.InvalidResponse;
-    const result = parsed.value.object.get("result") orelse return error.InvalidResponse;
+fn formatSessionList(allocator: std.mem.Allocator, result: std.json.Value) ![]u8 {
     if (result != .array) return error.InvalidResponse;
+    if (result.array.items.len == 0) return allocator.dupe(u8, "no sessions\n");
 
-    if (result.array.items.len == 0) {
-        try out.writer.writeAll("no sessions\n");
-        return out.toOwnedSlice();
-    }
-
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
     for (result.array.items) |item| {
         if (item != .object) continue;
-        const session_id = jsonObjectString(item, "sessionId") orelse "";
-        const pane_id = jsonObjectString(item, "paneId") orelse "";
-        const state = jsonObjectString(item, "state") orelse "";
-        const title = jsonObjectString(item, "title") orelse "";
-        const pid = jsonObjectInt(item, "pid");
-        try out.writer.print(
-            "{s}\t{s}\t{s}\tpid={d}\t{s}\n",
-            .{ session_id, pane_id, state, pid, title },
-        );
+        try out.writer.print("{f}\t{f}\t{f}\tpid={d}\t{f}\n", .{
+            escaped(jsonObjectString(item, "sessionId") orelse ""),
+            escaped(jsonObjectString(item, "paneId") orelse ""),
+            escaped(jsonObjectString(item, "state") orelse ""),
+            jsonUnsigned(item, "pid") orelse 0,
+            escaped(jsonObjectString(item, "title") orelse ""),
+        });
     }
-
     return out.toOwnedSlice();
 }
 
-// Return the daemon's `error.message` text (caller owns) when `response` is a
-// JSON-RPC error frame, or null for a success frame. Uses a real JSON parse so
-// a result payload that merely contains the word "error" is not misread.
-fn rpcErrorMessage(allocator: std.mem.Allocator, response: []const u8) ?[]u8 {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch return null;
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const err = parsed.value.object.get("error") orelse return null;
-    if (err != .object) return allocator.dupe(u8, "unknown error") catch null;
-    const message = err.object.get("message") orelse return allocator.dupe(u8, "unknown error") catch null;
-    if (message != .string) return allocator.dupe(u8, "unknown error") catch null;
-    return allocator.dupe(u8, message.string) catch null;
+const Escaped = struct {
+    bytes: []const u8,
+
+    pub fn format(self: Escaped, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        var i: usize = 0;
+        while (i < self.bytes.len) {
+            const byte = self.bytes[i];
+            // Preserve printable UTF-8, including continuation bytes that
+            // would otherwise look like standalone C1 controls.
+            const len = std.unicode.utf8ByteSequenceLength(byte) catch 1;
+            const codepoint = if (len > 1 and i + len <= self.bytes.len)
+                std.unicode.utf8Decode(self.bytes[i..][0..len]) catch null
+            else
+                null;
+            if (codepoint) |cp| {
+                if (cp >= 0x80 and cp <= 0x9f)
+                    try writer.print("\\x{x:0>2}", .{cp})
+                else
+                    try writer.writeAll(self.bytes[i..][0..len]);
+                i += len;
+            } else {
+                if (byte < 0x20 or (byte >= 0x7f and byte <= 0x9f))
+                    try writer.print("\\x{x:0>2}", .{byte})
+                else
+                    try writer.writeByte(byte);
+                i += 1;
+            }
+        }
+    }
+};
+
+fn escaped(bytes: []const u8) Escaped {
+    return .{ .bytes = bytes };
 }
 
-fn verbError(io: std.Io, comptime fmt: []const u8, args: anytype) error{RpcError} {
-    var buf: [1024]u8 = undefined;
-    var w = std.Io.File.stderr().writer(io, &buf);
-    w.interface.print("zmux-connect: " ++ fmt ++ "\n", args) catch {};
-    w.interface.flush() catch {};
+fn reportRpcError(io: std.Io, err: RpcError) error{RpcError} {
+    printDiagnostic(io, "{f}", .{escaped(err.message)});
     return error.RpcError;
 }
 
-const RunOutcome = enum { exited, session_ended, detached, connection_lost };
+fn diagnostic(io: std.Io, comptime fmt: []const u8, args: anytype) error{ReportedFailure} {
+    printDiagnostic(io, fmt, args);
+    return error.ReportedFailure;
+}
+
+fn printDiagnostic(io: std.Io, comptime fmt: []const u8, args: anytype) void {
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.File.stderr().writerStreaming(io, &buf);
+    w.interface.print("zmux-connect: " ++ fmt ++ "\n", args) catch {};
+    w.interface.flush() catch {};
+}
+
+const RunOutcome = enum { exited, session_ended, detached, detached_remotely, connection_lost };
 
 const RunLoopOptions = struct {
-    // Detach chord byte to intercept on stdin, or null to disable interception.
+    pane_id: []const u8,
+    client_id: []const u8 = "",
+    generation: ?u64 = null,
+    replay_end: ?u64 = null,
     detach_key: ?u8 = null,
-    // Logical clientId to release via `client.detach` on detach, if known.
-    client_id: ?[]const u8 = null,
+    piped: bool = false,
+    io: std.Io,
+};
+
+const RunState = struct {
+    pane_id: []const u8,
+    switched_pane: ?[]u8 = null,
+    generation: ?u64,
+    next_offset: ?u64,
+    client_id: []const u8,
+    next_id: u32 = first_interactive_id,
+
+    fn queue(self: *RunState, allocator: std.mem.Allocator, out: *WriteQueue, method: []const u8, params: anytype) !void {
+        const frame = try buildFrame(allocator, self.next_id, method, params);
+        defer allocator.free(frame);
+        self.next_id += 1;
+        try out.append(allocator, frame);
+    }
+
+    /// Queue `session.send` for `input`. Byte-identical to
+    /// `queue("session.send", .{ .sessionId, .dataBase64 })`, but encodes the
+    /// base64 straight into the frame: one allocation and no JSON escape scan
+    /// over the base64 alphabet.
+    fn queueSend(self: *RunState, allocator: std.mem.Allocator, out: *WriteQueue, input: []const u8) !void {
+        const frame = try buildSendFrame(allocator, self.next_id, self.pane_id, input);
+        defer allocator.free(frame);
+        self.next_id += 1;
+        try out.append(allocator, frame);
+    }
+};
+
+fn buildSendFrame(allocator: std.mem.Allocator, id: u32, session_id: []const u8, input: []const u8) ![]u8 {
+    if (!isPlainJsonAscii(session_id)) {
+        const encoded = try base64Encode(allocator, input);
+        defer allocator.free(encoded);
+        return buildFrame(allocator, id, "session.send", .{ .sessionId = session_id, .dataBase64 = encoded });
+    }
+    const encoder = std.base64.standard.Encoder;
+    var id_buf: [10]u8 = undefined;
+    const id_text = std.fmt.bufPrint(&id_buf, "{d}", .{id}) catch unreachable;
+    const parts = [_][]const u8{
+        "{\"jsonrpc\":\"2.0\",\"id\":",
+        id_text,
+        ",\"method\":\"session.send\",\"params\":{\"sessionId\":\"",
+        session_id,
+        "\",\"dataBase64\":\"",
+    };
+    const suffix = "\"}}\n";
+    var head_len: usize = 0;
+    for (parts) |part| head_len += part.len;
+    const b64_len = encoder.calcSize(input.len);
+    const frame = try allocator.alloc(u8, head_len + b64_len + suffix.len);
+    var pos: usize = 0;
+    for (parts) |part| {
+        @memcpy(frame[pos..][0..part.len], part);
+        pos += part.len;
+    }
+    _ = encoder.encode(frame[pos..][0..b64_len], input);
+    pos += b64_len;
+    @memcpy(frame[pos..][0..suffix.len], suffix);
+    return frame;
+}
+
+const WriteQueue = struct {
+    bytes: std.ArrayList(u8) = .empty,
+    sent: usize = 0,
+    deadline: i64 = 0,
+
+    fn pending(self: *const WriteQueue) []const u8 {
+        return self.bytes.items[self.sent..];
+    }
+
+    fn append(self: *WriteQueue, allocator: std.mem.Allocator, frame: []const u8) !void {
+        const pending_bytes = self.pending();
+        if (frame.len > outbound_max - pending_bytes.len) return error.OutboundQueueFull;
+        if (pending_bytes.len == 0) self.deadline = sys.monotonicMs() + write_timeout_ms;
+        if (self.bytes.items.len + frame.len > outbound_max) {
+            std.mem.copyForwards(u8, self.bytes.items, pending_bytes);
+            self.bytes.shrinkRetainingCapacity(pending_bytes.len);
+            self.sent = 0;
+        }
+        try self.bytes.appendSlice(allocator, frame);
+    }
+
+    fn flush(self: *WriteQueue, fd: posix.fd_t) !void {
+        // Byte-level helper shared with the bootstrap writer.
+        self.sent += try sendSome(fd, self.pending()) orelse return;
+        self.deadline = sys.monotonicMs() + write_timeout_ms;
+        if (self.pending().len == 0) {
+            self.bytes.clearRetainingCapacity();
+            self.sent = 0;
+        }
+    }
 };
 
 fn runLoop(
@@ -1048,69 +922,168 @@ fn runLoop(
     socket_fd: posix.fd_t,
     reader: *LineReader,
     allocator: std.mem.Allocator,
-    session_id: []const u8,
     options: RunLoopOptions,
 ) !RunOutcome {
+    try sys.setNonBlocking(socket_fd);
+    var state: RunState = .{
+        .pane_id = options.pane_id,
+        .client_id = options.client_id,
+        .generation = options.generation,
+        .next_offset = options.replay_end,
+    };
+    defer if (state.switched_pane) |pane| allocator.free(pane);
+    var outbound: WriteQueue = .{};
+    defer outbound.bytes.deinit(allocator);
+
+    var partial_since: ?i64 = null;
+    var pending_output: ?[]u8 = null;
+    defer if (pending_output) |bytes| allocator.free(bytes);
+    var output_sent: usize = 0;
+
+    var stdin_eof = false;
+    var quiet_until: i64 = 0;
+    var eof_outcome: ?RunOutcome = null;
+    var resize_pending = true;
     var buf: [buffer_size]u8 = undefined;
+    const stdin_unpollable = pollUnsupported(stdin_fd);
+    const stdout_unpollable = pollUnsupported(stdout_fd);
 
     while (true) {
-        if (g_winch_flag.swap(false, .seq_cst)) {
-            sendResize(allocator, socket_fd, session_id, stdout_fd) catch {};
-        }
-
-        var fds = [_]posix.pollfd{
-            .{ .fd = stdin_fd, .events = posix.POLL.IN, .revents = 0 },
-            .{ .fd = socket_fd, .events = posix.POLL.IN, .revents = 0 },
-        };
-        const ready = try posix.poll(&fds, run_loop_poll_timeout_ms);
-        if (g_winch_flag.swap(false, .seq_cst)) {
-            sendResize(allocator, socket_fd, session_id, stdout_fd) catch {};
-        }
-        if (ready == 0) continue;
-
-        if ((fds[1].revents & posix.POLL.HUP) != 0) {
-            const saw_exit = try drainReadableSocket(allocator, reader, socket_fd, session_id, stdout_fd);
-            return if (saw_exit) .session_ended else .connection_lost;
-        }
-
-        if ((fds[1].revents & posix.POLL.IN) != 0) {
-            if (try handleReadableSocket(allocator, reader, socket_fd, session_id, stdout_fd)) return .session_ended;
-        }
-
-        if ((fds[1].revents & posix.POLL.ERR) != 0) return .connection_lost;
-
-        if ((fds[0].revents & posix.POLL.IN) != 0) {
-            switch (try readStdinChunk(stdin_fd, &buf)) {
-                .again => continue,
-                .eof => return .exited,
-                .bytes => |bytes| {
-                    // Intercept the detach chord before forwarding: raw mode
-                    // disables ISIG so we are scanning raw bytes. Forward any
-                    // bytes that precede the chord, then detach.
-                    if (options.detach_key) |chord| {
-                        if (std.mem.indexOfScalar(u8, bytes, chord)) |pos| {
-                            if (pos > 0) try sendInput(allocator, socket_fd, session_id, bytes[0..pos]);
-                            if (options.client_id) |cid| sendDetach(allocator, socket_fd, cid) catch {};
-                            return .detached;
-                        }
-                    }
-                    try sendInput(allocator, socket_fd, session_id, bytes);
-                },
+        if (pending_output == null and eof_outcome == null) {
+            while (reader.hasBufferedLine()) {
+                const line = (try reader.nextBufferedLineAlloc(allocator, rpc_line_max)).?;
+                defer allocator.free(line);
+                eof_outcome = try handleServerLine(allocator, line, &state, &pending_output, options.io);
+                partial_since = null;
+                if (pending_output != null or eof_outcome != null) break;
+            }
+            // The reader's staging buffer is fixed-size. Move a partial frame
+            // into the reader's heap buffer so large frames never block the
+            // loop; the reader joins it with the rest of the line.
+            if (pending_output == null and eof_outcome == null and reader.end > reader.start) {
+                if (partial_since == null) partial_since = sys.monotonicMs();
+                _ = try reader.nextBufferedLineAlloc(allocator, rpc_line_max);
             }
         }
 
-        if ((fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return .exited;
+        if (eof_outcome) |outcome| {
+            if (pending_output == null and (outcome != .detached or outbound.pending().len == 0)) return outcome;
+        }
+        const now = sys.monotonicMs();
+        if (partial_since) |started| {
+            if (now - started >= partial_frame_timeout_ms) return .connection_lost;
+        }
+        if (outbound.pending().len != 0 and now >= outbound.deadline) {
+            return diagnostic(options.io, "timed out sending interactive requests", .{});
+        }
+        if (stdin_eof and outbound.pending().len == 0 and pending_output == null and partial_since == null and now >= quiet_until)
+            return .exited;
+
+        resize_pending = g_winch_flag.swap(false, .seq_cst) or resize_pending;
+        // Leave space for a worst-case input frame and a detach frame.
+        const can_queue = outbound.pending().len <= outbound_max - (buffer_size * 2 + 4096);
+        if (eof_outcome == null and resize_pending and can_queue) {
+            resize_pending = false;
+            if (currentTerminalSize(stdout_fd, stdin_fd)) |size| {
+                try state.queue(allocator, &outbound, "session.resize", .{
+                    .sessionId = state.pane_id,
+                    .rows = size.rows,
+                    .cols = size.cols,
+                });
+            }
+        }
+
+        const socket_events: i16 = (if (pending_output == null and eof_outcome == null) @as(i16, posix.POLL.IN) else 0) |
+            (if (outbound.pending().len != 0) @as(i16, posix.POLL.OUT) else 0);
+        const want_stdin = !stdin_eof and eof_outcome == null and can_queue;
+        const want_stdout = pending_output != null;
+        var fds = [_]posix.pollfd{
+            .{ .fd = if (want_stdin and !stdin_unpollable) stdin_fd else -1, .events = posix.POLL.IN, .revents = 0 },
+            .{ .fd = if (socket_events != 0) socket_fd else -1, .events = socket_events, .revents = 0 },
+            .{ .fd = if (want_stdout and !stdout_unpollable) stdout_fd else -1, .events = posix.POLL.OUT, .revents = 0 },
+        };
+        // An unpollable stdout (see pollUnsupported) is written without
+        // waiting; an unpollable stdin is read once per loop turn.
+        _ = try posix.poll(&fds, if (want_stdout and stdout_unpollable) 0 else run_loop_poll_timeout_ms);
+        if (want_stdin and stdin_unpollable) fds[0].revents = posix.POLL.IN;
+        if (want_stdout and stdout_unpollable) fds[2].revents = posix.POLL.OUT;
+        if ((fds[2].revents & (posix.POLL.ERR | posix.POLL.NVAL | posix.POLL.HUP)) != 0) return error.OutputClosed;
+        if ((fds[2].revents & posix.POLL.OUT) != 0) {
+            const bytes = pending_output.?;
+            const n = sys.write(stdout_fd, bytes[output_sent..]) catch |err| switch (err) {
+                error.WouldBlock => 0,
+                else => return err,
+            };
+            output_sent += n;
+            if (output_sent == bytes.len) {
+                allocator.free(bytes);
+                pending_output = null;
+                output_sent = 0;
+            }
+        }
+        if (socket_events & posix.POLL.IN != 0 and (fds[1].revents & (posix.POLL.IN | posix.POLL.HUP)) != 0) {
+            const filled = reader.fillOnce(socket_fd) catch |err| switch (@as(anyerror, err)) {
+                error.ConnectionClosed, error.ConnectionResetByPeer => return .connection_lost,
+                else => return err,
+            };
+            switch (filled) {
+                .data => quiet_until = sys.monotonicMs() + pipe_quiet_ms,
+                .eof => return .connection_lost,
+                .would_block => if ((fds[1].revents & posix.POLL.HUP) != 0) return .connection_lost,
+            }
+        } else if ((fds[1].revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0 or
+            (socket_events & posix.POLL.OUT != 0 and fds[1].revents & posix.POLL.HUP != 0 and pending_output == null))
+        {
+            return .connection_lost;
+        }
+        if ((fds[1].revents & posix.POLL.HUP) != 0 and socket_events & posix.POLL.IN == 0) {
+            // Finish pending terminal output before reading EOF from the socket.
+            outbound.bytes.clearRetainingCapacity();
+            outbound.sent = 0;
+        } else if ((fds[1].revents & posix.POLL.OUT) != 0) {
+            outbound.flush(socket_fd) catch |err| switch (err) {
+                error.BrokenPipe, error.ConnectionResetByPeer => {
+                    // Read already queued final frames before handling EOF.
+                    outbound.bytes.clearRetainingCapacity();
+                    outbound.sent = 0;
+                },
+                else => return err,
+            };
+            if (stdin_eof) quiet_until = sys.monotonicMs() + pipe_quiet_ms;
+        }
+
+        if ((fds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
+            switch (try readStdinChunk(stdin_fd, &buf)) {
+                .again => {},
+                .eof => {
+                    if (!options.piped) return .exited;
+                    stdin_eof = true;
+                    quiet_until = sys.monotonicMs() + pipe_quiet_ms;
+                },
+                .bytes => |bytes| {
+                    const chord = if (options.detach_key) |key| std.mem.indexOfScalar(u8, bytes, key) else null;
+                    const input = bytes[0 .. chord orelse bytes.len];
+                    if (input.len != 0) try state.queueSend(allocator, &outbound, input);
+                    if (chord != null) {
+                        try state.queue(allocator, &outbound, "client.detach", .{ .clientId = state.client_id });
+                        eof_outcome = .detached;
+                    }
+                },
+            }
+        }
     }
 }
 
-fn sendDetach(allocator: std.mem.Allocator, socket_fd: posix.fd_t, client_id: []const u8) !void {
-    const msg = try std.fmt.allocPrint(
-        allocator,
-        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"client.detach\",\"params\":{{\"clientId\":{f}}}}}\n",
-        .{ detach_rpc_id, std.json.fmt(client_id, .{}) },
-    );
-    defer allocator.free(msg);
-    try writeAll(socket_fd, msg);
+/// Whether `fd` is open but cannot be polled. Darwin's poll(2) "does not
+/// support devices" (BUGS section): an open character device such as
+/// /dev/null reports POLLNVAL, which otherwise reads as a closed descriptor.
+/// Such a descriptor is left out of poll and treated as always ready; its
+/// read or write then reports the real state.
+fn pollUnsupported(fd: posix.fd_t) bool {
+    if (fd < 0) return false;
+    var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN | posix.POLL.OUT, .revents = 0 }};
+    _ = posix.poll(&fds, 0) catch return false;
+    return (fds[0].revents & posix.POLL.NVAL) != 0 and c.fcntl(fd, c.F.GETFD) >= 0;
 }
 
 const StdinReadResult = union(enum) {
@@ -1128,311 +1101,349 @@ fn readStdinChunk(fd: posix.fd_t, buf: []u8) !StdinReadResult {
     return .{ .bytes = buf[0..n] };
 }
 
-fn handleReadableSocket(
-    allocator: std.mem.Allocator,
-    reader: *LineReader,
-    socket_fd: posix.fd_t,
-    session_id: []const u8,
-    stdout_fd: posix.fd_t,
-) !bool {
-    const first_line = try reader.readLineAlloc(allocator, socket_fd, rpc_line_max);
-    defer allocator.free(first_line);
-    if (try handleServerLine(allocator, first_line, session_id, stdout_fd)) return true;
-
-    while (try reader.nextBufferedLineAlloc(allocator, rpc_line_max)) |line| {
-        const should_exit = try handleServerLine(allocator, line, session_id, stdout_fd);
-        allocator.free(line);
-        if (should_exit) return true;
-    }
-
-    return false;
+fn getEnv(name: []const u8) ?[]const u8 {
+    var buf: [64]u8 = undefined;
+    if (name.len >= buf.len) return null;
+    @memcpy(buf[0..name.len], name);
+    buf[name.len] = 0;
+    const key = buf[0..name.len :0];
+    return if (c.getenv(key.ptr)) |value| std.mem.span(value) else null;
 }
 
-fn drainReadableSocket(
-    allocator: std.mem.Allocator,
-    reader: *LineReader,
-    socket_fd: posix.fd_t,
-    session_id: []const u8,
-    stdout_fd: posix.fd_t,
-) !bool {
-    var saw_exit = false;
-    while (try reader.readLineAllocMaybe(allocator, socket_fd, rpc_line_max)) |line| {
-        const should_exit = try handleServerLine(allocator, line, session_id, stdout_fd);
-        allocator.free(line);
-        if (should_exit) saw_exit = true;
-    }
-    return saw_exit;
+fn resolveSocketPath(allocator: std.mem.Allocator, io: std.Io, override: ?[]const u8) ![]u8 {
+    return socket_path.resolve(allocator, override, getEnv) catch |err| switch (err) {
+        error.SocketPathTooLong => {
+            // The resolver discards an overlong result. Repeat its resolution
+            // only on this error with a generalized path-length diagnostic.
+            const raw = override orelse getEnv("ZMUX_SOCKET") orelse getEnv("SMITHERS_SESSION_SOCKET");
+            if (raw) |value| {
+                const path = try socket_path.absolutize(allocator, value);
+                defer allocator.free(path);
+                if (path.len > sys.max_unix_path_len)
+                    return fail(io, "socket path too long ({d} > {d})", .{ path.len, sys.max_unix_path_len });
+            }
+            return fail(io, "socket path too long (maximum {d} bytes)", .{sys.max_unix_path_len});
+        },
+        error.EmptySocketPath, error.SocketPathContainsNul => return fail(io, "{s}", .{@errorName(err)}),
+        else => return err,
+    };
 }
 
 fn connectWithRetry(allocator: std.mem.Allocator, io: std.Io, path: []const u8, spawn_daemon: bool) !posix.fd_t {
-    if (tryConnect(path)) |fd| return fd else |err| switch (err) {
+    const first_deadline = sys.monotonicMs() + write_timeout_ms;
+    if (tryConnect(io, path, first_deadline)) |fd| return fd else |err| switch (err) {
         error.ConnectionRefused, error.FileNotFound => {
-            if (!spawn_daemon) return err;
+            if (!spawn_daemon) return diagnostic(io, "no daemon at {f}; start zmuxd or pass --spawn-daemon", .{escaped(path)});
         },
         else => return err,
     }
 
-    try spawnDaemonDetached(allocator, io, path);
+    // A refused connect can also mean an existing regular file or symlink.
+    if (sys.statAt(sys.cwd_fd, path, false)) |st| {
+        if (!st.isSocket() or st.uid != sys.geteuid()) return diagnostic(io, "refusing to replace socket path {f}", .{escaped(path)});
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
 
-    const deadline = Deadline.fromNow(io, 2000);
-    while (std.Io.Clock.awake.now(io).compare(.lt, deadline.at.raw)) {
-        if (tryConnect(path)) |fd| return fd else |err| switch (err) {
-            error.ConnectionRefused, error.FileNotFound => {
-                try io.sleep(.fromMilliseconds(50), .awake);
-            },
+    const deadline = sys.monotonicMs() + spawn_timeout_ms;
+    spawnDaemonDetached(allocator, io, path, deadline) catch |err| {
+        if (err == error.ReportedFailure) return err;
+        return diagnostic(io, "could not start daemon at {f}: {s}; see {f}.log", .{ escaped(path), @errorName(err), escaped(path) });
+    };
+    while (sys.monotonicMs() < deadline) {
+        if (tryConnect(io, path, deadline)) |fd| return fd else |err| switch (err) {
+            error.ConnectionRefused, error.FileNotFound => try io.sleep(.fromMilliseconds(50), .awake),
+            error.ReportedFailure => return err,
             else => return err,
         }
     }
-    return error.DaemonUnavailable;
+    return diagnostic(io, "daemon at {f} did not become ready within 4s; see {f}.log", .{ escaped(path), escaped(path) });
 }
 
-fn connectFailureMessage(allocator: std.mem.Allocator, path: []const u8, err: anyerror) !?[]u8 {
-    return switch (err) {
-        error.ConnectionRefused, error.FileNotFound => try std.fmt.allocPrint(
-            allocator,
-            "no daemon at {s}; start zmuxd or pass --spawn-daemon",
-            .{path},
-        ),
-        error.DaemonUnavailable => try std.fmt.allocPrint(
-            allocator,
-            "daemon at {s} did not become ready within 2s; see {s}.log",
-            .{ path, path },
-        ),
-        else => null,
+fn tryConnect(io: std.Io, path: []const u8, deadline: i64) !posix.fd_t {
+    const connected = sys.connectUnixDeadline(path, deadline) catch |err| switch (err) {
+        error.NameTooLong => return fail(io, "socket path too long ({d} > {d})", .{ path.len, sys.max_unix_path_len }),
+        error.Timeout, error.ConnectionTimedOut => return diagnostic(io, "timed out connecting to daemon at {f}", .{escaped(path)}),
+        else => return err,
     };
-}
-
-fn tryConnect(path: []const u8) !posix.fd_t {
-    const address = sys.UnixAddress.init(path) catch return error.FileNotFound;
-    const fd = try sys.unixStreamSocket();
+    // Keep a socket out of stdin/stdout/stderr when the caller closed one.
+    const fd = try moveAboveStdio(connected);
     errdefer sys.close(fd);
-    try sys.connect(fd, &address);
     sys.tuneUnixSocketBuffers(fd);
+    const uid = sys.peerEuid(fd) catch
+        return diagnostic(io, "could not authenticate daemon at {f}; refusing", .{escaped(path)});
+    if (uid != sys.geteuid())
+        return diagnostic(io, "socket at {f} is owned by uid {d}; refusing", .{ escaped(path), uid });
+
+    if (socket_path.isDefaultManaged(path, getEnv)) {
+        const parent = std.fs.path.dirname(path).?;
+        // An existing connection must never cause us to create a directory.
+        const dir = sys.openDirNoFollow(parent) catch |err|
+            return diagnostic(io, "cannot verify socket directory {f}: {s}", .{ escaped(parent), @errorName(err) });
+        defer sys.close(dir);
+        const st = try sys.fstat(dir);
+        if (!st.isDir() or st.uid != sys.geteuid() or st.permissions() & 0o077 != 0)
+            return diagnostic(io, "socket directory {f} must be private and owned by the current user", .{escaped(parent)});
+    }
+    try sys.setNonBlocking(fd);
     return fd;
 }
 
-fn spawnDaemonDetached(allocator: std.mem.Allocator, io: std.Io, socket_path: []const u8) !void {
-    // Locate the daemon binary by looking next to our own executable.
+fn moveAboveStdio(fd: posix.fd_t) !posix.fd_t {
+    if (fd >= 3) return fd;
+    defer sys.close(fd);
+    const moved = c.fcntl(fd, c.F.DUPFD_CLOEXEC, @as(c_int, 3));
+    if (moved < 0) return error.Unexpected;
+    return moved;
+}
+
+fn spawnDaemonDetached(allocator: std.mem.Allocator, io: std.Io, path: []const u8, deadline: i64) !void {
     const self_path = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(self_path);
-    const dir = std.fs.path.dirname(self_path) orelse ".";
-    const daemon_path = try findDaemonSibling(allocator, io, dir, std.fs.path.basename(self_path));
+    const daemon_path = try findDaemonSibling(allocator, io, std.fs.path.dirname(self_path) orelse ".", std.fs.path.basename(self_path));
     defer allocator.free(daemon_path);
-
-    // Prepare every NUL-terminated string before fork: a forked child of a
-    // Zig process may only invoke async-signal-safe syscalls before exec
-    // (no heap allocation, no `std.Io`, no locks).
     const daemon_z = try allocator.dupeSentinel(u8, daemon_path, 0);
     defer allocator.free(daemon_z);
-    const path_z = try allocator.dupeSentinel(u8, socket_path, 0);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
-    const log_path_z = try std.fmt.allocPrintSentinel(allocator, "{s}.log", .{socket_path}, 0);
-    defer allocator.free(log_path_z);
     const argv = [_:null]?[*:0]const u8{ daemon_z.ptr, "--socket", path_z.ptr };
     const envp = sys.currentEnviron();
 
-    const pid = try sys.fork();
-    if (pid != 0) return;
-
-    // Child: detach and exec.
-    _ = std.c.setsid();
-    // Redirect stdio to /dev/null, and stderr to the socket log for startup diagnostics.
-    const devnull = sys.openZ("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch std.c._exit(127);
-    sys.dup2(devnull, 0) catch {};
-    sys.dup2(devnull, 1) catch {};
-
-    const log_fd = sys.openZ(
-        log_path_z.ptr,
-        .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true },
-        0o600,
-    ) catch devnull;
-    sys.dup2(log_fd, 2) catch {};
-    if (log_fd > 2) sys.close(log_fd);
-    if (devnull > 2 and devnull != log_fd) sys.close(devnull);
-
-    // execvpeZ only returns on failure; the log fd already holds stderr.
-    switch (sys.execvpeZ(daemon_z.ptr, &argv, envp)) {
-        else => std.c._exit(127),
+    const parent = std.fs.path.dirname(path) orelse return error.NoSocketDirectory;
+    if (!socket_path.isDefaultManaged(path, getEnv)) {
+        const existing = try sys.openDirNoFollow(parent);
+        sys.close(existing);
     }
-}
+    const dir_fd = try moveAboveStdio(try sys.ensurePrivateDir(parent));
+    defer sys.close(dir_fd);
+    const log_name = try std.fmt.allocPrint(allocator, "{s}.log", .{std.fs.path.basename(path)});
+    defer allocator.free(log_name);
+    const log_fd = try moveAboveStdio(try sys.openOwnedRegularAt(dir_fd, log_name, .{ .ACCMODE = .WRONLY, .APPEND = true, .CREAT = true }, 0o600));
+    defer sys.close(log_fd);
+    const devnull = try moveAboveStdio(try sys.openZ("/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0));
+    defer sys.close(devnull);
 
-fn enterRawMode(fd: posix.fd_t) !void {
-    const current = posix.tcgetattr(fd) catch |err| switch (err) {
-        error.NotATerminal => return,
-        else => return err,
+    const status_pipe = try sys.pipe();
+    const status_read = moveAboveStdio(status_pipe[0]) catch |err| {
+        sys.close(status_pipe[1]);
+        return err;
     };
-    g_saved_termios = current;
-    g_saved_termios_fd = fd;
+    defer sys.close(status_read);
+    const status_write = try moveAboveStdio(status_pipe[1]);
 
-    var raw = current;
-    // Input: disable CR/NL translation, parity, strip, XON/XOFF.
-    raw.iflag.BRKINT = false;
-    raw.iflag.ICRNL = false;
-    raw.iflag.INPCK = false;
-    raw.iflag.ISTRIP = false;
-    raw.iflag.IXON = false;
-    // Output: disable post-processing (we forward bytes verbatim).
-    raw.oflag.OPOST = false;
-    // Local: disable echo, canonical mode, signal generation, extended input.
-    raw.lflag.ECHO = false;
-    raw.lflag.ECHONL = false;
-    raw.lflag.ICANON = false;
-    raw.lflag.ISIG = false;
-    raw.lflag.IEXTEN = false;
+    const child = sys.fork() catch |err| {
+        sys.close(status_write);
+        return err;
+    };
+    if (child == 0) {
+        sys.close(status_read);
+        if (c.setsid() < 0) childSpawnFailed(status_write, "setsid");
+        const daemon_child = sys.fork() catch childSpawnFailed(status_write, "fork");
+        if (daemon_child != 0) c._exit(0);
 
-    try posix.tcsetattr(fd, .FLUSH, raw);
+        sys.dup2(devnull, 0) catch childSpawnFailed(status_write, "stdin");
+        sys.dup2(devnull, 1) catch childSpawnFailed(status_write, "stdout");
+        sys.dup2(log_fd, 2) catch childSpawnFailed(status_write, "stderr");
+        // Reserve fd 3 for the exec receipt, and close all other inherited fds.
+        if (status_write != 3) sys.dup2(status_write, 3) catch childSpawnFailed(status_write, "dup2");
+        sys.setCloseOnExec(3) catch childSpawnFailed(3, "cloexec");
+        sys.closeFrom(4);
+        sys.resetChildSignals();
+        _ = c.execve(daemon_z.ptr, &argv, envp);
+        childSpawnFailed(3, "execve");
+    }
+    sys.close(status_write);
+
+    var status: c_int = undefined;
+    while (c.waitpid(child, &status, 0) < 0) {
+        if (posix.errno(@as(c_int, -1)) != .INTR) return error.WaitFailed;
+    }
+    try waitWritableOrReadable(status_read, posix.POLL.IN, deadline);
+    var buf: [32]u8 = undefined;
+    const count = try posix.read(status_read, &buf);
+    if (count != 0) return diagnostic(io, "daemon startup failed during {f}", .{escaped(buf[0..count])});
+    if (status != 0) return error.DaemonSpawnFailed;
 }
 
-fn restoreTermios() void {
-    if (g_saved_termios) |saved| {
-        posix.tcsetattr(g_saved_termios_fd, .FLUSH, saved) catch {};
-        g_saved_termios = null;
+fn childSpawnFailed(fd: posix.fd_t, stage: []const u8) noreturn {
+    _ = c.write(fd, stage.ptr, stage.len);
+    c._exit(127);
+}
+
+const terminal_signals = [_]posix.SIG{ .HUP, .INT, .TERM, .TSTP, .QUIT, .PIPE, .CONT, .TTOU };
+
+fn terminalSignalSet() posix.sigset_t {
+    var mask = posix.sigemptyset();
+    for (terminal_signals) |sig| posix.sigaddset(&mask, sig);
+    return mask;
+}
+
+fn enterTerminal(stdin_fd: posix.fd_t, stdout_fd: posix.fd_t, is_tty: bool) !void {
+    if (is_tty) {
+        const current = try posix.tcgetattr(stdin_fd);
+        g_saved_termios = current;
+        g_saved_termios_fd = stdin_fd;
+        var raw = current;
+        raw.iflag.IGNBRK = false;
+        raw.iflag.BRKINT = false;
+        raw.iflag.PARMRK = false;
+        raw.iflag.ISTRIP = false;
+        raw.iflag.INLCR = false;
+        raw.iflag.IGNCR = false;
+        raw.iflag.ICRNL = false;
+        raw.iflag.IXON = false;
+        raw.oflag.OPOST = false;
+        raw.lflag.ECHO = false;
+        raw.lflag.ECHONL = false;
+        raw.lflag.ICANON = false;
+        raw.lflag.ISIG = false;
+        raw.lflag.IEXTEN = false;
+        raw.cflag.CSIZE = .CS8;
+        raw.cflag.PARENB = false;
+        raw.cc[@backingInt(posix.V.MIN)] = 1;
+        raw.cc[@backingInt(posix.V.TIME)] = 0;
+        g_raw_termios = raw;
+        try posix.tcsetattr(stdin_fd, .NOW, raw);
+        g_termios_saved.store(true, .seq_cst);
+    } else {
+        g_saved_termios_fd = -1;
     }
+
+    g_output_fd = stdout_fd;
+    g_output_flags = c.fcntl(stdout_fd, c.F.GETFL);
+    if (g_output_flags < 0) return error.Unexpected;
+    try sys.setNonBlocking(stdout_fd);
+    g_restore_output.store(true, .seq_cst);
+}
+
+fn leaveTerminal() void {
+    g_terminal_active.store(false, .seq_cst);
+    restoreTerminal();
+}
+
+fn restoreTerminal() void {
+    var previous: posix.sigset_t = undefined;
+    const signals = terminalSignalSet();
+    posix.sigprocmask(posix.SIG.BLOCK, &signals, &previous);
+    if (g_termios_saved.swap(false, .seq_cst)) posix.tcsetattr(g_saved_termios_fd, .NOW, g_saved_termios) catch {};
+    if (g_restore_output.swap(false, .seq_cst)) _ = c.fcntl(g_output_fd, c.F.SETFL, g_output_flags);
+    posix.sigprocmask(posix.SIG.SETMASK, &previous, null);
 }
 
 fn winchHandler(_: posix.SIG) callconv(.c) void {
     g_winch_flag.store(true, .seq_cst);
 }
 
+fn terminalAction(handler: *const fn (posix.SIG) callconv(.c) void) posix.Sigaction {
+    return .{ .handler = .{ .handler = handler }, .mask = terminalSignalSet(), .flags = 0 };
+}
+
 fn exitRestoreHandler(sig: posix.SIG) callconv(.c) void {
-    restoreTermios();
-    // Reset to default and re-raise so the default action takes effect.
-    const dfl: posix.Sigaction = .{
-        .handler = .{ .handler = posix.SIG.DFL },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
-    };
+    leaveTerminal();
+    const dfl: posix.Sigaction = .{ .handler = .{ .handler = posix.SIG.DFL }, .mask = posix.sigemptyset(), .flags = 0 };
     posix.sigaction(sig, &dfl, null);
-    _ = std.c.raise(sig);
+    _ = c.raise(sig);
 }
 
-fn installSigwinchHandler() void {
-    const act: posix.Sigaction = .{
-        .handler = .{ .handler = winchHandler },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
+fn suspendHandler(sig: posix.SIG) callconv(.c) void {
+    restoreTerminal();
+    const dfl: posix.Sigaction = .{ .handler = .{ .handler = posix.SIG.DFL }, .mask = posix.sigemptyset(), .flags = 0 };
+    posix.sigaction(sig, &dfl, null);
+    var unblock = posix.sigemptyset();
+    posix.sigaddset(&unblock, sig);
+    posix.sigprocmask(posix.SIG.UNBLOCK, &unblock, null);
+    _ = c.raise(sig);
+    // Also restore the active state when an orphaned process group ignores TSTP.
+    resumeHandler(.CONT);
+}
+
+fn resumeHandler(_: posix.SIG) callconv(.c) void {
+    if (!g_terminal_active.load(.seq_cst)) return;
+    const suspend_action = terminalAction(suspendHandler);
+    posix.sigaction(.TSTP, &suspend_action, null);
+    if (g_saved_termios_fd >= 0 and !g_termios_saved.load(.seq_cst)) {
+        if (posix.tcsetattr(g_saved_termios_fd, .NOW, g_raw_termios)) |_| {
+            g_termios_saved.store(true, .seq_cst);
+        } else |_| {}
+    }
+    if (!g_restore_output.load(.seq_cst)) {
+        if (sys.setNonBlocking(g_output_fd)) |_| {
+            g_restore_output.store(true, .seq_cst);
+        } else |_| {}
+    }
+    g_winch_flag.store(true, .seq_cst);
+}
+
+fn installTerminalHandlers() void {
+    const restore = terminalAction(exitRestoreHandler);
+    for ([_]posix.SIG{ .HUP, .PIPE, .QUIT, .INT, .TERM }) |sig| posix.sigaction(sig, &restore, null);
+    const suspend_action = terminalAction(suspendHandler);
+    posix.sigaction(.TSTP, &suspend_action, null);
+    const resume_action = terminalAction(resumeHandler);
+    posix.sigaction(.CONT, &resume_action, null);
+    const winch = terminalAction(winchHandler);
+    posix.sigaction(.WINCH, &winch, null);
+}
+
+const TerminalSize = struct { rows: u16, cols: u16 };
+
+fn currentTerminalSize(stdout_fd: posix.fd_t, stdin_fd: posix.fd_t) ?TerminalSize {
+    return terminalSize(stdout_fd) orelse terminalSize(stdin_fd);
+}
+
+fn terminalSize(fd: posix.fd_t) ?TerminalSize {
+    var size: posix.winsize = undefined;
+    const rc = if (builtin.os.tag.isDarwin() or builtin.abi.isGnu()) blk: {
+        const ioctl = @extern(*const fn (posix.fd_t, c_ulong, ...) callconv(.c) c_int, .{ .name = "ioctl", .library_name = "c" });
+        break :blk ioctl(fd, tiocgwinsz(), &size);
+    } else c.ioctl(fd, @intCast(tiocgwinsz()), &size);
+    if (rc != 0 or size.col == 0 or size.row == 0) return null;
+    return .{ .rows = size.row, .cols = size.col };
+}
+
+fn tiocgwinsz() c_ulong {
+    return if (builtin.os.tag.isDarwin()) 0x40087468 else 0x5413;
+}
+
+fn waitWritableOrReadable(fd: posix.fd_t, event: i16, deadline: i64) !void {
+    const remaining = deadline - sys.monotonicMs();
+    if (remaining <= 0) return error.WriteTimeout;
+    var pollfds = [_]posix.pollfd{.{ .fd = fd, .events = event, .revents = 0 }};
+    if (try posix.poll(&pollfds, @intCast(remaining)) == 0) return error.WriteTimeout;
+}
+
+fn sendSome(fd: posix.fd_t, bytes: []const u8) !?usize {
+    const n = sys.send(fd, bytes) catch |err| switch (err) {
+        error.WouldBlock => return null,
+        else => return err,
     };
-    posix.sigaction(.WINCH, &act, null);
+    if (n == 0) return error.WriteZero;
+    return n;
 }
 
-fn installExitRestoreHandlers() void {
-    // Raw mode disables ISIG, so interactive ^C is forwarded as input bytes.
-    // Signal-delivered INT/TERM still need to restore the local terminal.
-    const act: posix.Sigaction = .{
-        .handler = .{ .handler = exitRestoreHandler },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
-    };
-    posix.sigaction(.HUP, &act, null);
-    posix.sigaction(.PIPE, &act, null);
-    posix.sigaction(.QUIT, &act, null);
-    posix.sigaction(.INT, &act, null);
-    posix.sigaction(.TERM, &act, null);
-}
-
-fn sendResize(
-    allocator: std.mem.Allocator,
-    socket_fd: posix.fd_t,
-    session_id: []const u8,
-    tty_fd: posix.fd_t,
-) !void {
-    const size = terminalSize(tty_fd) orelse return;
-
-    const msg = try std.fmt.allocPrint(
-        allocator,
-        "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"session.resize\",\"params\":{{\"sessionId\":{f},\"cols\":{},\"rows\":{}}}}}\n",
-        .{ std.json.fmt(session_id, .{}), size.cols, size.rows },
-    );
-    defer allocator.free(msg);
-    writeAll(socket_fd, msg) catch {};
-}
-
-const TerminalSize = struct {
-    rows: u16,
-    cols: u16,
-};
-
-fn terminalSize(tty_fd: posix.fd_t) ?TerminalSize {
-    var wsz: posix.winsize = undefined;
-    const req = tiocgwinsz();
-    if (std.c.ioctl(tty_fd, @as(c_int, @bitCast(@as(u32, @truncate(req)))), &wsz) != 0) return null;
-    if (wsz.col == 0 or wsz.row == 0) return null;
-    return .{ .rows = wsz.row, .cols = wsz.col };
-}
-
-// Mirrors daemon.zig::socketPath. Keep in sync.
-fn resolveSocketPath(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]u8 {
-    return resolveSocketPathFromEnv(
-        allocator,
-        environ.get("ZMUX_SOCKET"),
-        environ.get("SMITHERS_SESSION_SOCKET"),
-        environ.get("XDG_RUNTIME_DIR"),
-        environ.get("HOME"),
-    );
-}
-
-fn resolveSocketPathFromEnv(
-    allocator: std.mem.Allocator,
-    zmux_socket: ?[]const u8,
-    smithers_socket: ?[]const u8,
-    xdg_runtime_dir: ?[]const u8,
-    home: ?[]const u8,
-) ![]u8 {
-    if (zmux_socket) |value| {
-        if (value.len > 0) return allocator.dupe(u8, value);
-    }
-    if (smithers_socket) |value| {
-        if (value.len > 0) return allocator.dupe(u8, value);
-    }
-    if (xdg_runtime_dir) |xdg| {
-        if (xdg.len > 0) return std.fs.path.join(allocator, &.{ xdg, "smithers-sessions.sock" });
-    }
-    if (home) |home_path| {
-        if (home_path.len > 0) return std.fs.path.join(allocator, &.{ home_path, ".smithers", "sessions.sock" });
-    }
-
-    const fallback_dir = try std.fmt.allocPrint(allocator, "/tmp/zmux-{d}", .{sys.geteuid()});
-    defer allocator.free(fallback_dir);
-    return std.fs.path.join(allocator, &.{ fallback_dir, "sessions.sock" });
-}
-
-fn tiocgwinsz() usize {
-    return switch (builtin.os.tag) {
-        .macos, .ios, .tvos, .watchos, .visionos => 0x40087468,
-        else => 0x5413, // TIOCGWINSZ on Linux
-    };
-}
-
-/// Write to a socket using `MSG_NOSIGNAL` (falling back to `write(2)` only on
-/// non-socket descriptors such as unit-test pipes).
-fn writeAll(fd: posix.fd_t, bytes: []const u8) !void {
+fn sendFrame(fd: posix.fd_t, bytes: []const u8, timeout_ms: i64) !void {
+    const deadline = sys.monotonicMs() + timeout_ms;
     var offset: usize = 0;
     while (offset < bytes.len) {
-        const chunk = bytes[offset..];
-        const rc = std.c.send(fd, chunk.ptr, chunk.len, std.c.MSG.NOSIGNAL);
-        switch (posix.errno(rc)) {
-            .SUCCESS => {
-                const n: usize = @intCast(rc);
-                if (n == 0) return error.WriteZero;
-                offset += n;
-            },
-            .INTR, .AGAIN => continue,
-            .NOTSOCK => return writeAllFd(fd, chunk),
-            .PIPE => return error.BrokenPipe,
-            .CONNRESET => return error.ConnectionResetByPeer,
-            .IO => return error.InputOutput,
-            .NOSPC => return error.NoSpaceLeft,
-            .ACCES, .PERM => return error.AccessDenied,
-            else => |err| return posix.unexpectedErrno(err),
+        if (sys.monotonicMs() >= deadline) return error.WriteTimeout;
+        if (try sendSome(fd, bytes[offset..])) |n| {
+            offset += n;
+        } else {
+            try waitWritableOrReadable(fd, posix.POLL.OUT, deadline);
         }
     }
 }
 
 fn writeAllFd(fd: posix.fd_t, bytes: []const u8) !void {
+    const deadline = sys.monotonicMs() + write_timeout_ms;
     var offset: usize = 0;
     while (offset < bytes.len) {
         const n = sys.write(fd, bytes[offset..]) catch |err| switch (err) {
-            error.WouldBlock => continue,
+            error.WouldBlock => {
+                try waitWritableOrReadable(fd, posix.POLL.OUT, deadline);
+                continue;
+            },
             else => return err,
         };
         if (n == 0) return error.WriteZero;
@@ -1443,326 +1454,228 @@ fn writeAllFd(fd: posix.fd_t, bytes: []const u8) !void {
 fn handleServerLine(
     allocator: std.mem.Allocator,
     line: []const u8,
+    state: *RunState,
+    output: *?[]u8,
+    io: std.Io,
+) !?RunOutcome {
+    if (std.mem.indexOfScalar(u8, line, '\\') == null) {
+        // Without a backslash every JSON string in `line` is spelled verbatim,
+        // so a frame can only act on this client if the method names (or the
+        // `"error"` key) and the current pane id appear literally.
+        const is_error = containsSubstrSimd(line, "\"error\"");
+        const is_client = containsSubstrSimd(line, "client_");
+        if (!is_error and !is_client) {
+            if (!containsSubstrSimd(line, "pane_") and
+                !containsSubstrSimd(line, protocol.session_exited_method)) return null;
+            if (!containsSubstrSimd(line, state.pane_id)) return null;
+        }
+        if (canonicalPaneOutput(line)) |frame| {
+            if (frame.generation != null and state.generation != null and frame.generation.? < state.generation.?) return null;
+            if (!std.mem.eql(u8, frame.pane_id, state.pane_id)) return null;
+            return applyPaneOutput(allocator, state, output, frame.generation, frame.offset, frame.data_base64);
+        }
+    }
+    return handleServerLineDom(allocator, line, state, output, io);
+}
+
+/// Fields of a `pane_output` frame in the daemon's canonical wire layout.
+const CanonicalPaneOutput = struct {
     pane_id: []const u8,
-    stdout_fd: posix.fd_t,
-) !bool {
-    // Ultra-fast canonical path for the wire format emitted by `zmuxd`:
-    //   {"jsonrpc":"2.0","method":"pane_output","params":{"pane_id":"<id>","data_base64":"<b64>"}}\n
-    // Base64 decoding strictly rejects `"`, `\`, and all control/non-ASCII bytes,
-    // so a successful match + decode is 100% equivalent to full JSON parsing while
-    // avoiding a byte-by-byte UTF-8 JSON scan over multi-kilobyte base64 payloads.
-    const canonical_prefix = "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{\"pane_id\":\"";
-    const canonical_mid = "\",\"data_base64\":\"";
-    if (std.mem.startsWith(u8, line, canonical_prefix)) blk: {
-        const id_start = canonical_prefix.len;
-        const id_end = std.mem.indexOfScalarPos(u8, line, id_start, '"') orelse break :blk;
-        const wire_pane_id = line[id_start..id_end];
-        if (!isPlainJsonAscii(wire_pane_id)) break :blk;
-        if (!std.mem.startsWith(u8, line[id_end..], canonical_mid)) break :blk;
+    data_base64: []const u8,
+    offset: ?u64 = null,
+    generation: ?u64 = null,
+};
 
-        const b64_start = id_end + canonical_mid.len;
-        const trimmed = std.mem.trimEnd(u8, line, "\r\n");
-        if (!std.mem.endsWith(u8, trimmed, "\"}}")) break :blk;
-        if (trimmed.len < b64_start + 3) break :blk;
-        const encoded = trimmed[b64_start .. trimmed.len - 3];
+/// Match the exact layout `zmuxd` emits for `pane_output`, so the hot path
+/// skips a JSON DOM parse over multi-kilobyte base64:
+///   {"jsonrpc":"2.0","method":"pane_output","params":{"pane_id":"<id>",
+///    "data_base64":"<b64>"[,"offset":<n>][,"generation":<n>]}}
+/// The caller guarantees `line` has no backslash, so every string is
+/// verbatim. Any other layout returns null and takes the DOM path; the result
+/// is then identical because each accepted field is unique and well formed.
+fn canonicalPaneOutput(line: []const u8) ?CanonicalPaneOutput {
+    const prefix = "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{\"pane_id\":\"";
+    const mid = "\",\"data_base64\":\"";
+    const trimmed = std.mem.trimEnd(u8, line, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
+    const id_end = std.mem.indexOfScalarPos(u8, trimmed, prefix.len, '"') orelse return null;
+    const pane_id = trimmed[prefix.len..id_end];
+    if (!isPlainJsonAscii(pane_id)) return null;
+    if (!std.mem.startsWith(u8, trimmed[id_end..], mid)) return null;
+    const b64_start = id_end + mid.len;
+    const b64_end = std.mem.indexOfScalarPos(u8, trimmed, b64_start, '"') orelse return null;
+    const data_base64 = trimmed[b64_start..b64_end];
+    if (!isPlainJsonAscii(data_base64)) return null;
 
-        if (!std.mem.eql(u8, wire_pane_id, pane_id)) {
-            // Confirm `encoded` has no unescaped quotes/backslashes/control chars
-            // so we know the JSON frame ends cleanly right after `data_base64`.
-            if (isPlainJsonAscii(encoded)) return false;
-            break :blk;
-        }
-
-        // For matching pane_id, decode directly; any malformed quote/escape or
-        // invalid base64 falls through to the general parser so error semantics
-        // match `handleServerLineFallback` identically.
-        const decoder = std.base64.standard.Decoder;
-        const decoded_len = decoder.calcSizeForSlice(encoded) catch break :blk;
-        var stack_buf: [64 * 1024]u8 = undefined;
-        if (decoded_len <= stack_buf.len) {
-            decoder.decode(stack_buf[0..decoded_len], encoded) catch break :blk;
-            try writeAllFd(stdout_fd, stack_buf[0..decoded_len]);
-        } else {
-            const decoded = try allocator.alloc(u8, decoded_len);
-            defer allocator.free(decoded);
-            decoder.decode(decoded, encoded) catch break :blk;
-            try writeAllFd(stdout_fd, decoded);
-        }
-        return false;
+    var frame: CanonicalPaneOutput = .{ .pane_id = pane_id, .data_base64 = data_base64 };
+    var rest = trimmed[b64_end + 1 ..];
+    while (!std.mem.eql(u8, rest, "}}")) {
+        const slot: *?u64 = if (std.mem.startsWith(u8, rest, ",\"offset\":"))
+            &frame.offset
+        else if (std.mem.startsWith(u8, rest, ",\"generation\":"))
+            &frame.generation
+        else
+            return null;
+        if (slot.* != null) return null;
+        rest = rest[std.mem.indexOfScalar(u8, rest, ':').? + 1 ..];
+        var digits: usize = 0;
+        while (digits < rest.len and std.ascii.isDigit(rest[digits])) digits += 1;
+        // JSON forbids leading zeros; keep numbers well inside i64 so the DOM
+        // would read the same `.integer`.
+        if (digits == 0 or digits > 18 or (digits > 1 and rest[0] == '0')) return null;
+        slot.* = std.fmt.parseInt(u64, rest[0..digits], 10) catch return null;
+        rest = rest[digits..];
     }
+    return frame;
+}
 
-    // Fast reject: only `pane_output` and `session_exited` notifications ever
-    // write output or signal exit. Without either method name (or `\u`), skip
-    // JSON parsing completely.
-    const has_unicode_escape = containsSubstrSimd(line, "\\u");
-    if (!has_unicode_escape) {
-        if (!containsSubstrSimd(line, "pane_output") and
-            !containsSubstrSimd(line, "session_exited"))
-        {
-            return false;
-        }
-        // Notifications for another pane cannot match `pane_id` unless the raw
-        // `pane_id` bytes appear somewhere in `line` (when plain ASCII).
-        if (isPlainJsonAscii(pane_id) and !containsSubstrSimd(line, pane_id)) {
-            return false;
-        }
-    }
-
-    return handleServerLineFast(allocator, line, pane_id, stdout_fd) catch |err| switch (err) {
-        error.FallbackToDom => handleServerLineFallback(allocator, line, pane_id, stdout_fd),
-        else => return err,
+fn handleServerLineDom(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    state: *RunState,
+    output: *?[]u8,
+    io: std.Io,
+) !?RunOutcome {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
     };
-}
-
-fn handleServerLineFast(
-    allocator: std.mem.Allocator,
-    line: []const u8,
-    pane_id: []const u8,
-    stdout_fd: posix.fd_t,
-) !bool {
-    var scanner = std.json.Scanner.initCompleteInput(allocator, line);
-    defer scanner.deinit();
-
-    const first = scanner.next() catch return false;
-    if (first != .object_begin) return false;
-
-    const MethodKind = enum { none, pane_output, session_exited, other };
-    var method_kind: MethodKind = .none;
-    var has_params = false;
-    var param_pane_id: ?[]const u8 = null;
-    var param_pane_id_camel: ?[]const u8 = null;
-    var param_session_id: ?[]const u8 = null;
-    var param_session_id_camel: ?[]const u8 = null;
-    var param_data_b64: ?[]const u8 = null;
-    var param_data_b64_camel: ?[]const u8 = null;
-
-    while (true) {
-        const key_tok = scanner.next() catch return false;
-        switch (key_tok) {
-            .object_end => break,
-            .string => |key| {
-                if (std.mem.eql(u8, key, "method")) {
-                    const val = scanner.next() catch return false;
-                    switch (val) {
-                        .string => |s| {
-                            if (std.mem.eql(u8, s, "pane_output")) {
-                                method_kind = .pane_output;
-                            } else if (std.mem.eql(u8, s, "session_exited")) {
-                                method_kind = .session_exited;
-                            } else {
-                                method_kind = .other;
-                            }
-                        },
-                        .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => return error.FallbackToDom,
-                        .object_begin, .array_begin => {
-                            method_kind = .other;
-                            skipComposite(&scanner) catch return false;
-                        },
-                        .partial_number => {
-                            method_kind = .other;
-                            skipRestOfNumber(&scanner) catch return false;
-                        },
-                        else => method_kind = .other,
-                    }
-                } else if (std.mem.eql(u8, key, "params")) {
-                    const val = scanner.next() catch return false;
-                    if (val != .object_begin) {
-                        switch (val) {
-                            .array_begin => skipComposite(&scanner) catch return false,
-                            .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => skipRestOfString(&scanner) catch return false,
-                            .partial_number => skipRestOfNumber(&scanner) catch return false,
-                            else => {},
-                        }
-                        continue;
-                    }
-                    has_params = true;
-                    while (true) {
-                        const pk = scanner.next() catch return false;
-                        switch (pk) {
-                            .object_end => break,
-                            .string => |pfield| {
-                                if (std.mem.eql(u8, pfield, "pane_id")) {
-                                    const pv = scanner.next() catch return false;
-                                    switch (pv) {
-                                        .string => |s| param_pane_id = s,
-                                        .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => return error.FallbackToDom,
-                                        .object_begin, .array_begin => skipComposite(&scanner) catch return false,
-                                        .partial_number => skipRestOfNumber(&scanner) catch return false,
-                                        else => param_pane_id = null,
-                                    }
-                                } else if (std.mem.eql(u8, pfield, "paneId")) {
-                                    const pv = scanner.next() catch return false;
-                                    switch (pv) {
-                                        .string => |s| param_pane_id_camel = s,
-                                        .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => return error.FallbackToDom,
-                                        .object_begin, .array_begin => skipComposite(&scanner) catch return false,
-                                        .partial_number => skipRestOfNumber(&scanner) catch return false,
-                                        else => param_pane_id_camel = null,
-                                    }
-                                } else if (std.mem.eql(u8, pfield, "data_base64")) {
-                                    const pv = scanner.next() catch return false;
-                                    switch (pv) {
-                                        .string => |s| param_data_b64 = s,
-                                        .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => return error.FallbackToDom,
-                                        .object_begin, .array_begin => skipComposite(&scanner) catch return false,
-                                        .partial_number => skipRestOfNumber(&scanner) catch return false,
-                                        else => param_data_b64 = null,
-                                    }
-                                } else if (std.mem.eql(u8, pfield, "dataBase64")) {
-                                    const pv = scanner.next() catch return false;
-                                    switch (pv) {
-                                        .string => |s| param_data_b64_camel = s,
-                                        .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => return error.FallbackToDom,
-                                        .object_begin, .array_begin => skipComposite(&scanner) catch return false,
-                                        .partial_number => skipRestOfNumber(&scanner) catch return false,
-                                        else => param_data_b64_camel = null,
-                                    }
-                                } else if (std.mem.eql(u8, pfield, "session_id")) {
-                                    const pv = scanner.next() catch return false;
-                                    switch (pv) {
-                                        .string => |s| param_session_id = s,
-                                        .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => return error.FallbackToDom,
-                                        .object_begin, .array_begin => skipComposite(&scanner) catch return false,
-                                        .partial_number => skipRestOfNumber(&scanner) catch return false,
-                                        else => param_session_id = null,
-                                    }
-                                } else if (std.mem.eql(u8, pfield, "sessionId")) {
-                                    const pv = scanner.next() catch return false;
-                                    switch (pv) {
-                                        .string => |s| param_session_id_camel = s,
-                                        .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => return error.FallbackToDom,
-                                        .object_begin, .array_begin => skipComposite(&scanner) catch return false,
-                                        .partial_number => skipRestOfNumber(&scanner) catch return false,
-                                        else => param_session_id_camel = null,
-                                    }
-                                } else {
-                                    scanner.skipValue() catch return false;
-                                }
-                            },
-                            else => return error.FallbackToDom,
-                        }
-                    }
-                } else {
-                    scanner.skipValue() catch return false;
-                }
-            },
-            else => return error.FallbackToDom,
-        }
-    }
-
-    const end_tok = scanner.next() catch return false;
-    if (end_tok != .end_of_document or !has_params) return false;
-
-    switch (method_kind) {
-        .pane_output => {
-            const actual_pane_id = param_pane_id_camel orelse param_pane_id orelse return false;
-            if (!std.mem.eql(u8, actual_pane_id, pane_id)) return false;
-            const encoded = param_data_b64_camel orelse param_data_b64 orelse return false;
-            const decoder = std.base64.standard.Decoder;
-            const decoded_len = decoder.calcSizeForSlice(encoded) catch return false;
-            var stack_buf: [64 * 1024]u8 = undefined;
-            if (decoded_len <= stack_buf.len) {
-                decoder.decode(stack_buf[0..decoded_len], encoded) catch return false;
-                try writeAllFd(stdout_fd, stack_buf[0..decoded_len]);
-            } else {
-                const decoded = try allocator.alloc(u8, decoded_len);
-                defer allocator.free(decoded);
-                decoder.decode(decoded, encoded) catch return false;
-                try writeAllFd(stdout_fd, decoded);
-            }
-            return false;
-        },
-        .session_exited => {
-            const actual_sid = param_session_id_camel orelse param_session_id orelse return false;
-            return std.mem.eql(u8, actual_sid, pane_id);
-        },
-        else => return false,
-    }
-}
-
-fn handleServerLineFallback(
-    allocator: std.mem.Allocator,
-    line: []const u8,
-    pane_id: []const u8,
-    stdout_fd: posix.fd_t,
-) !bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return false;
     defer parsed.deinit();
-    if (parsed.value != .object) return false;
-
-    const method = parsed.value.object.get("method") orelse return false;
-    if (method != .string) return false;
-
-    if (std.mem.eql(u8, method.string, "pane_output")) {
-        const params = parsed.value.object.get("params") orelse return false;
-        if (!jsonAnyStringEquals(params, &.{ "paneId", "pane_id" }, pane_id)) return false;
-        const encoded = jsonAnyObjectString(params, &.{ "dataBase64", "data_base64" }) orelse return false;
-        const decoded = base64Decode(allocator, encoded) catch return false;
-        defer allocator.free(decoded);
-        try writeAllFd(stdout_fd, decoded);
-        return false;
+    const envelope = parsed.value;
+    if (RpcError.fromEnvelope(envelope)) |err| {
+        const id = jsonUnsigned(envelope, "id");
+        if (id) |n| if (n < first_interactive_id or n >= state.next_id) return null;
+        printDiagnostic(io, "{f}", .{escaped(err.message)});
+        if (err.is("terminated") or err.is("not_found")) return .session_ended;
+        if (id == null) return error.RpcError;
+        return null;
     }
 
-    if (std.mem.eql(u8, method.string, "session_exited")) {
-        const params = parsed.value.object.get("params") orelse return false;
-        return jsonAnyStringEquals(params, &.{ "sessionId", "session_id" }, pane_id);
+    const method = jsonObjectString(envelope, "method") orelse return null;
+    const params = jsonField(envelope, "params");
+    if (std.mem.eql(u8, method, protocol.client_detached_method) or std.mem.eql(u8, method, "client_switched")) {
+        if (!jsonAnyStringEquals(params, &.{ "clientId", "client_id" }, state.client_id)) return null;
+        if (std.mem.eql(u8, method, protocol.client_detached_method)) {
+            const reason = jsonObjectString(params, "reason") orelse "";
+            if (std.mem.eql(u8, reason, "remote_detach")) return .detached_remotely;
+            return .session_ended;
+        }
+        const pane = jsonAnyObjectString(params, &.{ "paneId", "pane_id" }) orelse return error.InvalidResponse;
+        if (pane.len == 0) return error.InvalidResponse;
+        const new_pane = try allocator.dupe(u8, pane);
+        if (state.switched_pane) |old_pane| allocator.free(old_pane);
+        state.switched_pane = new_pane;
+        state.pane_id = new_pane;
+        state.generation = jsonUnsigned(params, "generation");
+        state.next_offset = jsonUnsigned(params, "replayEndOffset");
+        output.* = try decodeReplay(allocator, params);
+        g_winch_flag.store(true, .seq_cst);
+        return null;
     }
 
+    const generation = jsonUnsigned(params, "generation");
+    if (generation != null and state.generation != null and generation.? < state.generation.?) return null;
+
+    if (std.mem.eql(u8, method, protocol.session_exited_method)) {
+        if (jsonAnyStringEquals(params, &.{ "sessionId", "session_id" }, state.pane_id)) return .session_ended;
+        return null;
+    }
+    if (!jsonAnyStringEquals(params, &.{ "paneId", "pane_id" }, state.pane_id)) return null;
+
+    if (std.mem.eql(u8, method, protocol.pane_respawned_method)) {
+        if (generation != state.generation) state.next_offset = null;
+        state.generation = generation;
+        return null;
+    }
+    if (std.mem.eql(u8, method, protocol.pane_output_dropped_method)) {
+        if (jsonUnsigned(params, "resume_offset")) |offset|
+            state.next_offset = @max(offset, state.next_offset orelse 0);
+        return null;
+    }
+    if (!std.mem.eql(u8, method, protocol.pane_output_method)) return null;
+    const encoded = jsonAnyObjectString(params, &.{ "dataBase64", "data_base64" });
+    return applyPaneOutput(allocator, state, output, generation, jsonUnsigned(params, "offset"), encoded);
+}
+
+/// Apply a `pane_output` frame already matched to the current pane.
+fn applyPaneOutput(
+    allocator: std.mem.Allocator,
+    state: *RunState,
+    output: *?[]u8,
+    generation: ?u64,
+    offset_field: ?u64,
+    encoded_field: ?[]const u8,
+) !?RunOutcome {
+    if (generation != null and generation != state.generation) {
+        state.generation = generation;
+        state.next_offset = null;
+    }
+    const encoded = encoded_field orelse return null;
+    // A corrupt frame is dropped, never surfaced as a run-loop error.
+    const bytes = base64Decode(allocator, encoded) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    errdefer allocator.free(bytes);
+    const skip: usize = if (offset_field) |offset| blk: {
+        const previous = state.next_offset orelse offset;
+        state.next_offset = @max(previous, offset +| bytes.len);
+        break :blk @intCast(@min(previous -| offset, bytes.len));
+    } else 0;
+    if (skip == 0 and bytes.len != 0) {
+        output.* = bytes;
+    } else {
+        if (skip < bytes.len) output.* = try allocator.dupe(u8, bytes[skip..]);
+        allocator.free(bytes);
+    }
+    return null;
+}
+
+/// True when `bytes` can sit inside a JSON string verbatim: printable ASCII
+/// without `"` or `\`.
+fn isPlainJsonAscii(bytes: []const u8) bool {
+    const Vec = @Vector(16, u8);
+    const low: Vec = @splat(0x20);
+    const high: Vec = @splat(0x7f);
+    const quote: Vec = @splat('"');
+    const backslash: Vec = @splat('\\');
+
+    var i: usize = 0;
+    while (i + 16 <= bytes.len) : (i += 16) {
+        const chunk: Vec = bytes[i..][0..16].*;
+        const bad = (chunk < low) | (chunk >= high) | (chunk == quote) | (chunk == backslash);
+        if (@reduce(.Or, bad)) return false;
+    }
+    for (bytes[i..]) |b| {
+        if (b < 0x20 or b >= 0x7f or b == '"' or b == '\\') return false;
+    }
+    return true;
+}
+
+/// Substring search that skips to candidates with the SIMD
+/// `indexOfScalarPos`; much faster than `std.mem.indexOf` over long base64.
+fn containsSubstrSimd(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+    const last_start = haystack.len - needle.len;
+    var pos: usize = 0;
+    while (pos <= last_start) {
+        const hit = std.mem.indexOfScalarPos(u8, haystack[0 .. last_start + 1], pos, needle[0]) orelse return false;
+        if (std.mem.eql(u8, haystack[hit..][0..needle.len], needle)) return true;
+        pos = hit + 1;
+    }
     return false;
 }
 
-fn sendInput(
-    allocator: std.mem.Allocator,
-    socket_fd: posix.fd_t,
-    session_id: []const u8,
-    bytes: []const u8,
-) !void {
-    if (isPlainJsonAscii(session_id)) {
-        const prefix = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session.send\",\"params\":{\"sessionId\":\"";
-        const mid = "\",\"dataBase64\":\"";
-        const suffix = "\"}}\n";
-        const b64_len = std.base64.standard.Encoder.calcSize(bytes.len);
-        const total = prefix.len + session_id.len + mid.len + b64_len + suffix.len;
+/// False only when `line` provably has no `quoted_key` member: with no
+/// backslash, every JSON key is spelled verbatim.
+fn mayHaveKey(line: []const u8, quoted_key: []const u8) bool {
+    return std.mem.indexOfScalar(u8, line, '\\') != null or containsSubstrSimd(line, quoted_key);
+}
 
-        var stack_buf: [8192]u8 = undefined;
-        if (total <= stack_buf.len) {
-            var pos: usize = 0;
-            @memcpy(stack_buf[pos..][0..prefix.len], prefix);
-            pos += prefix.len;
-            @memcpy(stack_buf[pos..][0..session_id.len], session_id);
-            pos += session_id.len;
-            @memcpy(stack_buf[pos..][0..mid.len], mid);
-            pos += mid.len;
-            _ = std.base64.standard.Encoder.encode(stack_buf[pos..][0..b64_len], bytes);
-            pos += b64_len;
-            @memcpy(stack_buf[pos..][0..suffix.len], suffix);
-            return writeAll(socket_fd, stack_buf[0..total]);
-        }
-
-        const msg = try allocator.alloc(u8, total);
-        defer allocator.free(msg);
-        var pos: usize = 0;
-        @memcpy(msg[pos..][0..prefix.len], prefix);
-        pos += prefix.len;
-        @memcpy(msg[pos..][0..session_id.len], session_id);
-        pos += session_id.len;
-        @memcpy(msg[pos..][0..mid.len], mid);
-        pos += mid.len;
-        _ = std.base64.standard.Encoder.encode(msg[pos..][0..b64_len], bytes);
-        pos += b64_len;
-        @memcpy(msg[pos..][0..suffix.len], suffix);
-        return writeAll(socket_fd, msg);
-    }
-
-    const encoded = try base64Encode(allocator, bytes);
-    defer allocator.free(encoded);
-    const msg = try std.fmt.allocPrint(
-        allocator,
-        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session.send\",\"params\":{{\"sessionId\":{f},\"dataBase64\":\"{s}\"}}}}\n",
-        .{ std.json.fmt(session_id, .{}), encoded },
-    );
-    defer allocator.free(msg);
-    try writeAll(socket_fd, msg);
+fn jsonField(value: std.json.Value, key: []const u8) std.json.Value {
+    if (value != .object) return .null;
+    return value.object.get(key) orelse .null;
 }
 
 fn jsonAnyStringEquals(value: std.json.Value, keys: []const []const u8, expected: []const u8) bool {
@@ -1778,20 +1691,22 @@ fn jsonAnyObjectString(value: std.json.Value, keys: []const []const u8) ?[]const
 }
 
 fn jsonObjectString(value: std.json.Value, key: []const u8) ?[]const u8 {
-    if (value != .object) return null;
-    const field = value.object.get(key) orelse return null;
-    return switch (field) {
-        .string => |text| text,
-        else => null,
-    };
+    const field = jsonField(value, key);
+    return if (field == .string) field.string else null;
 }
 
-fn jsonObjectInt(value: std.json.Value, key: []const u8) i64 {
-    if (value != .object) return 0;
-    const field = value.object.get(key) orelse return 0;
+fn requiredString(value: std.json.Value, key: []const u8) ![]const u8 {
+    const str = jsonObjectString(value, key) orelse return error.InvalidResponse;
+    if (str.len == 0) return error.InvalidResponse;
+    return str;
+}
+
+fn jsonUnsigned(value: std.json.Value, key: []const u8) ?u64 {
+    const field = jsonField(value, key);
     return switch (field) {
-        .integer => |n| n,
-        else => 0,
+        .integer => std.math.cast(u64, field.integer),
+        .number_string => std.fmt.parseInt(u64, field.number_string, 10) catch null,
+        else => null,
     };
 }
 
@@ -1811,29 +1726,16 @@ fn base64Decode(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
     return out;
 }
 
-fn findJsonField(haystack: []const u8, needle: []const u8) ?usize {
-    return std.mem.indexOf(u8, haystack, needle);
+fn decodeReplay(allocator: std.mem.Allocator, result: std.json.Value) !?[]u8 {
+    const encoded = jsonObjectString(result, "replayBase64") orelse return null;
+    if (encoded.len == 0) return null;
+    return try base64Decode(allocator, encoded);
 }
 
-/// Pull the `replayBase64` field out of the attach response JSON, decode
-/// it, and write the raw bytes to `out_fd` so the terminal redraws the
-/// prior session state.
-fn replayScrollbackFromAttach(
-    allocator: std.mem.Allocator,
-    payload: []const u8,
-    out_fd: posix.fd_t,
-) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch return;
-    defer parsed.deinit();
-    if (parsed.value != .object) return;
-    const result = parsed.value.object.get("result") orelse return;
-    const encoded = jsonObjectString(result, "replayBase64") orelse return;
-    if (encoded.len == 0) return;
-
-    const decoded = base64Decode(allocator, encoded) catch return;
-    defer allocator.free(decoded);
-    if (decoded.len == 0) return;
-    try writeAllFd(out_fd, decoded);
+fn replayScrollback(allocator: std.mem.Allocator, result: std.json.Value, out_fd: posix.fd_t) !void {
+    const bytes = (try decodeReplay(allocator, result)) orelse return;
+    defer allocator.free(bytes);
+    try writeAllFd(out_fd, bytes);
 }
 
 fn stderrWrite(io: std.Io, bytes: []const u8) !void {
@@ -1853,7 +1755,7 @@ fn printUsage(io: std.Io) !void {
     var buf: [2048]u8 = undefined;
     var w = std.Io.File.stdout().writerStreaming(io, &buf);
     try w.interface.writeAll(
-        \\Usage: zmux-connect <session_id> [--socket PATH] [--spawn-daemon]
+        \\Usage: zmux-connect [--socket PATH] [attach] <session_id> [--socket PATH] [--spawn-daemon]
         \\                    [--no-create] [--command CMD] [--detach-key KEY]
         \\       zmux-connect <verb> [args] [--socket PATH] [--json]
         \\       smithers-session-connect ... (same interface)
@@ -1861,6 +1763,7 @@ fn printUsage(io: std.Io) !void {
         \\Attach (default): if <session_id> is not an existing pane id or session
         \\name, a new session with that name is created and then attached.
         \\  --socket PATH      path to the daemon's unix socket
+        \\  --                 end options (e.g. zmux-connect -- ls to attach to ls)
         \\  --spawn-daemon     start a daemon if none is running
         \\  --no-create        require an existing session (do not create)
         \\  --command CMD       shell command to run in a newly created session
@@ -1899,7 +1802,7 @@ fn findDaemonSibling(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, 
 
 const test_io = std.testing.io;
 
-/// Internal hooks exposed for the repository's own fuzz suites.
+/// Internal hooks for repository fuzz and benchmark code.
 pub const fuzz_hooks = struct {
     pub const VerbKind = Verb;
     pub const RunOutcomeKind = RunOutcome;
@@ -1909,8 +1812,6 @@ pub const fuzz_hooks = struct {
     pub const default_detach = default_detach_key;
     pub const ping_id = ping_rpc_id;
     pub const verb_id = verb_rpc_id;
-    pub const detach_id = detach_rpc_id;
-
     pub const parseAttachArgsFn = parseAttachArgs;
     pub const parseVerbArgsFn = parseVerbArgs;
     pub const parseDetachKeyFn = parseDetachKey;
@@ -1920,721 +1821,395 @@ pub const fuzz_hooks = struct {
     pub const buildVerbRequestFn = buildVerbRequest;
     pub const formatVerbResultFn = formatVerbResult;
     pub const formatSessionListFn = formatSessionList;
-    pub const rpcErrorMessageFn = rpcErrorMessage;
-    pub const matchesRpcIdFn = matchesRpcId;
-    pub const isPaneNotFoundFn = isPaneNotFound;
-    pub const paneIdFromAttachFn = paneIdFromAttach;
-    pub const clientIdFromAttachFn = clientIdFromAttach;
+    pub const RunStateKind = RunState;
     pub const handleServerLineFn = handleServerLine;
-    pub const replayScrollbackFromAttachFn = replayScrollbackFromAttach;
-    pub const resolveSocketPathFromEnvFn = resolveSocketPathFromEnv;
-    pub const connectFailureMessageFn = connectFailureMessage;
+    pub const handleServerLineDomFn = handleServerLineDom;
+    pub const replayScrollbackFromAttachFn = replayScrollback;
     pub const attachOrCreateFn = attachOrCreate;
     pub const executeVerbFn = executeVerb;
-    pub const daemonVersionFn = daemonVersion;
     pub const readRpcResponseFn = readRpcResponse;
     pub const runLoopFn = runLoop;
     pub const b64EncodeFn = base64Encode;
     pub const b64DecodeFn = base64Decode;
     pub const findDaemonSiblingFn = findDaemonSibling;
-    pub const writeAllFn = writeAll;
+    pub const sendFrameFn = sendFrame;
+    pub const rpcErrorFromEnvelopeFn = RpcError.fromEnvelope;
+    pub const requiredStringFn = requiredString;
+    pub const mayHaveKeyFn = mayHaveKey;
+    pub const warnOnVersionMismatchFn = warnOnVersionMismatch;
+
+    /// Free a response returned by `readRpcResponseFn` or `attachOrCreateFn`.
+    pub fn deinitResponse(response: Response, allocator: std.mem.Allocator) void {
+        response.deinit(allocator);
+    }
+
+    /// The `result` member of a response.
+    pub fn responseResult(response: Response) std.json.Value {
+        return response.result();
+    }
 };
 
-test "tiocgwinsz encodes the platform ioctl" {
-    const req = tiocgwinsz();
-    try std.testing.expect(req != 0);
+test "explicit attach and the options terminator accept reserved session names" {
+    const explicit = try parseAttachArgs(&.{ "zmux-connect", "--socket", "sock", "attach", "ls" }, null);
+    try std.testing.expectEqualStrings("ls", explicit.session_id.?);
+    try std.testing.expectEqualStrings("sock", explicit.explicit_socket_path.?);
+    const literal = try parseAttachArgs(&.{ "zmux-connect", "--", "--help" }, null);
+    try std.testing.expectEqualStrings("--help", literal.session_id.?);
+    try std.testing.expect(!literal.show_help);
 }
 
-test "resolveSocketPathFromEnv falls back to uid-scoped /tmp path" {
-    const path = try resolveSocketPathFromEnv(std.testing.allocator, null, null, null, null);
-    defer std.testing.allocator.free(path);
-    const expected_prefix = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "/tmp/zmux-{d}/sessions.sock",
-        .{sys.geteuid()},
-    );
-    defer std.testing.allocator.free(expected_prefix);
-    try std.testing.expectEqualStrings(expected_prefix, path);
-
-    const from_home = try resolveSocketPathFromEnv(std.testing.allocator, null, null, null, "/home/me");
-    defer std.testing.allocator.free(from_home);
-    try std.testing.expect(std.mem.endsWith(u8, from_home, "/home/me/.smithers/sessions.sock"));
+test "RPC reads match numeric ids and accept null-id capacity errors" {
+    const alloc = std.testing.allocator;
+    const pair = try sys.socketPair();
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
+    try sys.sendAll(pair[1], "{\"method\":\"pane_output\",\"params\":{}}\n" ++
+        "{\"id\":1,\"result\":{\"stale\":true}}\n" ++
+        "{\"id\":\"2\",\"result\":{\"stale\":true}}\n" ++
+        "{\"id\":2,\"result\":{\"name\":\"error\"}}\n" ++
+        "{\"id\":null,\"error\":{\"code\":-32000,\"message\":\"LimitExceeded\",\"data\":{\"kind\":\"limit\"}}}\n");
+    var reader: LineReader = .{};
+    defer reader.deinit();
+    const deadline = Deadline.fromNow(test_io, 500);
+    const success = try readRpcResponse(alloc, &reader, pair[0], 2, deadline);
+    defer success.deinit(alloc);
+    try std.testing.expect(success.rpcError() == null);
+    try std.testing.expectEqualStrings("error", try requiredString(success.result(), "name"));
+    const failure = try readRpcResponse(alloc, &reader, pair[0], 3, deadline);
+    defer failure.deinit(alloc);
+    try std.testing.expect(failure.rpcError().?.is("limit"));
+    try std.testing.expectEqualStrings("LimitExceeded", failure.rpcError().?.message);
 }
 
-test "matchesRpcId accepts only the expected numeric response id" {
-    try std.testing.expect(matchesRpcId(std.testing.allocator, "{\"id\":7,\"result\":{}}\n", 7));
-    try std.testing.expect(!matchesRpcId(std.testing.allocator, "{\"id\":8,\"result\":{}}\n", 7));
-    try std.testing.expect(!matchesRpcId(std.testing.allocator, "{\"id\":\"7\",\"result\":{}}\n", 7));
-    try std.testing.expect(!matchesRpcId(std.testing.allocator, "{\"method\":\"pane_output\",\"params\":{}}\n", 7));
-    try std.testing.expect(!matchesRpcId(std.testing.allocator, "not json\n", 7));
-}
-
-test "readRpcResponse skips notifications and out-of-order responses" {
+test "RPC read has an absolute timeout" {
     const fds = try sys.pipe();
     defer sys.close(fds[0]);
     defer sys.close(fds[1]);
-
-    try writeAll(
-        fds[1],
-        "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{}}\n" ++
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"stale\":true}}\n" ++
-            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"ok\":true}}\n",
-    );
-
     var reader: LineReader = .{};
-    const line = try readRpcResponse(std.testing.allocator, &reader, fds[0], 2, Deadline.fromNow(test_io, 10_000));
-    defer std.testing.allocator.free(line);
-
-    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"ok\":true}}\n", line);
+    defer reader.deinit();
+    try std.testing.expectError(error.ReadTimeout, readRpcResponse(std.testing.allocator, &reader, fds[0], 1, .fromNow(test_io, 20)));
 }
 
-test "readRpcResponse returns ReadTimeout" {
-    const fds = try sys.pipe();
-    defer sys.close(fds[0]);
-    defer sys.close(fds[1]);
-
-    var reader: LineReader = .{};
-    const deadline = Deadline.fromNow(test_io, 20);
-    try std.testing.expectError(
-        error.ReadTimeout,
-        readRpcResponse(std.testing.allocator, &reader, fds[0], 1, deadline),
-    );
-}
-
-fn socketPairForTest() ![2]posix.fd_t {
-    return sys.socketPair() catch error.SkipZigTest;
-}
-
-fn readRequestLineForTest(allocator: std.mem.Allocator, reader: *LineReader, fd: posix.fd_t) ![]u8 {
-    return reader.readLineAllocTimeout(allocator, test_io, fd, rpc_line_max, .{
-        .duration = .{ .raw = .fromSeconds(2), .clock = .awake },
-    });
-}
-
-test "attachOrCreate returns an attach success without creating" {
-    const allocator = std.testing.allocator;
-    const pair = try socketPairForTest();
+test "attach sends createIfMissing in one frame and parses whitespace in replay" {
+    const alloc = std.testing.allocator;
+    const pair = try sys.socketPair();
     defer sys.close(pair[0]);
     defer sys.close(pair[1]);
-
-    try writeAll(pair[1], "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"clientId\":\"client-1\",\"paneId\":\"work\"}}\n");
-
+    try sys.sendAll(pair[1], "{\"id\":1,\"result\":{\"paneId\":\"pane-1\",\"clientId\":\"client-1\",\"title\":\"error\",\"replayBase64\" : \"aGVsbG8=\"}}\n");
     var reader: LineReader = .{};
-    const response = try attachOrCreate(
-        allocator,
-        &reader,
-        pair[0],
-        "work",
-        .{ .rows = 24, .cols = 80 },
-        true,
-        null,
-        Deadline.fromNow(test_io, 2_000),
-    );
-    defer allocator.free(response);
-    try std.testing.expect(std.mem.indexOf(u8, response, "\"clientId\":\"client-1\"") != null);
-
+    defer reader.deinit();
+    const deadline = Deadline.fromNow(test_io, 500);
+    const response = try attachOrCreate(alloc, &reader, pair[0], "error", .{ .rows = 24, .cols = 80 }, true, "echo hi", deadline);
+    defer response.deinit(alloc);
+    const replay = (try decodeReplay(alloc, response.result())).?;
+    defer alloc.free(replay);
+    try std.testing.expectEqualStrings("hello", replay);
     var request_reader: LineReader = .{};
-    const attach_req = try readRequestLineForTest(allocator, &request_reader, pair[1]);
-    defer allocator.free(attach_req);
-    try std.testing.expect(std.mem.indexOf(u8, attach_req, "\"method\":\"client.attach\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, attach_req, "\"id\":1") != null);
+    defer request_reader.deinit();
+    const request = try request_reader.readLineAllocTimeout(alloc, test_io, pair[1], rpc_line_max, deadline.timeout());
+    defer alloc.free(request);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, request, .{});
+    defer parsed.deinit();
+    const create = jsonField(jsonField(parsed.value, "params"), "createIfMissing");
+    try std.testing.expectEqualStrings("error", try requiredString(create, "id"));
+    try std.testing.expectEqualStrings("echo hi", try requiredString(create, "command"));
 }
 
-test "attachOrCreate creates after PaneNotFound and skips interleaved notifications" {
-    const allocator = std.testing.allocator;
-    const pair = try socketPairForTest();
+test "attach requires both canonical IDs" {
+    const alloc = std.testing.allocator;
+    const pair = try sys.socketPair();
     defer sys.close(pair[0]);
     defer sys.close(pair[1]);
-
-    try writeAll(
-        pair[1],
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"PaneNotFound: work\"}}\n" ++
-            "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{}}\n" ++
-            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"id\":\"work\"}}\n" ++
-            "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"clientId\":\"client-2\",\"paneId\":\"pane-2\"}}\n",
-    );
-
+    try sys.sendAll(pair[1], "{\"id\":1,\"result\":{\"paneId\":\"pane-1\"}}\n");
     var reader: LineReader = .{};
-    const response = try attachOrCreate(
-        allocator,
-        &reader,
-        pair[0],
-        "work",
-        .{ .rows = 40, .cols = 120 },
-        true,
-        "printf ok",
-        Deadline.fromNow(test_io, 2_000),
-    );
-    defer allocator.free(response);
-    try std.testing.expect(std.mem.indexOf(u8, response, "\"clientId\":\"client-2\"") != null);
-
-    var request_reader: LineReader = .{};
-    const first_attach = try readRequestLineForTest(allocator, &request_reader, pair[1]);
-    defer allocator.free(first_attach);
-    const create_req = try readRequestLineForTest(allocator, &request_reader, pair[1]);
-    defer allocator.free(create_req);
-    const second_attach = try readRequestLineForTest(allocator, &request_reader, pair[1]);
-    defer allocator.free(second_attach);
-
-    try std.testing.expect(std.mem.indexOf(u8, first_attach, "\"method\":\"client.attach\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, create_req, "\"method\":\"session.create\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, create_req, "\"command\":\"printf ok\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, second_attach, "\"id\":3") != null);
+    defer reader.deinit();
+    try std.testing.expectError(error.InvalidResponse, attachOrCreate(alloc, &reader, pair[0], "work", .{ .rows = 24, .cols = 80 }, true, null, .fromNow(test_io, 500)));
 }
 
-test "attachOrCreate returns PaneNotFound when auto create is disabled" {
-    const allocator = std.testing.allocator;
-    const pair = try socketPairForTest();
-    defer sys.close(pair[0]);
-    defer sys.close(pair[1]);
-
-    const pane_error = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"PaneNotFound\"}}\n";
-    try writeAll(pair[1], pane_error);
-
-    var reader: LineReader = .{};
-    const response = try attachOrCreate(
-        allocator,
-        &reader,
-        pair[0],
-        "missing",
-        .{ .rows = 24, .cols = 80 },
-        false,
-        null,
-        Deadline.fromNow(test_io, 2_000),
-    );
-    defer allocator.free(response);
-    try std.testing.expectEqualStrings(pane_error, response);
-
-    var request_reader: LineReader = .{};
-    const attach_req = try readRequestLineForTest(allocator, &request_reader, pair[1]);
-    defer allocator.free(attach_req);
-    try std.testing.expect(std.mem.indexOf(u8, attach_req, "\"method\":\"client.attach\"") != null);
-}
-
-test "attachOrCreate returns create errors without retrying attach" {
-    const allocator = std.testing.allocator;
-    const pair = try socketPairForTest();
-    defer sys.close(pair[0]);
-    defer sys.close(pair[1]);
-
-    const create_error = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"bad create\"}}\n";
-    try writeAll(
-        pair[1],
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"PaneNotFound\"}}\n" ++
-            create_error,
-    );
-
-    var reader: LineReader = .{};
-    const response = try attachOrCreate(
-        allocator,
-        &reader,
-        pair[0],
-        "bad",
-        .{ .rows = 24, .cols = 80 },
-        true,
-        null,
-        Deadline.fromNow(test_io, 2_000),
-    );
-    defer allocator.free(response);
-    try std.testing.expectEqualStrings(create_error, response);
-
-    var request_reader: LineReader = .{};
-    const attach_req = try readRequestLineForTest(allocator, &request_reader, pair[1]);
-    defer allocator.free(attach_req);
-    const create_req = try readRequestLineForTest(allocator, &request_reader, pair[1]);
-    defer allocator.free(create_req);
-    try std.testing.expect(std.mem.indexOf(u8, attach_req, "\"method\":\"client.attach\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, create_req, "\"method\":\"session.create\"") != null);
-}
-
-test "isPaneNotFound only matches error payloads containing PaneNotFound" {
-    try std.testing.expect(isPaneNotFound("{\"error\":{\"message\":\"PaneNotFound\"}}\n"));
-    try std.testing.expect(!isPaneNotFound("{\"result\":{\"message\":\"PaneNotFound\"}}\n"));
-    try std.testing.expect(!isPaneNotFound("{\"error\":{\"message\":\"other\"}}\n"));
-}
-
-test "paneIdFromAttach extracts canonical pane id" {
-    const pane_id = try paneIdFromAttach(
-        std.testing.allocator,
-        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"clientId\":\"client-1\",\"paneId\":\"pane-7\"}}\n",
-    );
-    defer std.testing.allocator.free(pane_id);
-
-    try std.testing.expectEqualStrings("pane-7", pane_id);
-    try std.testing.expectError(
-        error.MissingPaneId,
-        paneIdFromAttach(std.testing.allocator, "{\"result\":{\"clientId\":\"client-1\"}}\n"),
-    );
-}
-
-test "handleServerLine writes matching pane output and ignores other panes" {
-    const ignored =
-        "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":" ++
-        "{\"pane_id\":\"pane-other\",\"data_base64\":\"aGVsbG8=\"}}\n";
-    try std.testing.expect(!try handleServerLine(
-        std.testing.allocator,
-        ignored,
-        "pane-1",
-        @as(posix.fd_t, -1),
-    ));
-
-    const fds = try sys.pipe();
-    defer sys.close(fds[0]);
-    defer sys.close(fds[1]);
-
-    const matching =
-        "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":" ++
-        "{\"pane_id\":\"pane-1\",\"data_base64\":\"aGVsbG8=\"}}\n";
-    try std.testing.expect(!try handleServerLine(std.testing.allocator, matching, "pane-1", fds[1]));
-
-    var buf: [16]u8 = undefined;
-    const n = try sys.read(fds[0], &buf);
-    try std.testing.expectEqualStrings("hello", buf[0..n]);
-}
-
-test "handleServerLine exits only for matching session exit notification" {
-    const matching =
-        "{\"jsonrpc\":\"2.0\",\"method\":\"session_exited\",\"params\":" ++
-        "{\"session_id\":\"pane-1\",\"pid\":123}}\n";
-    const other =
-        "{\"jsonrpc\":\"2.0\",\"method\":\"session_exited\",\"params\":" ++
-        "{\"session_id\":\"pane-2\",\"pid\":123}}\n";
-
-    try std.testing.expect(try handleServerLine(std.testing.allocator, matching, "pane-1", @as(posix.fd_t, -1)));
-    try std.testing.expect(!try handleServerLine(std.testing.allocator, other, "pane-1", @as(posix.fd_t, -1)));
+test "replay overlap, dropped bytes, switching and respawn follow the current pane" {
+    const alloc = std.testing.allocator;
+    var state: RunState = .{ .pane_id = "p", .client_id = "c", .generation = 1, .next_offset = 4 };
+    defer if (state.switched_pane) |pane| alloc.free(pane);
+    var output: ?[]u8 = null;
+    const line = "{\"method\":\"pane_output\",\"params\":{\"pane_id\":\"p\",\"generation\":1,\"offset\":2,\"data_base64\":\"YWJjZA==\"}}";
+    try std.testing.expectEqual(null, try handleServerLine(alloc, line, &state, &output, test_io));
+    try std.testing.expectEqualStrings("cd", output.?);
+    alloc.free(output.?);
+    output = null;
+    _ = try handleServerLine(alloc, line, &state, &output, test_io);
+    try std.testing.expect(output == null);
+    _ = try handleServerLine(alloc, "{\"method\":\"pane_output_dropped\",\"params\":{\"pane_id\":\"p\",\"resume_offset\":20}}", &state, &output, test_io);
+    try std.testing.expectEqual(@as(?u64, 20), state.next_offset);
+    _ = try handleServerLine(alloc, "{\"method\":\"pane_respawned\",\"params\":{\"pane_id\":\"p\",\"generation\":2}}", &state, &output, test_io);
+    try std.testing.expect(state.next_offset == null);
+    const old = "{\"method\":\"session_exited\",\"params\":{\"session_id\":\"p\",\"generation\":1}}";
+    try std.testing.expectEqual(null, try handleServerLine(alloc, old, &state, &output, test_io));
+    _ = try handleServerLine(alloc, "{\"method\":\"client_switched\",\"params\":{\"clientId\":\"c\",\"paneId\":\"q\",\"generation\":0}}", &state, &output, test_io);
+    try std.testing.expectEqualStrings("q", state.pane_id);
+    try std.testing.expectEqual(RunOutcome.detached_remotely, (try handleServerLine(alloc, "{\"method\":\"client_detached\",\"params\":{\"client_id\":\"c\",\"reason\":\"remote_detach\"}}", &state, &output, test_io)).?);
 }
 
 test "handleServerLine ignores corrupt base64 on every parse path without erroring" {
-    // Each frame targets a different path: canonical wire prefix, scanner
-    // (reordered keys / camelCase), and DOM fallback (escaped key). All must
-    // return false rather than surface a base64 decode error to the run loop.
+    // Canonical wire layout, reordered/camelCase keys, and an escaped key
+    // (DOM path) must all drop the frame rather than fail the run loop.
+    const alloc = std.testing.allocator;
     const frames = [_][]const u8{
         "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{\"pane_id\":\"pane-1\",\"data_base64\":\"!!!not-valid-b64!!!\"}}\n",
-        "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{\"pane_id\":\"pane-1\",\"data_base64\":\"abc\"}}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{\"pane_id\":\"pane-1\",\"data_base64\":\"abc\",\"offset\":0,\"generation\":1}}\n",
         "{\"method\":\"pane_output\",\"jsonrpc\":\"2.0\",\"params\":{\"dataBase64\":\"=\",\"paneId\":\"pane-1\"}}\n",
         "{\"method\":\"pane_output\",\"params\":{\"pane_\\u0069d\":\"pane-1\",\"data_base64\":\"a\"}}\n",
     };
     for (frames) |frame| {
-        try std.testing.expect(!try handleServerLine(std.testing.allocator, frame, "pane-1", @as(posix.fd_t, -1)));
+        var state: RunState = .{ .pane_id = "pane-1", .client_id = "c", .generation = 1, .next_offset = null };
+        var output: ?[]u8 = null;
+        try std.testing.expectEqual(null, try handleServerLine(alloc, frame, &state, &output, test_io));
+        try std.testing.expect(output == null);
     }
 }
 
-test "handleServerLine fast paths match the DOM fallback on valid and escaped frames" {
+test "handleServerLine fast paths match the DOM path" {
+    const alloc = std.testing.allocator;
     const frames = [_][]const u8{
         "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{\"pane_id\":\"pane-1\",\"data_base64\":\"aGVsbG8=\"}}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{\"pane_id\":\"pane-1\",\"data_base64\":\"aGVsbG8=\",\"offset\":3,\"generation\":2}}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{\"pane_id\":\"pane-1\",\"data_base64\":\"aGVsbG8=\",\"generation\":1,\"offset\":12}}\r\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{\"pane_id\":\"pane-1\",\"data_base64\":\"aGVsbG8=\",\"generation\":0}}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{\"pane_id\":\"pane-1\",\"data_base64\":\"aGVsbG8=\",\"offset\":1,\"offset\":2}}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{\"pane_id\":\"pane-1\",\"data_base64\":\"aGVsbG8=\",\"offset\":01}}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{\"pane_id\":\"pane-2\",\"data_base64\":\"aGVsbG8=\"}}\n",
         "{\"method\":\"pane_output\",\"params\":{\"paneId\":\"pane-1\",\"dataBase64\":\"aGVsbG8=\"},\"jsonrpc\":\"2.0\"}\n",
         "{\"method\":\"pane_\\u006futput\",\"params\":{\"pane_id\":\"pane-1\",\"data_base64\":\"aGVsbG8=\"}}\n",
+        "{\"method\":\"pane_activity\",\"params\":{\"pane_id\":\"pane-1\"}}\n",
+        "{\"method\":\"session_exited\",\"params\":{\"session_id\":\"pane-1\"}}\n",
+        "{\"method\":\"pane_respawned\",\"params\":{\"pane_id\":\"pane-1\",\"generation\":5}}\n",
     };
     for (frames) |frame| {
-        const fast_fds = try sys.pipe();
-        defer sys.close(fast_fds[0]);
-        const slow_fds = try sys.pipe();
-        defer sys.close(slow_fds[0]);
-
-        const fast_exit = try handleServerLine(std.testing.allocator, frame, "pane-1", fast_fds[1]);
-        sys.close(fast_fds[1]);
-        const slow_exit = try handleServerLineFallback(std.testing.allocator, frame, "pane-1", slow_fds[1]);
-        sys.close(slow_fds[1]);
-        try std.testing.expectEqual(slow_exit, fast_exit);
-
-        var fast_buf: [64]u8 = undefined;
-        var slow_buf: [64]u8 = undefined;
-        const fast_n = try sys.read(fast_fds[0], &fast_buf);
-        const slow_n = try sys.read(slow_fds[0], &slow_buf);
-        try std.testing.expectEqualStrings(slow_buf[0..slow_n], fast_buf[0..fast_n]);
-        try std.testing.expectEqualStrings("hello", fast_buf[0..fast_n]);
+        var fast: RunState = .{ .pane_id = "pane-1", .client_id = "c", .generation = 1, .next_offset = 10 };
+        var dom = fast;
+        var fast_out: ?[]u8 = null;
+        defer if (fast_out) |bytes| alloc.free(bytes);
+        var dom_out: ?[]u8 = null;
+        defer if (dom_out) |bytes| alloc.free(bytes);
+        const fast_outcome = try handleServerLine(alloc, frame, &fast, &fast_out, test_io);
+        const dom_outcome = try handleServerLineDom(alloc, frame, &dom, &dom_out, test_io);
+        try std.testing.expectEqual(dom_outcome, fast_outcome);
+        try std.testing.expectEqual(dom.generation, fast.generation);
+        try std.testing.expectEqual(dom.next_offset, fast.next_offset);
+        try std.testing.expectEqual(dom_out == null, fast_out == null);
+        if (dom_out) |bytes| try std.testing.expectEqualStrings(bytes, fast_out.?);
     }
 }
 
-test "replayScrollbackFromAttach decodes replay bytes" {
-    const fds = try sys.pipe();
-    defer sys.close(fds[0]);
-    defer sys.close(fds[1]);
-
-    try replayScrollbackFromAttach(
-        std.testing.allocator,
-        "{\"result\":{\"replayBase64\":\"cmVwbGF5IGJ5dGVz\"}}\n",
-        fds[1],
-    );
-
-    var buf: [32]u8 = undefined;
-    const n = try sys.read(fds[0], &buf);
-    try std.testing.expectEqualStrings("replay bytes", buf[0..n]);
+test "canonicalPaneOutput accepts only the exact daemon layout" {
+    const ok = canonicalPaneOutput("{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{\"pane_id\":\"p\",\"data_base64\":\"b2s=\",\"offset\":7,\"generation\":2}}\n").?;
+    try std.testing.expectEqualStrings("p", ok.pane_id);
+    try std.testing.expectEqualStrings("b2s=", ok.data_base64);
+    try std.testing.expectEqual(@as(?u64, 7), ok.offset);
+    try std.testing.expectEqual(@as(?u64, 2), ok.generation);
+    try std.testing.expect(canonicalPaneOutput("{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{\"pane_id\":\"p\",\"data_base64\":\"b2s=\",\"extra\":1}}") == null);
+    try std.testing.expect(canonicalPaneOutput("{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{\"pane_id\":\"p\",\"data_base64\":\"b2s=\"}}}") == null);
+    try std.testing.expect(canonicalPaneOutput("{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{\"pane_id\":\"p\",\"data_base64\":\"b2s=\",\"offset\":-1}}") == null);
 }
 
-test "exit restore handlers include external INT and TERM signals" {
-    var old_hup: posix.Sigaction = undefined;
-    var old_pipe: posix.Sigaction = undefined;
-    var old_quit: posix.Sigaction = undefined;
-    var old_int: posix.Sigaction = undefined;
-    var old_term: posix.Sigaction = undefined;
-    posix.sigaction(.HUP, null, &old_hup);
-    posix.sigaction(.PIPE, null, &old_pipe);
-    posix.sigaction(.QUIT, null, &old_quit);
-    posix.sigaction(.INT, null, &old_int);
-    posix.sigaction(.TERM, null, &old_term);
-    defer posix.sigaction(.HUP, &old_hup, null);
-    defer posix.sigaction(.PIPE, &old_pipe, null);
-    defer posix.sigaction(.QUIT, &old_quit, null);
-    defer posix.sigaction(.INT, &old_int, null);
-    defer posix.sigaction(.TERM, &old_term, null);
-
-    installExitRestoreHandlers();
-
-    var current_int: posix.Sigaction = undefined;
-    var current_term: posix.Sigaction = undefined;
-    posix.sigaction(.INT, null, &current_int);
-    posix.sigaction(.TERM, null, &current_term);
-    try std.testing.expect(current_int.handler.handler.? == exitRestoreHandler);
-    try std.testing.expect(current_term.handler.handler.? == exitRestoreHandler);
-}
-
-test "stdin WouldBlock is not treated as EOF" {
-    const fds = try sys.pipe();
-    defer sys.close(fds[0]);
-    defer sys.close(fds[1]);
-    try sys.setNonBlocking(fds[0]);
-
-    var buf: [16]u8 = undefined;
-    switch (try readStdinChunk(fds[0], &buf)) {
-        .again => {},
-        .eof => return error.WouldBlockMappedToEof,
-        .bytes => return error.UnexpectedStdinBytes,
-    }
-}
-
-test "runLoop drains final socket output after HUP" {
-    const allocator = std.testing.allocator;
-    const stdin_fds = try sys.pipe();
-    defer sys.close(stdin_fds[0]);
-    defer sys.close(stdin_fds[1]);
-
-    const socket_fds = try sys.pipe();
-    defer sys.close(socket_fds[0]);
-    var socket_write_open = true;
-    defer if (socket_write_open) sys.close(socket_fds[1]);
-
-    const stdout_fds = try sys.pipe();
-    defer sys.close(stdout_fds[0]);
-    var stdout_write_open = true;
-    defer if (stdout_write_open) sys.close(stdout_fds[1]);
-
-    const first_line = try paneOutputLineForTest(allocator, "pane-1", "FIRST\n");
-    defer allocator.free(first_line);
-
-    var tail = try allocator.alloc(u8, 5000);
-    defer allocator.free(tail);
-    @memset(tail, 'x');
-    const marker = "TAIL_END";
-    @memcpy(tail[tail.len - marker.len ..], marker);
-    const tail_line = try paneOutputLineForTest(allocator, "pane-1", tail);
-    defer allocator.free(tail_line);
-
-    try writeAll(socket_fds[1], first_line);
-    try writeAll(socket_fds[1], tail_line);
-    sys.close(socket_fds[1]);
-    socket_write_open = false;
-
-    var reader: LineReader = .{};
-    const outcome = try runLoop(stdin_fds[0], stdout_fds[1], socket_fds[0], &reader, allocator, "pane-1", .{});
-    try std.testing.expectEqual(RunOutcome.connection_lost, outcome);
-
-    sys.close(stdout_fds[1]);
-    stdout_write_open = false;
-    const output = try readAllFdForTest(allocator, stdout_fds[0]);
-    defer allocator.free(output);
-
-    try std.testing.expect(std.mem.indexOf(u8, output, "FIRST\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, marker) != null);
-}
-
-test "runLoop reports session end when the daemon sends a matching exit notification" {
-    const allocator = std.testing.allocator;
-    const stdin_fds = try sys.pipe();
-    defer sys.close(stdin_fds[0]);
-    defer sys.close(stdin_fds[1]);
-
-    const socket_fds = try sys.pipe();
-    defer sys.close(socket_fds[0]);
-    var socket_write_open = true;
-    defer if (socket_write_open) sys.close(socket_fds[1]);
-
-    const stdout_fds = try sys.pipe();
-    defer sys.close(stdout_fds[0]);
-    defer sys.close(stdout_fds[1]);
-
-    try writeAll(
-        socket_fds[1],
-        "{\"jsonrpc\":\"2.0\",\"method\":\"session_exited\",\"params\":{\"session_id\":\"pane-1\",\"pid\":123,\"exit_code\":0,\"signal\":null}}\n",
-    );
-    sys.close(socket_fds[1]);
-    socket_write_open = false;
-
-    var reader: LineReader = .{};
-    const outcome = try runLoop(stdin_fds[0], stdout_fds[1], socket_fds[0], &reader, allocator, "pane-1", .{});
-    try std.testing.expectEqual(RunOutcome.session_ended, outcome);
-}
-
-test "run loop poll timeout bounds idle SIGWINCH latency" {
-    try std.testing.expect(run_loop_poll_timeout_ms <= 100);
-}
-
-fn paneOutputLineForTest(allocator: std.mem.Allocator, pane_id: []const u8, data: []const u8) ![]u8 {
-    const encoded = try base64Encode(allocator, data);
-    defer allocator.free(encoded);
-    return std.fmt.allocPrint(
-        allocator,
-        "{{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{{\"pane_id\":{f},\"data_base64\":{f}}}}}\n",
-        .{ std.json.fmt(pane_id, .{}), std.json.fmt(encoded, .{}) },
-    );
-}
-
-fn readAllFdForTest(allocator: std.mem.Allocator, fd: posix.fd_t) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
-    var buf: [1024]u8 = undefined;
-    while (true) {
-        const n = try posix.read(fd, &buf);
-        if (n == 0) return out.toOwnedSlice(allocator);
-        try out.appendSlice(allocator, buf[0..n]);
-    }
-}
-
-// --- A2 detach key ---------------------------------------------------------
-
-test "parseDetachKey handles ctrl chords, backslash default, and none" {
-    try std.testing.expectEqual(@as(?u8, 0x01), try parseDetachKey("ctrl-a"));
-    try std.testing.expectEqual(@as(?u8, 0x02), try parseDetachKey("Ctrl-B"));
-    try std.testing.expectEqual(@as(?u8, 0x1a), try parseDetachKey("ctrl-z"));
-    try std.testing.expectEqual(@as(?u8, default_detach_key), try parseDetachKey("ctrl-\\"));
-    try std.testing.expectEqual(@as(?u8, null), try parseDetachKey("none"));
-    try std.testing.expectEqual(@as(?u8, null), try parseDetachKey("NONE"));
-    try std.testing.expectError(error.InvalidDetachKey, parseDetachKey("ctrl-1"));
-    try std.testing.expectError(error.InvalidDetachKey, parseDetachKey("bogus"));
-    try std.testing.expectError(error.InvalidDetachKey, parseDetachKey("ctrl-"));
-}
-
-test "clientIdFromAttach extracts the logical client id" {
+test "session.send fast framing is byte-identical to the generic frame" {
     const alloc = std.testing.allocator;
-    const cid = try clientIdFromAttach(alloc, "{\"result\":{\"clientId\":\"client-3\",\"paneId\":\"pane-1\"}}\n");
-    defer alloc.free(cid);
-    try std.testing.expectEqualStrings("client-3", cid);
-    try std.testing.expectError(
-        error.MissingClientId,
-        clientIdFromAttach(alloc, "{\"result\":{\"paneId\":\"pane-1\"}}\n"),
-    );
+    const inputs = [_][]const u8{ "", "a", "hello world", "\x00\xff\x1b[A" };
+    const ids = [_][]const u8{ "p", "pane-1/x", "pa\"ne", "p\xc3\xa9" };
+    for (ids) |sid| for (inputs) |input| {
+        const fast = try buildSendFrame(alloc, 4_000_000_000, sid, input);
+        defer alloc.free(fast);
+        const encoded = try base64Encode(alloc, input);
+        defer alloc.free(encoded);
+        const generic = try buildFrame(alloc, 4_000_000_000, "session.send", .{ .sessionId = sid, .dataBase64 = encoded });
+        defer alloc.free(generic);
+        try std.testing.expectEqualStrings(generic, fast);
+    };
 }
 
-test "runLoop intercepts the detach chord and sends client.detach" {
-    g_winch_flag.store(false, .seq_cst);
+test "RPC reads skip id-less frames without parsing them" {
+    try std.testing.expect(!mayHaveKey("{\"method\":\"pane_output\",\"params\":{\"pane_id\":\"p\"}}", "\"id\""));
+    try std.testing.expect(mayHaveKey("{\"\\u0069d\":1}", "\"id\""));
+    try std.testing.expect(mayHaveKey("{\"id\":1}", "\"id\""));
+}
 
-    const allocator = std.testing.allocator;
-
-    const stdin_fds = try sys.pipe();
-    defer sys.close(stdin_fds[0]);
-    defer sys.close(stdin_fds[1]);
-
-    const socket_fds = try sys.pipe();
-    defer sys.close(socket_fds[0]);
-    defer sys.close(socket_fds[1]);
-
-    // Feed the default detach chord (Ctrl-\) as raw stdin.
-    try writeAll(stdin_fds[1], &.{default_detach_key});
-
+test "run loop drains frames already buffered behind the RPC response" {
+    const alloc = std.testing.allocator;
+    const pair = try sys.socketPair();
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
+    const input = try sys.pipe();
+    defer sys.close(input[0]);
+    defer sys.close(input[1]);
+    const out = try sys.pipe();
+    defer sys.close(out[0]);
+    defer sys.close(out[1]);
+    const frames = "{\"id\":1,\"result\":{}}\n" ++
+        "{\"method\":\"pane_output\",\"params\":{\"pane_id\":\"p\",\"data_base64\":\"b2s=\"}}\n" ++
+        "{\"method\":\"session_exited\",\"params\":{\"session_id\":\"p\"}}\n";
+    try sys.sendAll(pair[1], frames);
+    _ = c.shutdown(pair[1], 1);
     var reader: LineReader = .{};
-    const outcome = try runLoop(
-        stdin_fds[0],
-        @as(posix.fd_t, -1),
-        socket_fds[1],
+    defer reader.deinit();
+    const response = try readRpcResponse(alloc, &reader, pair[0], 1, .fromNow(test_io, 500));
+    defer response.deinit(alloc);
+    try std.testing.expect(reader.hasBufferedLine());
+    try std.testing.expectEqual(RunOutcome.session_ended, try runLoop(
+        input[0],
+        out[1],
+        pair[0],
         &reader,
-        allocator,
-        "pane-1",
-        .{ .detach_key = default_detach_key, .client_id = "client-9" },
-    );
-    try std.testing.expectEqual(RunOutcome.detached, outcome);
-
-    // The client.detach request must be waiting on the socket write end.
-    var buf: [256]u8 = undefined;
-    const n = try posix.read(socket_fds[0], &buf);
-    const written = buf[0..n];
-    try std.testing.expect(std.mem.indexOf(u8, written, "client.detach") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "client-9") != null);
-}
-
-// --- A9 management verbs ---------------------------------------------------
-
-test "parseVerb recognizes management subcommands only" {
-    try std.testing.expectEqual(Verb.list, parseVerb("ls").?);
-    try std.testing.expectEqual(Verb.kill, parseVerb("kill").?);
-    try std.testing.expectEqual(Verb.rename, parseVerb("rename").?);
-    try std.testing.expectEqual(Verb.shutdown, parseVerb("shutdown").?);
-    try std.testing.expect(parseVerb("work") == null);
-    try std.testing.expect(parseVerb("--help") == null);
-}
-
-test "buildVerbRequest emits the expected JSON-RPC methods and params" {
-    const alloc = std.testing.allocator;
-
-    const list = try buildVerbRequest(alloc, .list, null, null);
-    defer alloc.free(list);
-    try std.testing.expect(std.mem.indexOf(u8, list, "\"method\":\"session.list\"") != null);
-
-    const kill = try buildVerbRequest(alloc, .kill, "work", null);
-    defer alloc.free(kill);
-    try std.testing.expect(std.mem.indexOf(u8, kill, "\"method\":\"session.terminate\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, kill, "\"sessionId\":\"work\"") != null);
-
-    const rename = try buildVerbRequest(alloc, .rename, "work", "play");
-    defer alloc.free(rename);
-    try std.testing.expect(std.mem.indexOf(u8, rename, "\"method\":\"session.rename\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rename, "\"sessionId\":\"work\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rename, "\"name\":\"play\"") != null);
-
-    const shutdown = try buildVerbRequest(alloc, .shutdown, null, null);
-    defer alloc.free(shutdown);
-    try std.testing.expect(std.mem.indexOf(u8, shutdown, "\"method\":\"daemon.shutdown\"") != null);
-}
-
-test "formatSessionList renders rows and the empty case" {
-    const alloc = std.testing.allocator;
-
-    const empty = try formatSessionList(alloc, "{\"id\":1,\"result\":[]}\n");
-    defer alloc.free(empty);
-    try std.testing.expectEqualStrings("no sessions\n", empty);
-
-    const listed = try formatSessionList(
         alloc,
-        "{\"id\":1,\"result\":[{\"pid\":7,\"state\":\"running\",\"title\":\"work\"," ++
-            "\"sessionId\":\"work\",\"paneId\":\"pane-1\"}]}\n",
-    );
-    defer alloc.free(listed);
-    try std.testing.expect(std.mem.indexOf(u8, listed, "pane-1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, listed, "work") != null);
-    try std.testing.expect(std.mem.indexOf(u8, listed, "running") != null);
-    try std.testing.expect(std.mem.indexOf(u8, listed, "pid=7") != null);
+        .{ .pane_id = "p", .io = test_io },
+    ));
+    var bytes: [2]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), try posix.read(out[0], &bytes));
+    try std.testing.expectEqualStrings("ok", &bytes);
 }
 
-test "rpcErrorMessage extracts daemon error text and ignores success frames" {
+test "run loop writes to and reads from unpollable devices such as /dev/null" {
+    // Darwin's poll(2) reports POLLNVAL for an open /dev/null. The loop must
+    // still deliver output to it and see EOF from it.
     const alloc = std.testing.allocator;
+    const devnull = try sys.openZ("/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    defer sys.close(devnull);
+    const input = try sys.pipe();
+    defer sys.close(input[0]);
+    defer sys.close(input[1]);
 
-    const msg = rpcErrorMessage(alloc, "{\"id\":1,\"error\":{\"code\":-32000,\"message\":\"nope\"}}\n") orelse
-        return error.MissingMessage;
-    defer alloc.free(msg);
-    try std.testing.expectEqualStrings("nope", msg);
-
-    try std.testing.expect(rpcErrorMessage(alloc, "{\"id\":1,\"result\":{\"ok\":true}}\n") == null);
-}
-
-test "executeVerb round-trips session.list over a socket and formats output" {
-    const allocator = std.testing.allocator;
-
-    var pair: [2]posix.fd_t = undefined;
-    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &pair) != 0) return error.SkipZigTest;
+    const pair = try sys.socketPair();
     defer sys.close(pair[0]);
     defer sys.close(pair[1]);
-
-    const out = try sys.pipe();
-    defer sys.close(out[0]);
-    defer sys.close(out[1]);
-
-    const response =
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":[" ++
-        "{\"id\":\"pane-1\",\"title\":\"work\",\"pid\":4242,\"state\":\"running\"," ++
-        "\"sessionId\":\"work\",\"windowId\":\"win-1\",\"paneId\":\"pane-1\"}]}\n";
-    try writeAll(pair[1], response);
-
+    try sys.sendAll(pair[1], "{\"method\":\"pane_output\",\"params\":{\"pane_id\":\"p\",\"data_base64\":\"b2s=\"}}\n" ++
+        "{\"method\":\"session_exited\",\"params\":{\"session_id\":\"p\"}}\n");
+    _ = c.shutdown(pair[1], 1);
     var reader: LineReader = .{};
-    try executeVerb(
-        allocator,
-        pair[0],
-        &reader,
-        .list,
-        null,
-        null,
-        false,
-        out[1],
-        Deadline.fromNow(test_io, 2_000),
-    );
+    defer reader.deinit();
+    try std.testing.expectEqual(RunOutcome.session_ended, try runLoop(input[0], devnull, pair[0], &reader, alloc, .{ .pane_id = "p", .io = test_io }));
 
-    var buf: [512]u8 = undefined;
-    const n = try posix.read(out[0], &buf);
-    const written = buf[0..n];
-    try std.testing.expect(std.mem.indexOf(u8, written, "pane-1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "running") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "pid=4242") != null);
+    const quiet = try sys.socketPair();
+    defer sys.close(quiet[0]);
+    defer sys.close(quiet[1]);
+    var quiet_reader: LineReader = .{};
+    defer quiet_reader.deinit();
+    try std.testing.expectEqual(RunOutcome.exited, try runLoop(devnull, 1, quiet[0], &quiet_reader, alloc, .{ .pane_id = "p", .io = test_io }));
 }
 
-test "executeVerb surfaces a daemon RPC error as error.RpcError" {
-    const allocator = std.testing.allocator;
-
-    var pair: [2]posix.fd_t = undefined;
-    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &pair) != 0) return error.SkipZigTest;
+test "run loop completes a frame larger than the line reader staging buffer" {
+    const alloc = std.testing.allocator;
+    const pair = try sys.socketPair();
     defer sys.close(pair[0]);
     defer sys.close(pair[1]);
-
-    const out = try sys.pipe();
-    defer sys.close(out[0]);
-    defer sys.close(out[1]);
-
-    const response =
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"session not found\"}}\n";
-    try writeAll(pair[1], response);
-
+    const input = try sys.pipe();
+    defer sys.close(input[0]);
+    defer sys.close(input[1]);
+    const frame = try alloc.alloc(u8, 10_000);
+    defer alloc.free(frame);
+    @memset(frame, ' ');
+    const exit_frame = "{\"method\":\"session_exited\",\"params\":{\"session_id\":\"p\"}}\n";
+    @memcpy(frame[frame.len - exit_frame.len ..], exit_frame);
+    // The whole frame is queued before the loop reads; Darwin's default
+    // 8 KiB AF_UNIX buffer would block this send forever.
+    sys.tuneUnixSocketBuffers(pair[1]);
+    sys.tuneUnixSocketBuffers(pair[0]);
+    try sys.sendAll(pair[1], frame);
+    _ = c.shutdown(pair[1], 1);
     var reader: LineReader = .{};
-    try std.testing.expectError(error.RpcError, executeVerb(
-        allocator,
+    defer reader.deinit();
+    try std.testing.expectEqual(RunOutcome.session_ended, try runLoop(
+        input[0],
+        1,
         pair[0],
         &reader,
-        .kill,
-        "ghost",
-        null,
-        false,
-        out[1],
-        Deadline.fromNow(test_io, 2_000),
+        alloc,
+        .{ .pane_id = "p", .io = test_io },
     ));
 }
 
-// --- A23 version handshake -------------------------------------------------
-
-test "daemonVersion reads the daemon-reported protocol version" {
-    const allocator = std.testing.allocator;
-
-    // daemonVersion writes the ping and reads its reply on the same fd, so the
-    // test needs a bidirectional socketpair rather than a one-way pipe.
-    var pair: [2]posix.fd_t = undefined;
-    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &pair) != 0) return error.SkipZigTest;
+test "run loop sends detach while a partial frame is pending" {
+    const alloc = std.testing.allocator;
+    const pair = try sys.socketPair();
     defer sys.close(pair[0]);
     defer sys.close(pair[1]);
-
-    // A notification the ping read must skip, then the ping response itself.
-    try writeAll(
-        pair[1],
-        "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{}}\n" ++
-            "{\"jsonrpc\":\"2.0\",\"id\":100,\"result\":{\"version\":\"9.9.9\",\"pid\":1}}\n",
-    );
-
+    const input = try sys.pipe();
+    defer sys.close(input[0]);
+    defer sys.close(input[1]);
+    try sys.sendAll(pair[1], "{");
+    try sys.writeAll(input[1], "a\x1c");
     var reader: LineReader = .{};
-    const version = try daemonVersion(allocator, &reader, pair[0], Deadline.fromNow(test_io, 2_000));
-    defer allocator.free(version);
-    try std.testing.expectEqualStrings("9.9.9", version);
+    defer reader.deinit();
+    try std.testing.expectEqual(RunOutcome.detached, try runLoop(
+        input[0],
+        1,
+        pair[0],
+        &reader,
+        alloc,
+        .{ .pane_id = "p", .client_id = "c", .detach_key = default_detach_key, .io = test_io },
+    ));
+    var requests: LineReader = .{};
+    defer requests.deinit();
+    const deadline = Deadline.fromNow(test_io, 500);
+    const send = try requests.readLineAllocTimeout(alloc, test_io, pair[1], rpc_line_max, deadline.timeout());
+    defer alloc.free(send);
+    const detach = try requests.readLineAllocTimeout(alloc, test_io, pair[1], rpc_line_max, deadline.timeout());
+    defer alloc.free(detach);
+    try std.testing.expect(std.mem.indexOf(u8, send, "\"id\":101,\"method\":\"session.send\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detach, "\"id\":102,\"method\":\"client.detach\"") != null);
 }
 
-test "connectFailureMessage explains expected bootstrap failures" {
+test "session list escapes terminal controls and preserves printable UTF-8" {
+    const alloc = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, "[{\"sessionId\":\"work\",\"paneId\":\"p\",\"state\":\"running\",\"pid\":7,\"title\":\"é\\u001b]0;pwn\\u0007\\u0085\\u007f\"}]", .{});
+    defer parsed.deinit();
+    const text = try formatSessionList(alloc, parsed.value);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("work\tp\trunning\tpid=7\té\\x1b]0;pwn\\x07\\x85\\x7f\n", text);
+}
+
+test "management JSON prints the complete null-id error envelope and fails" {
+    const alloc = std.testing.allocator;
+    const pair = try sys.socketPair();
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
+    const out = try sys.pipe();
+    defer sys.close(out[0]);
+    defer sys.close(out[1]);
+    const response = "{\"id\":null,\"error\":{\"message\":\"LimitExceeded\",\"data\":{\"kind\":\"limit\"}}}\n";
+    try sys.sendAll(pair[1], response);
+    var reader: LineReader = .{};
+    defer reader.deinit();
+    try std.testing.expectError(error.RpcError, executeVerb(alloc, pair[0], &reader, .list, null, null, true, out[1], .fromNow(test_io, 500)));
+    var bytes: [response.len]u8 = undefined;
+    try std.testing.expectEqual(response.len, try posix.read(out[0], &bytes));
+    try std.testing.expectEqualStrings(response, &bytes);
+}
+
+test "detach key accepts ctrl chords and none" {
+    try std.testing.expectEqual(@as(?u8, 1), try parseDetachKey("CTRL-A"));
+    try std.testing.expectEqual(@as(?u8, default_detach_key), try parseDetachKey("ctrl-\\"));
+    try std.testing.expectEqual(@as(?u8, null), try parseDetachKey("none"));
+    try std.testing.expectError(error.InvalidDetachKey, parseDetachKey("ctrl-zebra"));
+}
+
+test "legacy create fallback branches on kind, independent of the message" {
     const allocator = std.testing.allocator;
-
-    const missing = (try connectFailureMessage(allocator, "/tmp/missing.sock", error.FileNotFound)) orelse
-        return error.MissingMessage;
-    defer allocator.free(missing);
-    try std.testing.expect(std.mem.indexOf(u8, missing, "no daemon at /tmp/missing.sock") != null);
-    try std.testing.expect(std.mem.indexOf(u8, missing, "--spawn-daemon") != null);
-    try std.testing.expect(std.mem.indexOf(u8, missing, "FileNotFound") == null);
-
-    const unavailable = (try connectFailureMessage(allocator, "/tmp/slow.sock", error.DaemonUnavailable)) orelse
-        return error.MissingMessage;
-    defer allocator.free(unavailable);
-    try std.testing.expect(std.mem.indexOf(u8, unavailable, "did not become ready within 2s") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unavailable, "/tmp/slow.sock.log") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unavailable, "DaemonUnavailable") == null);
-
-    try std.testing.expect((try connectFailureMessage(allocator, "/tmp/x.sock", error.AccessDenied)) == null);
+    const pair = try sys.socketPair();
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
+    try sys.sendAll(pair[1], "{\"id\":1,\"error\":{\"code\":-32000,\"message\":\"Missing target\",\"data\":{\"kind\":\"not_found\"}}}\n" ++
+        "{\"id\":2,\"result\":{\"paneId\":\"p\"}}\n" ++
+        "{\"id\":3,\"result\":{\"paneId\":\"p\",\"clientId\":\"c\"}}\n");
+    var reader: LineReader = .{};
+    defer reader.deinit();
+    const response = try attachOrCreate(
+        allocator,
+        &reader,
+        pair[0],
+        "work",
+        .{ .rows = 24, .cols = 80 },
+        true,
+        null,
+        .fromNow(test_io, 500),
+    );
+    defer response.deinit(allocator);
+    try std.testing.expectEqualStrings("p", try requiredString(response.result(), "paneId"));
 }

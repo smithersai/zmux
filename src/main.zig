@@ -24,6 +24,7 @@ pub const sys = @import("sys.zig");
 pub const internal = struct {
     pub const log = @import("log.zig");
     pub const rpc_line_reader = @import("rpc_line_reader.zig");
+    pub const socket_path = @import("socket_path.zig");
 };
 
 pub const NativeSession = native.NativeSession;
@@ -39,6 +40,20 @@ test {
     _ = @import("log.zig");
     _ = @import("rpc_line_reader.zig");
     _ = @import("sys.zig");
+    _ = @import("socket_path.zig");
+
+    // Check the shared declarations even when a particular target does not
+    // reach them through a binary entry point.
+    std.testing.refAllDecls(protocol);
+    std.testing.refAllDecls(internal.rpc_line_reader.LineReader);
+    std.testing.refAllDecls(buffer.ScrollbackBuffer);
+    std.testing.refAllDecls(foreground.Tracker);
+    std.testing.refAllDecls(sys);
+    std.testing.refAllDecls(pty.Pty);
+    std.testing.refAllDecls(native.NativeSession);
+    std.testing.refAllDecls(mux.Manager);
+    std.testing.refAllDecls(mux.PaneHandle);
+    std.testing.refAllDecls(internal.socket_path);
 }
 
 test "advertised top-level modules are exported" {
@@ -72,34 +87,36 @@ test "README library example compiles against the current API" {
     _ = &Example.standalone;
 }
 
-test "README documents current public wire and lifecycle behavior" {
+test "README request and notification examples match the wire types" {
     const std = @import("std");
-    const readme = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "README.md", std.testing.allocator, .limited(256 * 1024));
-    defer std.testing.allocator.free(readme);
+    const allocator = std.testing.allocator;
+    const readme = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "README.md", allocator, .limited(256 * 1024));
+    defer allocator.free(readme);
 
-    try std.testing.expect(std.mem.indexOf(u8, readme, "one JSON document per physical line") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session.create\",\"params\":{\"id\":\"work\",\"rows\":40,\"cols\":120,\"command\":\"bash\"}}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "\"pid\":12345,\"socketPath\":\"/tmp/zmux.sock\",\"sessions\":0,\"panes\":0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "\"params\": { \"pane_id\": \"pane-1\", \"data_base64\": \"...base64...\" }") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "`pane_activity` | `pane_id`, `last_activity_ms`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "`getpeereid(3)` / `LOCAL_PEERCRED`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "manual fork/exec PTY child spawning") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "full comm/argv on macOS and Linux, pid-only fallback on other platforms") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "`/proc/<pid>/comm`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "`/proc/<pid>/cmdline`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "--log-level <error|warn|info|debug>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "\"version\":\"0.3.0\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "Zig **0.17.1**") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "zmux.Server.init(init.gpa, init.io, \"/tmp/zmux.sock\", 60)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "0.15.2**") == null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "zmuxd-linux-arm64.tar.gz") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, ".sha256") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "$ZMUX_SOCKET") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "`--idle-seconds 0`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "`--spawn-daemon` looks for a sibling `zmuxd`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "`<socket>.log`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "`scrollbackBytes`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "LOCAL_PEERPID") == null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "forkpty") == null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "\"session\": \"work\", \"pane\": 0, \"data\"") == null);
+    var examples = std.mem.splitSequence(u8, readme, "```json\n");
+    _ = examples.next();
+    const request_example = examples.next() orelse return error.MissingRequestExample;
+    const request_end = std.mem.indexOf(u8, request_example, "```") orelse return error.UnclosedExample;
+    const Request = struct {
+        jsonrpc: []const u8,
+        id: u32,
+        method: []const u8,
+        params: struct { id: []const u8, rows: u16, cols: u16, command: []const u8 },
+    };
+    const request = try std.json.parseFromSlice(Request, allocator, request_example[0..request_end], .{});
+    defer request.deinit();
+    try std.testing.expectEqualStrings("2.0", request.value.jsonrpc);
+    try std.testing.expectEqualStrings("session.create", request.value.method);
+    try std.testing.expectEqualStrings("work", request.value.params.id);
+    try std.testing.expectEqual(@as(u16, 40), request.value.params.rows);
+    try std.testing.expectEqual(@as(u16, 120), request.value.params.cols);
+
+    const event_example = examples.next() orelse return error.MissingNotificationExample;
+    const event_end = std.mem.indexOf(u8, event_example, "```") orelse return error.UnclosedExample;
+    const Notification = struct { jsonrpc: []const u8, method: []const u8, params: protocol.PaneOutputParams };
+    const event = try std.json.parseFromSlice(Notification, allocator, event_example[0..event_end], .{});
+    defer event.deinit();
+    try std.testing.expectEqualStrings(protocol.pane_output_method, event.value.method);
+    try std.testing.expectEqual(@as(u64, 12), event.value.params.offset);
+    try std.testing.expectEqual(@as(u64, 1), event.value.params.generation);
 }

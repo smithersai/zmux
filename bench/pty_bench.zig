@@ -85,9 +85,12 @@ pub fn main(init: std.process.Init) !void {
             .min_sample_ns = 20 * std.time.ns_per_ms,
         }, EchoCtx{ .child = &child, .src = &write_buf, .dst = &read_buf }, struct {
             fn f(ctx: EchoCtx) !void {
-                try ctx.child.write(ctx.src);
+                // No deadline and no stop descriptor: the echo `cat` always reads.
+                try ctx.child.write(ctx.src, std.math.maxInt(i64), -1);
                 var got: usize = 0;
                 while (got < ctx.src.len) {
+                    // The master is non-blocking: wait for the echo first.
+                    if (!try ctx.child.pollReadable(5_000)) return error.EchoTimeout;
                     const n = try ctx.child.read(ctx.dst[0..@min(ctx.dst.len, ctx.src.len - got)]);
                     if (n == 0) return error.UnexpectedEof;
                     got += n;
@@ -123,6 +126,8 @@ pub fn main(init: std.process.Init) !void {
             var buf: [32 * 1024]u8 = undefined;
             var total: usize = 0;
             while (total < 4 * 1024 * 1024) {
+                // The master is non-blocking: wait for output, stop on EOF/HUP.
+                if (!(child.pollReadable(5_000) catch break)) break;
                 const n = child.read(&buf) catch break;
                 if (n == 0) break;
                 total += n;

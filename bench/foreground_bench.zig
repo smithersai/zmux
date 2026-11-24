@@ -14,17 +14,18 @@ pub fn main(init: std.process.Init) !void {
     // 1. Tracker steady-state pgid deduplication + transition.
     {
         var tracker = foreground.Tracker.init(100);
+        tracker.commit(100);
         try runner.run("tracker_shouldEmitForPgid_steady", .{}, &tracker, struct {
             fn f(t: *foreground.Tracker) void {
-                bench.doNotOptimize(t.shouldEmitForPgid(100));
-                bench.doNotOptimize(t.shouldEmitForPgid(100));
+                bench.doNotOptimize(t.observe(100));
+                bench.doNotOptimize(t.observe(100));
             }
         }.f);
 
         try runner.run("tracker_shouldEmitForPgid_transition", .{}, &tracker, struct {
             fn f(t: *foreground.Tracker) void {
-                bench.doNotOptimize(t.shouldEmitForPgid(200));
-                bench.doNotOptimize(t.shouldEmitForPgid(300));
+                if (t.observe(200)) t.commit(200);
+                if (t.observe(300)) t.commit(300);
             }
         }.f);
     }

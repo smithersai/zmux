@@ -16,16 +16,18 @@ fn fuzzServerParamsAndEnv(_: void, smith: *std.testing.Smith) !void {
     defer parsed.deinit();
 
     const params: ?std.json.Value = parsed.value;
-    _ = hooks.sessionId(params);
-    _ = hooks.paneId(params);
-    _ = hooks.windowId(params);
-    _ = hooks.clientId(params);
-    _ = hooks.axis(params);
-    _ = hooks.boolParamVal(params, "enter", false);
-    _ = hooks.boolParamVal(params, "repeat", true);
-    _ = hooks.intParamVal(u16, params, "rows", 24);
-    _ = hooks.intParamVal(u16, params, "cols", 80);
-    _ = hooks.intParamVal(usize, params, "lines", 200);
+    // Typed param readers: a wrong-typed field is an InvalidParams error,
+    // never a crash.
+    _ = hooks.sessionId(params) catch null;
+    _ = hooks.paneId(params) catch null;
+    _ = hooks.windowId(params) catch null;
+    _ = hooks.clientId(params) catch null;
+    _ = hooks.axis(params) catch null;
+    _ = hooks.boolParamVal(params, "enter") catch null;
+    _ = hooks.boolParamVal(params, "repeat") catch null;
+    _ = hooks.intParamVal(u16, params, "rows") catch null;
+    _ = hooks.intParamVal(u16, params, "cols") catch null;
+    _ = hooks.intParamVal(usize, params, "lines") catch null;
 
     const id_aliases_title = smith.value(bool);
     if (hooks.muxCreateArgs(allocator, params, .{ .id_aliases_title = id_aliases_title })) |*args_val| {
@@ -39,7 +41,17 @@ fn fuzzServerParamsAndEnv(_: void, smith: *std.testing.Smith) !void {
             }
         }
     } else |err| {
-        try std.testing.expect(err == error.ScrollbackBytesTooLarge or err == error.OutOfMemory);
+        // Only typed validation errors: a malformed field is rejected, never
+        // coerced or crashed on. The exhaustive switch pins the error set at
+        // compile time, so a new failure mode must be added here on purpose.
+        switch (err) {
+            error.ScrollbackBytesTooLarge,
+            error.InvalidParams,
+            error.InvalidDimensions,
+            error.InvalidSpawnArgument,
+            error.OutOfMemory,
+            => {},
+        }
     }
 
     // OOM safety on muxCreateArgs / envEntriesFromParams.
@@ -127,6 +139,7 @@ fn fuzzClientConnectionBackpressure(_: void, smith: *std.testing.Smith) !void {
 
     var msg_buf: [256]u8 = undefined;
     var cid_buf: [32]u8 = undefined;
+    var pane_buf: [32]u8 = undefined;
     var steps: usize = 0;
     while (!smith.eos() and steps < 48) : (steps += 1) {
         switch (smith.value(Op)) {
@@ -141,17 +154,18 @@ fn fuzzClientConnectionBackpressure(_: void, smith: *std.testing.Smith) !void {
                 }
             },
             .enqueue_large => {
-                // Stress exact broadcast_queue_max_bytes boundary.
+                // Stress the exact control-queue boundary: broadcasts are
+                // control notifications, capped by control_queue_max_bytes.
                 const size: usize = switch (smith.valueRangeAtMost(u8, 0, 2)) {
-                    0 => hooks.broadcast_queue_cap / 2,
-                    1 => hooks.broadcast_queue_cap,
-                    else => hooks.broadcast_queue_cap + 1,
+                    0 => hooks.control_queue_cap / 2,
+                    1 => hooks.control_queue_cap,
+                    else => hooks.control_queue_cap + 1,
                 };
                 const big = try allocator.alloc(u8, size);
                 defer allocator.free(big);
                 @memset(big, 'A');
                 if (hooks.enqueueBroadcast(conn, big)) {
-                    try std.testing.expect(size <= hooks.broadcast_queue_cap);
+                    try std.testing.expect(size <= hooks.control_queue_cap);
                     try ref_queue.append(allocator, try allocator.dupe(u8, big));
                     ref_queued_bytes += size;
                 } else |err| {
@@ -162,7 +176,10 @@ fn fuzzClientConnectionBackpressure(_: void, smith: *std.testing.Smith) !void {
             .drain_one => {
                 if (ref_queue.items.len == 0 and !hooks.isConnectionClosed(conn)) continue;
                 const got = hooks.takeQueuedWrite(conn);
-                if (ref_queue.items.len == 0) {
+                if (hooks.isConnectionClosed(conn)) {
+                    // A closed connection hands nothing more to its writer.
+                    try std.testing.expect(got == null);
+                } else if (ref_queue.items.len == 0) {
                     try std.testing.expect(got == null);
                 } else {
                     const actual = got.?;
@@ -175,7 +192,9 @@ fn fuzzClientConnectionBackpressure(_: void, smith: *std.testing.Smith) !void {
             },
             .track_client => {
                 const cid = corpus.drawAsciiSlice(smith, &cid_buf);
-                try hooks.trackMuxClient(conn, cid);
+                const pane = corpus.drawAsciiSlice(smith, &pane_buf);
+                try hooks.trackMuxClient(conn, cid, pane);
+                try std.testing.expect(hooks.wantsPaneOutput(conn, pane));
                 if (!tracked_clients.contains(cid)) {
                     try tracked_clients.put(try allocator.dupe(u8, cid), {});
                 }
@@ -195,7 +214,7 @@ fn fuzzClientConnectionBackpressure(_: void, smith: *std.testing.Smith) !void {
                 try std.testing.expect(hooks.isConnectionClosed(conn));
             },
         }
-        try std.testing.expectEqual(ref_queued_bytes, conn.queued_bytes);
+        try std.testing.expectEqual(ref_queued_bytes, conn.queued_control_bytes);
         try std.testing.expectEqual(ref_queue.items.len, conn.pendingWriteCount());
     }
 
