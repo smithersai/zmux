@@ -16,10 +16,19 @@ pub const ExitInfo = struct { exit_code: ?u32, signal: ?u32 };
 /// Budget for one `send`/`sendKey`/`writeInput` call.
 pub const default_input_deadline_ms: i64 = 2000;
 
-/// How long the reader keeps draining after the child exits while a
-/// descendant still holds the PTY slave open. `session_exited` is emitted no
-/// later than this after the exit is observed.
+/// How long the reader waits, idle, for more output or EOF after the child
+/// exits while a descendant still holds the PTY slave open. Output that is
+/// already readable when this expires is still drained (see
+/// `exit_drain_max_bytes`), so `session_exited` follows the last buffered
+/// byte, not a timer.
 pub const exit_drain_grace_ms: i64 = 250;
+
+/// Bound on the output drained after the idle wait ended (the grace expired
+/// or the owner asked the reader to stop). It is far larger than any kernel
+/// PTY buffer, so everything that was buffered when the child exited is
+/// delivered; a descendant that keeps writing forever cannot postpone
+/// `session_exited` indefinitely.
+pub const exit_drain_max_bytes: usize = 1024 * 1024;
 
 /// `pane_activity` fires on the idle-to-active edge: output after at least
 /// this long without any.
@@ -135,9 +144,16 @@ pub const EventSink = struct {
 /// child being reaped. Only the reap (`waitpid` returning a status or
 /// `ECHILD`) moves the session to `terminated`; a child that closes its
 /// terminal and keeps running stays `running`. The reader thread is the only
-/// emitter of events. After the child is reaped it drains the PTY to EOF (or
-/// for `exit_drain_grace_ms` when a descendant holds the slave open), emits
-/// `session_exited` exactly once, closes the master, and returns. Scrollback
+/// emitter of events. After the child is reaped it drains the PTY to EOF.
+/// When a descendant holds the slave open it waits at most
+/// `exit_drain_grace_ms` for more, then drains whatever is still immediately
+/// readable. Then it emits `session_exited` exactly once, closes the master,
+/// and returns.
+///
+/// "Process reaped" and "stream finalized" are therefore different moments:
+/// `exitInfo` is set at the reap, while output may still be in flight.
+/// `isStreamFinalized` turns true only once the reader has delivered the
+/// last byte and `session_exited`; scrollback is complete from then on and
 /// stays readable until the session is destroyed.
 ///
 /// Lock order: `input_mutex` before `mutex`; `pty.Pty.wait_mutex` is a leaf.
@@ -364,17 +380,30 @@ pub const NativeSession = struct {
         self.awaitTerminated(sys.monotonicMs() + terminate_grace_ms);
     }
 
-    /// Terminate the child unless it has already been reaped.
+    /// Terminate the child unless it has already been reaped. A reaped
+    /// child can still leave a foreground job behind (it ignored the hangup
+    /// and outlived its shell); that job is terminated too.
     pub fn stopForOwnerRelease(self: *NativeSession) void {
-        if (!self.handle.isReaped()) self.terminate();
+        if (!self.handle.isReaped() or self.handle.orphanedForegroundGroup() != null) self.terminate();
+    }
+
+    /// True once the reader thread has finished: every byte of PTY output
+    /// has been appended to scrollback and delivered, and `session_exited`
+    /// (if the child was reaped) has been emitted. `exitInfo` can be set
+    /// earlier, at the reap, while output is still being drained; callers
+    /// that snapshot or replace an exited pane should wait for this.
+    pub fn isStreamFinalized(self: *NativeSession) bool {
+        return self.reader_finished.load(.seq_cst);
     }
 
     /// Non-blocking start of teardown: close input (waking blocked writers),
     /// then SIGHUP+SIGCONT to the terminal foreground group and the shell
     /// group, which is what a closing terminal delivers. `awaitTerminated`
-    /// continues the ladder: SIGTERM to the shell group `hangup_grace_ms`
-    /// later, SIGKILL at its deadline. All signals are no-ops once the child
-    /// is reaped. Idempotent.
+    /// continues the ladder: SIGTERM to the foreground and shell groups
+    /// `hangup_grace_ms` later, SIGKILL at its deadline. The reap state is
+    /// refreshed first, so a child that something else already collected is
+    /// never signalled by number. Once the child is reaped only a foreground
+    /// job that outlived it is still signalled. Idempotent.
     ///
     /// The master is deliberately not closed here: the reader thread is
     /// polling it, and the reader closes it itself after draining the final
@@ -382,6 +411,7 @@ pub const NativeSession = struct {
     pub fn beginTerminate(self: *NativeSession) void {
         self.stopInput();
         if (self.term_at_ms.cmpxchgStrong(0, sys.monotonicMs() + hangup_grace_ms, .seq_cst, .seq_cst) != null) return;
+        _ = self.reapExited();
         self.handle.hangupForeground();
     }
 
@@ -390,6 +420,11 @@ pub const NativeSession = struct {
     /// passed. At the deadline, and only if the child is still not reaped, escalate to
     /// SIGKILL for the foreground and shell groups and keep reaping until
     /// `waitpid` collects the child (bounded by `kill_reap_budget_ms`).
+    ///
+    /// The ladder does not stop when the shell is reaped while a foreground
+    /// job that ignored the hangup is still alive: that job gets the same
+    /// SIGTERM and, at the deadline, SIGKILL.
+    ///
     /// Then give the reader thread a bounded moment to drain the final
     /// output and emit `session_exited`, so both normally precede the return.
     pub fn awaitTerminated(self: *NativeSession, deadline_ms: i64) void {
@@ -399,8 +434,10 @@ pub const NativeSession = struct {
         var kill_give_up_ms: ?i64 = null;
         var term_sent = false;
         while (true) {
-            _ = self.reapExited();
-            if (self.handle.isReaped()) break;
+            const reaped = self.reapIsDone();
+            // SIGKILL is the last step for a job that outlived its shell;
+            // there is nothing of it to reap here.
+            if (reaped and (kill_give_up_ms != null or self.handle.orphanedForegroundGroup() == null)) break;
             const now = sys.monotonicMs();
             const term_at = self.term_at_ms.load(.seq_cst);
             if (!term_sent and term_at != 0 and now >= @min(term_at, deadline_ms)) {
@@ -430,13 +467,28 @@ pub const NativeSession = struct {
     /// status when one is available. Never emits `session_exited`: the reader
     /// thread does, after draining the PTY.
     pub fn reapExited(self: *NativeSession) ?u32 {
-        if (self.handle.reapExited()) |status| {
-            self.markTerminated(status);
-            return status;
+        switch (self.handle.reap()) {
+            .running => return null,
+            // The reap flag and the status come from one locked read, so a
+            // caller racing the thread that collected the child publishes
+            // the same status, never a bare "terminated".
+            .exited => |status| {
+                self.markTerminated(status);
+                return status;
+            },
         }
-        // Reaped without a status: collected elsewhere (ECHILD).
-        if (self.handle.isReaped()) self.markTerminated(null);
-        return null;
+    }
+
+    /// `reapExited`, reporting whether the child has been reaped at all
+    /// (with or without a status).
+    fn reapIsDone(self: *NativeSession) bool {
+        switch (self.handle.reap()) {
+            .running => return false,
+            .exited => |status| {
+                self.markTerminated(status);
+                return true;
+            },
+        }
     }
 
     /// Only called once `waitpid` returned a status or `ECHILD`.
@@ -452,11 +504,13 @@ pub const NativeSession = struct {
     // -- Input ------------------------------------------------------------
 
     /// Write `text`, then Enter when `enter` is set, as one atomic input.
+    /// The `default_input_deadline_ms` budget starts when the call does, so
+    /// time spent queued behind another writer counts against it.
     pub fn send(self: *NativeSession, text: []const u8, enter: bool) !void {
+        const deadline_ms = sys.monotonicMs() + default_input_deadline_ms;
         self.input_mutex.lockUncancelable(self.io);
         defer self.input_mutex.unlock(self.io);
         try self.admitInputLocked();
-        const deadline_ms = sys.monotonicMs() + default_input_deadline_ms;
         try self.writeLocked(text, deadline_ms);
         if (enter) try self.writeLocked("\r", deadline_ms);
     }
@@ -466,11 +520,13 @@ pub const NativeSession = struct {
         try self.writeInput(sequence);
     }
 
+    /// Budgeted like `send`: queueing time counts.
     pub fn writeInput(self: *NativeSession, bytes: []const u8) !void {
+        const deadline_ms = sys.monotonicMs() + default_input_deadline_ms;
         self.input_mutex.lockUncancelable(self.io);
         defer self.input_mutex.unlock(self.io);
         try self.admitInputLocked();
-        try self.writeLocked(bytes, sys.monotonicMs() + default_input_deadline_ms);
+        try self.writeLocked(bytes, deadline_ms);
     }
 
     fn admitInputLocked(self: *NativeSession) error{ SessionTerminated, InputClosed }!void {
@@ -593,27 +649,41 @@ pub const NativeSession = struct {
         var read_buf: [8192]u8 = undefined;
         var pty_eof = false;
         var exit_seen_ms: ?i64 = null;
+        // Bytes read after the idle wait ended; see `exit_drain_max_bytes`.
+        var overtime_bytes: usize = 0;
 
-        // Only `reader_stop` ends the loop early. Otherwise it runs until the
-        // child is reaped and the PTY is drained.
-        while (!self.reader_stop.load(.seq_cst)) {
-            if (exit_seen_ms == null) {
-                _ = self.reapExited();
-                if (self.handle.isReaped()) exit_seen_ms = self.monotonicMs();
-            }
+        // The loop runs until the child is reaped and the PTY is drained.
+        // `reader_stop` and the post-exit grace end only the *waiting*: data
+        // that is immediately readable is still delivered, because the
+        // kernel buffer holds the only copy of it.
+        while (true) {
+            const stopping = self.reader_stop.load(.seq_cst);
+            // The last reference was dropped from inside a callback on this
+            // thread: the owner is gone, deliver nothing more.
+            if (stopping and self.destroy_on_reader_exit.load(.seq_cst)) break;
+
+            if (exit_seen_ms == null and self.reapIsDone()) exit_seen_ms = self.monotonicMs();
 
             // With a pidfd the exit wakes the poll; without one (Darwin) a
             // short timeout bounds how late the exit is noticed.
             var timeout_ms: i32 = if (self.handle.pid_fd >= 0) 100 else 25;
-            if (exit_seen_ms) |seen| {
+            // Overtime: no more waiting, only draining what is already there.
+            var overtime = false;
+            if (stopping) {
+                if (pty_eof) break;
+                overtime = true;
+            } else if (exit_seen_ms) |seen| {
                 if (pty_eof) break;
                 // A descendant still holds the slave open: stop waiting for
                 // an EOF that may never come.
                 const remaining = exit_drain_grace_ms - (self.monotonicMs() - seen);
-                if (remaining <= 0) break;
-                timeout_ms = @intCast(remaining);
+                if (remaining <= 0) overtime = true else timeout_ms = @intCast(remaining);
             } else if (!pty_eof) {
                 self.pollForegroundChange() catch {};
+            }
+            if (overtime) {
+                if (overtime_bytes >= exit_drain_max_bytes) break;
+                timeout_ms = 0;
             }
 
             // Negative descriptors are ignored by poll(2). After PTY EOF with
@@ -623,13 +693,21 @@ pub const NativeSession = struct {
                 .{ .fd = if (exit_seen_ms == null) self.handle.pid_fd else -1, .events = std.posix.POLL.IN, .revents = 0 },
             };
             const ready = std.posix.poll(&fds, timeout_ms) catch {
+                if (overtime) break;
                 self.sleepMs(10);
                 continue;
             };
-            if (ready == 0 or fds[0].revents == 0) continue;
+            if (ready == 0 or fds[0].revents == 0) {
+                // Nothing is buffered any more: the stream is final.
+                if (overtime) break;
+                continue;
+            }
 
             const n = self.handle.read(&read_buf) catch |err| switch (err) {
-                error.WouldBlock => continue,
+                error.WouldBlock => {
+                    if (overtime) break;
+                    continue;
+                },
                 // Linux reports EIO once every slave descriptor is closed.
                 else => {
                     pty_eof = true;
@@ -640,6 +718,7 @@ pub const NativeSession = struct {
                 pty_eof = true;
                 continue;
             }
+            if (overtime) overtime_bytes += n;
             self.handleOutput(read_buf[0..n]);
         }
 
@@ -695,7 +774,10 @@ pub const NativeSession = struct {
             } });
 
             // An exited pane keeps its scrollback but not its descriptors.
-            // `input_mutex` keeps the close from racing an in-flight write.
+            // `input_mutex` keeps the close from racing an in-flight write;
+            // stopping input first wakes a writer blocked on a full queue,
+            // so the lock is not held up for the rest of its deadline.
+            self.stopInput();
             self.input_mutex.lockUncancelable(self.io);
             self.handle.close();
             self.input_mutex.unlock(self.io);
@@ -714,10 +796,14 @@ pub const NativeSession = struct {
     }
 
     fn pollForegroundChange(self: *NativeSession) !void {
-        if (!foreground_check_enabled.load(.seq_cst)) return;
         const now_ms = self.monotonicMs();
         if (now_ms < self.next_foreground_check_ms) return;
         self.next_foreground_check_ms = now_ms + foreground.poll_interval_ms;
+
+        // Remember the foreground group while the shell is alive: if the
+        // shell dies first, teardown still needs to reach that job.
+        self.handle.captureForeground();
+        if (!foreground_check_enabled.load(.seq_cst)) return;
 
         // Without a sink nothing can be delivered: skip the lookup and leave
         // the change uncommitted for whoever subscribes later.
@@ -1086,8 +1172,9 @@ fn testCreate(rec: ?*Recorder, command: ?[]const u8, extra: struct {
     });
 }
 
+/// Zombie-aware: an exited process that nothing reaped is not running.
 fn processExists(pid: std.posix.pid_t) bool {
-    return std.c.kill(pid, @fromBackingInt(@intCast(0))) == 0;
+    return pty.processRunning(pid);
 }
 
 fn waitUntilGone(pid: std.posix.pid_t, timeout_ms: i64) bool {
@@ -1839,4 +1926,254 @@ test "destroy terminates a running child and joins the reader" {
     // The exit was delivered before destroy returned, with the hangup signal.
     try std.testing.expectEqual(@as(usize, 1), rec.exits);
     try std.testing.expectEqual(@as(?u32, @backingInt(std.posix.SIG.HUP)), rec.exit_signal);
+}
+
+/// Type a foreground job that ignores SIGHUP into an interactive shell and
+/// return its process group once the terminal reports it.
+fn startHupIgnoringJob(native: *NativeSession, seconds: []const u8) !std.posix.pid_t {
+    var line_buf: [96]u8 = undefined;
+    // An ignored disposition survives exec, so the `sleep` itself ignores
+    // the hangup.
+    const line = try std.fmt.bufPrint(&line_buf, "sh -c 'trap \"\" HUP; exec sleep {s}'", .{seconds});
+    try native.send(line, true);
+
+    const shell_pid = native.handle.child_pid;
+    var fg_pgid: std.posix.pid_t = 0;
+    const deadline = sys.monotonicMs() + 10_000;
+    while (true) {
+        try std.testing.expect(sys.monotonicMs() < deadline);
+        fg_pgid = tcgetpgrp(native.handle.master_fd);
+        if (fg_pgid > 1 and fg_pgid != shell_pid) break;
+        sys.sleepMs(10);
+    }
+    // Let the inner shell install the trap and exec.
+    sys.sleepMs(300);
+    try std.testing.expect(processExists(fg_pgid));
+    return fg_pgid;
+}
+
+test "terminate finishes off a foreground job that ignores SIGHUP after its shell exits" {
+    if (!supported_os) return error.SkipZigTest;
+
+    var rec: Recorder = .{};
+    defer rec.deinit();
+    const native = try testCreate(&rec, null, .{ .env = &.{ "HOME=/nonexistent", "PS1=zmux$ " } });
+    defer native.destroy();
+    const fg_pgid = try startHupIgnoringJob(native, "9993");
+
+    // SIGHUP kills the interactive shell at once; the job ignores it. The
+    // ladder must keep going for the job: SIGTERM after the hangup grace.
+    native.terminate();
+    try std.testing.expectEqual(NativeSessionState.terminated, native.state());
+    try std.testing.expect(waitUntilGone(fg_pgid, 3_000));
+    try std.testing.expectEqual(@as(?std.posix.pid_t, null), native.handle.orphanedForegroundGroup());
+}
+
+test "releasing a pane whose shell died first still terminates its foreground job" {
+    if (!supported_os) return error.SkipZigTest;
+
+    var rec: Recorder = .{};
+    defer rec.deinit();
+    const native = try testCreate(&rec, null, .{ .env = &.{ "HOME=/nonexistent", "PS1=zmux$ " } });
+    defer native.destroy();
+    const fg_pgid = try startHupIgnoringJob(native, "9992");
+    // The reader remembers the foreground group on its polling interval.
+    sys.sleepMs(foreground.poll_interval_ms + 200);
+
+    // The shell dies on its own (not through zmux) while the job runs. The
+    // hangup the kernel sends to the foreground group is ignored.
+    try std.testing.expectEqual(@as(c_int, 0), std.c.kill(native.handle.child_pid, .KILL));
+    try rec.waitForExit(10_000);
+    try std.testing.expectEqual(NativeSessionState.terminated, native.state());
+    try std.testing.expect(processExists(fg_pgid));
+
+    // The pane is already exited; closing it must not leave the job behind.
+    native.stopForOwnerRelease();
+    try std.testing.expect(waitUntilGone(fg_pgid, 3_000));
+}
+
+test "output buffered at exit survives a slow sink beyond the drain grace" {
+    if (!supported_os) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const total = 64 * 1024;
+
+    var rec: Recorder = .{};
+    defer rec.deinit();
+    // Every callback is slow, so the reader is still working through the
+    // kernel buffer long after `exit_drain_grace_ms` has passed since the
+    // reap. That buffer holds the only copy of the final output.
+    rec.output_delay_ms = 40;
+    const native = try testCreate(&rec, "head -c 65536 /dev/zero | tr '\\000' '\\001'", .{});
+    defer native.destroy();
+    try std.testing.expect(!native.isStreamFinalized());
+
+    try rec.waitForExit(60_000);
+    const finalized_deadline = sys.monotonicMs() + 5_000;
+    while (!native.isStreamFinalized()) {
+        try std.testing.expect(sys.monotonicMs() < finalized_deadline);
+        sys.sleepMs(2);
+    }
+
+    const snapshot = try native.scrollbackSnapshot(allocator);
+    defer allocator.free(snapshot);
+    try std.testing.expectEqual(@as(usize, total), std.mem.count(u8, snapshot, "\x01"));
+    try std.testing.expectEqual(@as(usize, total), rec.countByte(0x01));
+    rec.mutex.lockUncancelable(Recorder.io);
+    defer rec.mutex.unlock(Recorder.io);
+    try std.testing.expectEqual(@as(usize, 1), rec.exits);
+    try std.testing.expectEqual(EventKind.session_exited, rec.kinds.items[rec.kinds.items.len - 1]);
+    try std.testing.expect(rec.offsets_contiguous);
+}
+
+test "destroy delivers output that is still buffered when the reader is stopped" {
+    if (!supported_os) return error.SkipZigTest;
+
+    var rec: Recorder = .{};
+    defer rec.deinit();
+    // The child prints and then idles. The first callback is slow, so the
+    // rest of the output sits unread in the kernel while the owner tears
+    // the session down.
+    rec.output_delay_ms = 600;
+    const native = try testCreate(&rec, "echo first; sleep 0.2; echo MARK-LAST; exec sleep 100", .{});
+    try rec.waitForOutput("first", 10_000);
+    sys.sleepMs(350);
+    native.destroy();
+
+    try std.testing.expect(rec.outputContains("MARK-LAST"));
+    try std.testing.expectEqual(@as(usize, 1), rec.exits);
+    try std.testing.expectEqual(EventKind.session_exited, rec.kinds.items[rec.kinds.items.len - 1]);
+}
+
+test "a descendant that never stops writing cannot postpone session_exited forever" {
+    if (!supported_os) return error.SkipZigTest;
+
+    var rec: Recorder = .{};
+    defer rec.deinit();
+    // `yes` ignores the hangup and floods the terminal after the leader
+    // exits. It stops by itself once the master is closed (EIO).
+    const native = try testCreate(&rec, "(trap '' HUP; exec yes spam) & sleep 0.3; exit 6", .{ .scrollback_bytes = 64 * 1024 });
+    defer native.destroy();
+
+    try rec.waitForExit(20_000);
+    try std.testing.expectEqual(@as(?u32, 6), rec.exit_code);
+    try std.testing.expectEqual(@as(usize, 1), rec.exitCount());
+}
+
+const SpinReaper = struct {
+    native: *NativeSession,
+    go: *std.atomic.Value(bool),
+    stop: *std.atomic.Value(bool),
+
+    fn run(self: *SpinReaper) void {
+        while (!self.go.load(.seq_cst)) std.atomic.spinLoopHint();
+        while (!self.stop.load(.seq_cst)) _ = self.native.reapExited();
+    }
+};
+
+test "concurrent reapers never replace a real exit status with an unknown one" {
+    if (!supported_os) return error.SkipZigTest;
+
+    var round: usize = 0;
+    while (round < 12) : (round += 1) {
+        var rec: Recorder = .{};
+        defer rec.deinit();
+        const native = try testCreate(&rec, "exit 9", .{});
+        defer native.destroy();
+
+        var go: std.atomic.Value(bool) = .init(false);
+        var stop: std.atomic.Value(bool) = .init(false);
+        var reapers: [4]SpinReaper = undefined;
+        var threads: [4]std.Thread = undefined;
+        for (&reapers, &threads) |*reaper, *thread| {
+            reaper.* = .{ .native = native, .go = &go, .stop = &stop };
+            thread.* = try std.Thread.spawn(.{}, SpinReaper.run, .{reaper});
+        }
+        go.store(true, .seq_cst);
+        const waited = rec.waitForExit(15_000);
+        stop.store(true, .seq_cst);
+        for (threads) |thread| thread.join();
+        try waited;
+
+        // Whoever published the transition published the collected status.
+        try std.testing.expectEqual(@as(?u32, 9), native.exitInfo().?.exit_code);
+        try std.testing.expectEqual(@as(?u32, 9), rec.exit_code);
+        const json = try native.infoJson(std.testing.allocator);
+        defer std.testing.allocator.free(json);
+        try expectJsonContains(json, "\"exitCode\":9");
+    }
+}
+
+const QueuedWriter = struct {
+    native: *NativeSession,
+    data: []const u8,
+    start_delay_ms: i64,
+    elapsed_ms: i64 = 0,
+    failed: bool = false,
+
+    fn run(self: *QueuedWriter) void {
+        sys.sleepMs(self.start_delay_ms);
+        const started = sys.monotonicMs();
+        if (self.native.writeInput(self.data)) |_| {} else |_| self.failed = true;
+        self.elapsed_ms = sys.monotonicMs() - started;
+    }
+};
+
+test "time queued behind another writer counts against the input deadline" {
+    if (!supported_os) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    const native = try testCreate(null, "exec sleep 100", .{});
+    defer native.destroy();
+    const data = try lineBlock(allocator, 1024 * 1024);
+    defer allocator.free(data);
+
+    // The first writer holds the input lock for its whole deadline. The
+    // second arrives halfway through and must fail at its own deadline, not
+    // a full deadline after it finally gets the lock.
+    var queued = QueuedWriter{ .native = native, .data = data, .start_delay_ms = @divTrunc(default_input_deadline_ms, 2) };
+    const thread = try std.Thread.spawn(.{}, QueuedWriter.run, .{&queued});
+    try std.testing.expectError(error.InputTimeout, native.send(data, true));
+    thread.join();
+    try std.testing.expect(queued.failed);
+    try std.testing.expect(queued.elapsed_ms <= default_input_deadline_ms + 300);
+}
+
+const BlockedWriter = struct {
+    native: *NativeSession,
+    data: []const u8,
+    finished_at_ms: std.atomic.Value(i64) = .init(0),
+
+    fn run(self: *BlockedWriter) void {
+        self.native.writeInput(self.data) catch {};
+        self.finished_at_ms.store(sys.monotonicMs(), .seq_cst);
+    }
+};
+
+test "the reader epilogue wakes a blocked writer instead of waiting out its deadline" {
+    if (!supported_os) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var rec: Recorder = .{};
+    defer rec.deinit();
+    // The descendant keeps the slave open, so the blocked writer sees no
+    // hangup when the shell exits; only the reader can release it.
+    const native = try testCreate(&rec, "(trap '' HUP; exec sleep 4) & sleep 0.4; exit 0", .{});
+    defer native.destroy();
+    const data = try lineBlock(allocator, 1024 * 1024);
+    defer allocator.free(data);
+
+    const started = sys.monotonicMs();
+    var writer = BlockedWriter{ .native = native, .data = data };
+    const thread = try std.Thread.spawn(.{}, BlockedWriter.run, .{&writer});
+    try rec.waitForExit(10_000);
+    const finalized_deadline = sys.monotonicMs() + 5_000;
+    while (!native.isStreamFinalized() and sys.monotonicMs() < finalized_deadline) sys.sleepMs(2);
+    const finalized_after = sys.monotonicMs() - started;
+    thread.join();
+
+    // Shell exit (0.4 s) plus the drain grace, well short of the writer's
+    // 2 s deadline that the epilogue used to wait for.
+    try std.testing.expect(native.isStreamFinalized());
+    try std.testing.expect(finalized_after < default_input_deadline_ms - 400);
+    try std.testing.expect(writer.finished_at_ms.load(.seq_cst) - started < default_input_deadline_ms - 400);
 }

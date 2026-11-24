@@ -291,6 +291,9 @@ const libc = struct {
     // `std.c.ioctl` narrows it to `c_int`, which sign-extends requests with
     // the top bit set (every Darwin `_IOW` request).
     extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
+    extern "c" fn getsid(pid: pid_t) pid_t;
+    extern "c" fn getpgrp() pid_t;
+    extern "c" fn pause() c_int;
 };
 
 /// `ioctl(2)` with the request passed at its native width. Async-signal-safe.
@@ -1215,21 +1218,148 @@ pub fn monotonicMs() i64 {
     return std.Io.Clock.awake.now(std.Options.debug_io).toMilliseconds();
 }
 
-/// Async-signal-safe. Close every descriptor `>= low_fd`: `close_range(2)` on
-/// Linux, otherwise (and on kernels without it) a loop bounded by
-/// `RLIMIT_NOFILE`, capped so an unlimited rlimit cannot stall the child.
+/// Test seam: skip `close_range(2)` so the enumeration fallback of
+/// `closeFrom` runs on Linux too.
+pub var force_close_from_fallback: bool = false;
+
+/// Upper bound of the last-resort descriptor scan of `closeFrom`.
+const close_from_scan_cap: fd_t = 65536;
+
+/// Async-signal-safe. Close every descriptor `>= low_fd`.
+///
+/// `close_range(2)` on Linux. Otherwise (Darwin, and Linux kernels without
+/// `close_range`) the open descriptors are enumerated from the kernel
+/// (`proc_pidinfo` on Darwin, `/proc/self/fd` on Linux), so a descriptor that
+/// was opened before `RLIMIT_NOFILE` was lowered is closed even though it
+/// lies above the current soft limit. Only when enumeration fails does this
+/// fall back to a numeric scan, bounded by the larger of the soft and hard
+/// limits and capped so an unlimited rlimit cannot stall the child.
 pub fn closeFrom(low_fd: fd_t) void {
     if (builtin.os.tag == .linux) {
-        const rc = std.os.linux.close_range(low_fd, std.math.maxInt(fd_t), .{ .UNSHARE = false, .CLOEXEC = false });
-        if (std.os.linux.errno(rc) == .SUCCESS) return;
+        if (!force_close_from_fallback) {
+            const rc = std.os.linux.close_range(low_fd, std.math.maxInt(fd_t), .{ .UNSHARE = false, .CLOEXEC = false });
+            if (std.os.linux.errno(rc) == .SUCCESS) return;
+        }
+        if (closeFromProcSelfFd(low_fd)) return;
+    } else if (is_darwin) {
+        if (closeFromDarwinFdList(low_fd)) return;
     }
     var limit: c.rlimit = undefined;
     const max_fd: fd_t = if (c.getrlimit(.NOFILE, &limit) == 0)
-        @intCast(@min(limit.cur, 65536))
+        @intCast(@min(@max(limit.cur, limit.max), close_from_scan_cap))
     else
-        1024;
+        close_from_scan_cap;
     var fd = low_fd;
     while (fd < max_fd) : (fd += 1) _ = c.close(fd);
+}
+
+const darwin = struct {
+    const proc_pidlistfds: c_int = 1;
+    const ProcFdInfo = extern struct { proc_fd: i32, proc_fdtype: u32 };
+    extern "c" fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: ?*anyopaque, buffersize: c_int) c_int;
+};
+
+/// Async-signal-safe: `proc_pidinfo` is a bare system call and the list
+/// lives on the stack. Returns false when the kernel list is unavailable.
+fn closeFromDarwinFdList(low_fd: fd_t) bool {
+    if (!is_darwin) return false;
+    var entries: [1024]darwin.ProcFdInfo = undefined;
+    const pid = c.getpid();
+    // Each pass closes every listed descriptor at or above the floor, so a
+    // table larger than the buffer drains over several passes. The cap only
+    // guards against a kernel that keeps reporting descriptors that cannot
+    // be closed.
+    var pass: usize = 0;
+    while (pass < 4096) : (pass += 1) {
+        const bytes = darwin.proc_pidinfo(pid, darwin.proc_pidlistfds, 0, &entries, @sizeOf(@TypeOf(entries)));
+        if (bytes <= 0) return false;
+        const count = @as(usize, @intCast(bytes)) / @sizeOf(darwin.ProcFdInfo);
+        var closed: usize = 0;
+        for (entries[0..count]) |entry| {
+            if (entry.proc_fd < low_fd) continue;
+            if (c.close(entry.proc_fd) == 0) closed += 1;
+        }
+        // A short list is the whole table: nothing at or above the floor
+        // is left once this pass closed nothing.
+        if (closed == 0) return count < entries.len;
+    }
+    return false;
+}
+
+/// Async-signal-safe: raw `open`/`getdents64` with a stack buffer, no
+/// `opendir`. Returns false when `/proc/self/fd` cannot be read.
+fn closeFromProcSelfFd(low_fd: fd_t) bool {
+    if (builtin.os.tag != .linux) return false;
+    const linux = std.os.linux;
+    const dir_fd = c.open("/proc/self/fd", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, @as(c.mode_t, 0));
+    if (dir_fd < 0) return false;
+    defer _ = c.close(dir_fd);
+
+    var buf: [4096]u8 align(@alignOf(linux.dirent64)) = undefined;
+    // Closing entries invalidates the directory position, so every pass
+    // restarts from the top until one closes nothing.
+    var pass: usize = 0;
+    while (pass < 4096) : (pass += 1) {
+        if (linux.errno(linux.lseek(dir_fd, 0, 0)) != .SUCCESS) return false;
+        var closed: usize = 0;
+        while (true) {
+            const rc = linux.getdents64(dir_fd, &buf, buf.len);
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => return false,
+            }
+            if (rc == 0) break;
+            var offset: usize = 0;
+            while (offset < rc) {
+                const entry: *align(1) const linux.dirent64 = @ptrCast(&buf[offset]);
+                const name: [*:0]const u8 = @ptrCast(&buf[offset + @offsetOf(linux.dirent64, "name")]);
+                offset += entry.reclen;
+                const fd = parseFdName(name) orelse continue;
+                if (fd < low_fd or fd == dir_fd) continue;
+                if (c.close(fd) == 0) closed += 1;
+            }
+        }
+        if (closed == 0) return true;
+    }
+    return false;
+}
+
+/// Decimal descriptor number, or null for `.`, `..` and anything else.
+fn parseFdName(name: [*:0]const u8) ?fd_t {
+    var value: u32 = 0;
+    var index: usize = 0;
+    while (name[index] != 0) : (index += 1) {
+        const digit = name[index];
+        if (digit < '0' or digit > '9' or index >= 9) return null;
+        value = value * 10 + (digit - '0');
+    }
+    if (index == 0) return null;
+    return @intCast(value);
+}
+
+/// Linux `pidfd_send_signal(2)`: signal the exact process `pid_fd` refers
+/// to. Unlike `kill(2)` it can never reach a process that reused the PID.
+/// Returns false on failure, on other platforms, and for a negative
+/// descriptor. Counted in `kill_call_count`. Async-signal-safe.
+pub fn pidfdSendSignal(pid_fd: fd_t, sig: posix.SIG) bool {
+    if (builtin.os.tag != .linux or pid_fd < 0) return false;
+    _ = kill_call_count.fetchAdd(1, .seq_cst);
+    const rc = std.os.linux.pidfd_send_signal(pid_fd, sig, null, 0);
+    return std.os.linux.errno(rc) == .SUCCESS;
+}
+
+/// True when the process group `pgid` still has a member (zombies included).
+/// Never delivers a signal and is not counted in `kill_call_count`.
+pub fn processGroupExists(pgid: pid_t) bool {
+    if (pgid <= 1) return false;
+    return c.kill(-pgid, @fromBackingInt(@intCast(0))) == 0;
+}
+
+/// `getsid(2)`: the session id of `pid`, or null when it cannot be read.
+pub fn sessionOf(pid: pid_t) ?pid_t {
+    const sid = libc.getsid(pid);
+    return if (sid < 0) null else sid;
 }
 
 /// Signals `resetChildSignals` restores to `SIG_DFL`.
@@ -1754,6 +1884,112 @@ test "closeFrom closes every descriptor at or above the floor" {
     try std.testing.expectEqual(@as(u8, 0), try forkAndCollect(closeFromChildBody));
     // The parent's descriptors are untouched.
     try std.testing.expect(c.fcntl(60, c.F.GETFD) >= 0);
+}
+
+fn closeFromAboveLimitChildBody() u8 {
+    // Fd 200 was opened under the original limit. Lower the soft and hard
+    // limits beneath it: a scan bounded by RLIMIT_NOFILE would miss it.
+    const lowered: c.rlimit = .{ .cur = 64, .max = 64 };
+    if (c.setrlimit(.NOFILE, &lowered) != 0) return 10;
+    if (c.fcntl(200, c.F.GETFD) < 0) return 11;
+    closeFrom(3);
+    if (c.fcntl(200, c.F.GETFD) >= 0) return 1;
+    if (c.fcntl(40, c.F.GETFD) >= 0) return 2;
+    if (c.fcntl(2, c.F.GETFD) < 0) return 3;
+    return 0;
+}
+
+test "closeFrom closes descriptors above a lowered descriptor limit" {
+    const fds = try pipe();
+    defer close(fds[0]);
+    defer close(fds[1]);
+    try dup2(fds[0], 40);
+    defer close(40);
+    try dup2(fds[1], 200);
+    defer close(200);
+
+    try std.testing.expectEqual(@as(u8, 0), try forkAndCollect(closeFromAboveLimitChildBody));
+
+    // The enumeration path, which Linux otherwise reaches only on kernels
+    // without close_range(2).
+    force_close_from_fallback = true;
+    defer force_close_from_fallback = false;
+    try std.testing.expectEqual(@as(u8, 0), try forkAndCollect(closeFromAboveLimitChildBody));
+    try std.testing.expectEqual(@as(u8, 0), try forkAndCollect(closeFromChildBody));
+    try std.testing.expect(c.fcntl(200, c.F.GETFD) >= 0);
+}
+
+fn closeFromManyChildBody() u8 {
+    // More descriptors than one enumeration buffer holds.
+    var made: usize = 0;
+    while (made < 1500) : (made += 1) {
+        if (c.dup(0) < 0) break;
+    }
+    if (made < 1100) return 20;
+    closeFrom(3);
+    var fd: fd_t = 3;
+    while (fd < 2000) : (fd += 1) {
+        if (c.fcntl(fd, c.F.GETFD) >= 0) return 1;
+    }
+    return 0;
+}
+
+test "closeFrom drains a descriptor table larger than its enumeration buffer" {
+    var limit: c.rlimit = undefined;
+    if (c.getrlimit(.NOFILE, &limit) != 0 or limit.cur < 1600) return error.SkipZigTest;
+    force_close_from_fallback = true;
+    defer force_close_from_fallback = false;
+    try std.testing.expectEqual(@as(u8, 0), try forkAndCollect(closeFromManyChildBody));
+}
+
+test "parseFdName accepts only decimal descriptor numbers" {
+    try std.testing.expectEqual(@as(?fd_t, 0), parseFdName("0"));
+    try std.testing.expectEqual(@as(?fd_t, 1234), parseFdName("1234"));
+    try std.testing.expectEqual(@as(?fd_t, null), parseFdName("."));
+    try std.testing.expectEqual(@as(?fd_t, null), parseFdName(".."));
+    try std.testing.expectEqual(@as(?fd_t, null), parseFdName(""));
+    try std.testing.expectEqual(@as(?fd_t, null), parseFdName("12a"));
+    try std.testing.expectEqual(@as(?fd_t, null), parseFdName("12345678901"));
+}
+
+test "pidfdSendSignal signals exactly the process behind the descriptor" {
+    if (builtin.os.tag != .linux) {
+        try std.testing.expect(!pidfdSendSignal(0, .TERM));
+        return;
+    }
+    try std.testing.expect(!pidfdSendSignal(-1, .TERM));
+    const pid = try fork();
+    if (pid == 0) {
+        while (true) _ = libc.pause();
+    }
+    const raw = std.os.linux.pidfd_open(pid, 0);
+    if (std.os.linux.errno(raw) != .SUCCESS) {
+        _ = c.kill(pid, .KILL);
+        _ = c.waitpid(pid, null, 0);
+        return error.SkipZigTest;
+    }
+    const pid_fd: fd_t = @intCast(raw);
+    defer close(pid_fd);
+    const before = kill_call_count.load(.seq_cst);
+    try std.testing.expect(pidfdSendSignal(pid_fd, .KILL));
+    try std.testing.expectEqual(before + 1, kill_call_count.load(.seq_cst));
+    var status: c_int = 0;
+    try std.testing.expectEqual(pid, c.waitpid(pid, &status, 0));
+    try std.testing.expectEqual(posix.SIG.KILL, posix.W.TERMSIG(@as(u32, @bitCast(status))));
+    // The process is reaped: the descriptor no longer names anything.
+    try std.testing.expect(!pidfdSendSignal(pid_fd, .KILL));
+}
+
+test "processGroupExists and sessionOf describe the current process" {
+    // Inside a container the test can run in the group of PID 1, which
+    // `processGroupExists` deliberately never reports.
+    const own_group = libc.getpgrp();
+    try std.testing.expectEqual(own_group > 1, processGroupExists(own_group));
+    try std.testing.expect(!processGroupExists(1));
+    try std.testing.expect(!processGroupExists(0));
+    try std.testing.expect(!processGroupExists(0x7fff_fff0));
+    try std.testing.expect(sessionOf(getpid()) != null);
+    try std.testing.expectEqual(@as(?pid_t, null), sessionOf(0x7fff_fff0));
 }
 
 fn signalResetChildBody() u8 {
