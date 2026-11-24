@@ -3269,14 +3269,29 @@ test "symlinked_log_not_followed, FIFO and non-socket rejected" {
 test "overlong socket path fails before spawning" {
     var path: [201]u8 = @splat('x');
     path[0] = '/';
-    var child = try std.process.spawn(io, .{
-        .argv = &.{ build_options.zmux_connect_path, "--socket", &path, "--spawn-daemon", "work" },
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .ignore,
-    });
-    defer killChild(&child);
-    try expectTermExited(try waitChild(&child, 2_000), 2);
+    var env = std.process.Environ.Map.init(test_allocator);
+    defer env.deinit();
+    try env.put("ZMUX_SOCKET", "");
+    try env.put("SMITHERS_SESSION_SOCKET", &path);
+    const expected = try std.fmt.allocPrint(test_allocator, "socket path too long ({d} > {d})", .{ path.len, sys.max_unix_path_len });
+    defer test_allocator.free(expected);
+
+    const cases = [_][]const []const u8{
+        &.{ build_options.zmux_connect_path, "--socket", &path, "--spawn-daemon", "work" },
+        &.{ build_options.zmux_connect_path, "--spawn-daemon", "work" },
+    };
+    for (cases) |argv| {
+        const result = try std.process.run(test_allocator, io, .{
+            .argv = argv,
+            .environ_map = &env,
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        defer test_allocator.free(result.stdout);
+        defer test_allocator.free(result.stderr);
+        try expectTermExited(result.term, 2);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, expected) != null);
+    }
 }
 
 test "three_concurrent_starters_one_daemon and concurrent_open_or_create_single_session" {
@@ -3428,7 +3443,19 @@ test "piped input reaches the pane through POLLHUP" {
     try endDaemon(&daemon, dir.socket);
 }
 
-test "prebuffered_exit_notification_handled" {
+fn acceptAttachHandshake(conn: *Connection) !void {
+    const ping = try conn.read(test_allocator, max_reply, nowMs() + 2_000);
+    defer test_allocator.free(ping);
+    try std.testing.expect(lineMatchesRpcId(test_allocator, ping, 100));
+    const ping_reply = try std.fmt.allocPrint(test_allocator, "{{\"id\":100,\"result\":{{\"version\":\"{s}\"}}}}\n", .{zmux.protocol.version});
+    defer test_allocator.free(ping_reply);
+    try writeAll(conn.fd, ping_reply);
+    const attach = try conn.read(test_allocator, max_reply, nowMs() + 2_000);
+    defer test_allocator.free(attach);
+    try std.testing.expect(lineMatchesRpcId(test_allocator, attach, 1));
+}
+
+test "prebuffered exit before the attach reply is handled" {
     const dir = try TestDir.init();
     defer dir.deinit();
     const listener = try sys.unixStreamSocket();
@@ -3454,20 +3481,14 @@ test "prebuffered_exit_notification_handled" {
     try std.testing.expect(try posix.poll(&pollfds, 2_000) != 0);
     var conn: Connection = .{ .fd = try sys.accept(listener) };
     defer conn.close();
-    const ping = try conn.read(test_allocator, max_reply, nowMs() + 2_000);
-    defer test_allocator.free(ping);
-    try std.testing.expect(lineMatchesRpcId(test_allocator, ping, 100));
-    const ping_reply = try std.fmt.allocPrint(test_allocator, "{{\"id\":100,\"result\":{{\"version\":\"{s}\"}}}}\n", .{zmux.protocol.version});
-    defer test_allocator.free(ping_reply);
-    try writeAll(conn.fd, ping_reply);
-    const attach = try conn.read(test_allocator, max_reply, nowMs() + 2_000);
-    defer test_allocator.free(attach);
-    try std.testing.expect(lineMatchesRpcId(test_allocator, attach, 1));
+    try acceptAttachHandshake(&conn);
 
-    // Replay ends two bytes into the first live frame. It must appear once.
-    try writeAll(conn.fd, "{\"id\":1,\"result\":{\"paneId\":\"p\",\"clientId\":\"c\",\"replayBase64\" : \"YWI=\",\"replayEndOffset\":2,\"generation\":0}}\n" ++
-        "{\"method\":\"pane_output\",\"params\":{\"pane_id\":\"p\",\"data_base64\":\"YWJjZA==\",\"offset\":0,\"generation\":0}}\n" ++
-        "{\"method\":\"session_exited\",\"params\":{\"session_id\":\"p\",\"generation\":0}}\n");
+    // Replay ends two bytes into the first live frame. A drop from the
+    // previous generation must not suppress the non-overlapping bytes.
+    try writeAll(conn.fd, "{\"method\":\"pane_output_dropped\",\"params\":{\"pane_id\":\"p\",\"resume_offset\":100,\"generation\":0}}\n" ++
+        "{\"method\":\"pane_output\",\"params\":{\"pane_id\":\"p\",\"data_base64\":\"YWJjZA==\",\"offset\":0,\"generation\":1}}\n" ++
+        "{\"method\":\"session_exited\",\"params\":{\"session_id\":\"p\",\"generation\":1}}\n" ++
+        "{\"id\":1,\"result\":{\"paneId\":\"p\",\"clientId\":\"c\",\"replayBase64\":\"YWI=\",\"replayEndOffset\":2,\"generation\":1}}\n");
     try expectTermExited(try waitChild(&child, 1_500), 0);
     const bytes = try directory.readFileAlloc(io, "stdout", test_allocator, .limited(128));
     defer test_allocator.free(bytes);
@@ -3937,4 +3958,112 @@ test "daemon preserves a regular file at the socket path" {
     defer killChild(&daemon);
     try expectTermExited(try waitChild(&daemon, 3_000), 1);
     try std.testing.expect(try fileContains(dir, "zmux.sock", "keep"));
+}
+
+fn shutdownAutoSpawned(path: []const u8) void {
+    const reply = rpcLine(test_allocator, path, "{\"id\":1,\"method\":\"daemon.shutdown\"}\n", max_reply) catch return;
+    test_allocator.free(reply);
+}
+
+test "auto-spawn accepts an explicit socket directly under /tmp" {
+    const generated = try tempSocketPath(test_allocator);
+    defer test_allocator.free(generated);
+    const path = try std.fs.path.join(test_allocator, &.{ "/tmp", std.fs.path.basename(generated) });
+    defer test_allocator.free(path);
+    const log = try std.fmt.allocPrint(test_allocator, "{s}.log", .{path});
+    defer test_allocator.free(log);
+    const lock = try std.fmt.allocPrint(test_allocator, "{s}.lock", .{path});
+    defer test_allocator.free(lock);
+    defer std.Io.Dir.deleteFileAbsolute(io, log) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, lock) catch {};
+    defer shutdownAutoSpawned(path);
+
+    // Existing logs may have been created with a looser mode.
+    const log_fd = try sys.open(log, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o600);
+    defer sys.close(log_fd);
+    try sys.fchmod(log_fd, 0o644);
+
+    var client = try std.process.spawn(io, .{
+        .argv = &.{ build_options.zmux_connect_path, "--socket", path, "--spawn-daemon", "work", "--command", "cat" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .inherit,
+    });
+    defer killChild(&client);
+    try expectTermExited(try waitChild(&client, 8_000), 0);
+    try std.testing.expectEqual(@as(u32, 0o600), (try sys.statAt(sys.cwd_fd, log, false)).permissions());
+}
+
+test "auto-spawn upgrades a legacy 0755 managed directory" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+    const parent = try std.fs.path.join(test_allocator, &.{ dir.path, ".smithers" });
+    defer test_allocator.free(parent);
+    const path = try std.fs.path.join(test_allocator, &.{ parent, "sessions.sock" });
+    defer test_allocator.free(path);
+    try sys.mkdir(parent, 0o755);
+    const fd = try sys.openDirNoFollow(parent);
+    defer sys.close(fd);
+    try sys.fchmod(fd, 0o755);
+    defer shutdownAutoSpawned(path);
+    var env = std.process.Environ.Map.init(test_allocator);
+    defer env.deinit();
+    try env.put("HOME", dir.path);
+    var client = try std.process.spawn(io, .{
+        .argv = &.{ build_options.zmux_connect_path, "--spawn-daemon", "work", "--command", "cat" },
+        .environ_map = &env,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .inherit,
+    });
+    defer killChild(&client);
+    try expectTermExited(try waitChild(&client, 8_000), 0);
+    try std.testing.expectEqual(@as(u32, 0o700), (try sys.fstat(fd)).permissions());
+}
+
+test "piped send waits for a delayed daemon error even after session exit" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+    const listener = try sys.unixStreamSocket();
+    defer sys.close(listener);
+    const address = try sys.UnixAddress.init(dir.socket);
+    try sys.bind(listener, &address);
+    try sys.listen(listener, 1);
+    const directory = try std.Io.Dir.openDirAbsolute(io, dir.path, .{});
+    defer directory.close(io);
+    const stderr = try directory.createFile(io, "stderr", .{});
+    defer stderr.close(io);
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ build_options.zmux_connect_path, "--socket", dir.socket, "attach", "work" },
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .{ .file = stderr },
+    });
+    defer killChild(&child);
+    try child.stdin.?.writeStreamingAll(io, "input");
+    child.stdin.?.close(io);
+    child.stdin = null;
+
+    var pollfds = [_]posix.pollfd{.{ .fd = listener, .events = posix.POLL.IN, .revents = 0 }};
+    try std.testing.expect(try posix.poll(&pollfds, 2_000) != 0);
+    var conn: Connection = .{ .fd = try sys.accept(listener) };
+    defer conn.close();
+    try acceptAttachHandshake(&conn);
+    try writeAll(conn.fd, "{\"id\":1,\"result\":{\"paneId\":\"p\",\"clientId\":\"c\",\"generation\":1}}\n");
+
+    const send_id = while (true) {
+        const line = try conn.read(test_allocator, max_reply, nowMs() + 2_000);
+        defer test_allocator.free(line);
+        const parsed = try std.json.parseFromSlice(std.json.Value, test_allocator, line, .{});
+        defer parsed.deinit();
+        const method = parsed.value.object.get("method").?.string;
+        if (std.mem.eql(u8, method, "session.send")) break try expectIntegerField(parsed.value, "id");
+    };
+    sleepMs(2_200);
+    try writeAll(conn.fd, "{\"method\":\"session_exited\",\"params\":{\"session_id\":\"p\",\"generation\":1}}\n");
+    const failure = try std.fmt.allocPrint(test_allocator, "{{\"id\":{d},\"error\":{{\"code\":-32000,\"message\":\"InputClosed\",\"data\":{{\"kind\":\"io\"}}}}}}\n", .{send_id});
+    defer test_allocator.free(failure);
+    try writeAll(conn.fd, failure);
+    try expectTermExited(try waitChild(&child, 2_000), 1);
+    try std.testing.expect(try fileContains(dir, "stderr", "InputClosed"));
 }

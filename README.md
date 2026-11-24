@@ -218,11 +218,13 @@ section. This example uses the default HOME-based socket.
 ```sh
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"daemon.ping"}' \
   | nc -U "$HOME/.smithers/sessions.sock"
-# {"jsonrpc":"2.0","id":1,"result":{"version":"0.3.0","pid":12345,"socketPath":"/home/user/.smithers/sessions.sock","sessions":0,"panes":0}}
+# {"jsonrpc":"2.0","id":1,"result":{"version":"0.4.0","pid":12345,"socketPath":"/home/user/.smithers/sessions.sock","sessions":0,"panes":0}}
 ```
 
 The socket protocol is one JSON document per physical line, terminated by
-`\n`. Do not split one request across multiple lines.
+`\n`. Do not split one request across multiple lines. The daemon disconnects
+clients that do not complete their first frame within 10 seconds of connecting
+or do not complete a started frame within 30 seconds.
 
 `session.create` accepts `id` (or equivalently `name`/`title`) as the
 human-readable session name; the daemon allocates a separate auto-generated

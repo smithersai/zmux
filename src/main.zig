@@ -93,6 +93,22 @@ test "README request and notification examples match the wire types" {
     const readme = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "README.md", allocator, .limited(256 * 1024));
     defer allocator.free(readme);
 
+    const ping_prefix = "# {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":";
+    const ping_start = std.mem.indexOf(u8, readme, ping_prefix) orelse return error.MissingPingExample;
+    const ping_line = readme[ping_start + 2 ..];
+    const ping_end = std.mem.indexOfScalar(u8, ping_line, '\n') orelse return error.MissingPingExample;
+    const Ping = struct { jsonrpc: []const u8, id: u32, result: struct { version: []const u8 } };
+    const ping = try std.json.parseFromSlice(Ping, allocator, ping_line[0..ping_end], .{ .ignore_unknown_fields = true });
+    defer ping.deinit();
+    // The README describes the package release. The release workflow also
+    // checks that the package and protocol versions agree before publication.
+    const manifest = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "build.zig.zon", allocator, .limited(64 * 1024));
+    defer allocator.free(manifest);
+    const version_prefix = ".version = \"";
+    const version_start = (std.mem.indexOf(u8, manifest, version_prefix) orelse return error.MissingPackageVersion) + version_prefix.len;
+    const version_end = std.mem.indexOfScalar(u8, manifest[version_start..], '"') orelse return error.MissingPackageVersion;
+    try std.testing.expectEqualStrings(manifest[version_start..][0..version_end], ping.value.result.version);
+
     var examples = std.mem.splitSequence(u8, readme, "```json\n");
     _ = examples.next();
     const request_example = examples.next() orelse return error.MissingRequestExample;

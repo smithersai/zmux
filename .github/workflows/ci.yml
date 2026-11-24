@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -42,9 +43,11 @@ jobs:
       - name: Test foreign UID protection
         if: matrix.os == 'ubuntu-latest'
         run: |
-          sudo "$(command -v zig)" build test-integration -Dintegration-filter=foreign_ \
-            --cache-dir "$RUNNER_TEMP/zmux-root-cache" \
-            --global-cache-dir "$RUNNER_TEMP/zmux-root-global-cache" --summary all
+          set -o pipefail
+          sudo env ZIG_GLOBAL_CACHE_DIR=/zmux-root-global-cache ZIG_LOCAL_CACHE_DIR=/zmux-root-cache \
+            NO_COLOR=1 "$(command -v zig)" build test-integration -Dintegration-filter=foreign_ \
+            --summary all 2>&1 | tee "$RUNNER_TEMP/zmux-foreign-uid.log"
+          grep -Eq '2/2 tests passed([;[:space:]]|$)' "$RUNNER_TEMP/zmux-foreign-uid.log"
 
   musl:
     name: Test on Alpine (musl)

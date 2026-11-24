@@ -1,6 +1,6 @@
 .{
     .name = .zmux,
-    .version = "0.3.0",
+    .version = "0.4.0",
     .fingerprint = 0x695fb32ad8d04ce7,
     .minimum_zig_version = "0.17.1",
     .dependencies = .{},
