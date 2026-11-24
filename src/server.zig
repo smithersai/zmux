@@ -838,9 +838,15 @@ pub const Server = struct {
     /// Take ownership of an accepted descriptor: check credentials and the
     /// connection limit, then hand it to a worker thread.
     fn admit(self: *Server, client_fd: posix.fd_t) void {
-        // BSD-derived systems hand the listener's O_NONBLOCK to accepted
-        // sockets; the reader expects a blocking descriptor.
-        clearNonBlocking(client_fd);
+        // Client sockets are non-blocking on every platform: the reader is
+        // poll-driven, and `writeAllDeadline` needs `O_NONBLOCK` to bound a
+        // send (BSD-derived systems inherit it from the listener; Linux does
+        // not).
+        ensureNonBlocking(client_fd) catch {
+            _ = self.rejected_connections.fetchAdd(1, .monotonic);
+            sys.close(client_fd);
+            return;
+        };
 
         if (!self.peerAllowed(client_fd)) {
             _ = self.rejected_connections.fetchAdd(1, .monotonic);
@@ -2171,11 +2177,17 @@ fn bindSocketInPlace(
 // ---------------------------------------------------------------------------
 // Socket I/O
 
-/// Write every byte of `bytes` within `timeout_ms` overall. Uses non-blocking
-/// sends plus `poll(POLLOUT)` against one monotonic deadline, so a peer that
-/// stops reading costs at most the budget on every platform.
+/// Write every byte of `bytes` within `timeout_ms` overall. Puts `fd` in
+/// non-blocking mode (it stays there) and waits in `poll(POLLOUT)` against one
+/// monotonic deadline, so a peer that stops reading costs at most the budget
+/// on every platform.
+///
+/// `MSG_DONTWAIT` alone is not enough: Darwin ignores it for `AF_UNIX` stream
+/// sockets, where a `send` larger than the free buffer space sleeps until the
+/// peer reads. Only `O_NONBLOCK` on the descriptor makes that `send` return.
 fn writeAllDeadline(fd: posix.fd_t, bytes: []const u8, timeout_ms: i64) !void {
     const deadline = sys.monotonicMs() + timeout_ms;
+    ensureNonBlocking(fd) catch return error.Unexpected;
     const flags: u32 = std.c.MSG.NOSIGNAL | std.c.MSG.DONTWAIT;
     var offset: usize = 0;
     while (offset < bytes.len) {
@@ -2201,6 +2213,15 @@ fn writeAllDeadline(fd: posix.fd_t, bytes: []const u8, timeout_ms: i64) !void {
     }
 }
 
+/// Set `O_NONBLOCK` unless it is already set (one `fcntl` in the common case).
+fn ensureNonBlocking(fd: posix.fd_t) !void {
+    const flags = std.c.fcntl(fd, std.c.F.GETFL);
+    if (flags < 0) return error.Unexpected;
+    const nonblock: c_int = @bitCast(std.c.O{ .NONBLOCK = true });
+    if ((flags & nonblock) != 0) return;
+    if (std.c.fcntl(fd, std.c.F.SETFL, flags | nonblock) < 0) return error.Unexpected;
+}
+
 /// Bound a blocking send in the kernel on every platform (`SO_SNDTIMEO`), as
 /// a backstop for `writeAllDeadline`. Returns whether the option was set.
 fn setSocketSendTimeout(fd: posix.fd_t) bool {
@@ -2221,14 +2242,6 @@ fn setSocketSendTimeout(fd: posix.fd_t) bool {
         return false;
     }
     return true;
-}
-
-fn clearNonBlocking(fd: posix.fd_t) void {
-    const flags = std.c.fcntl(fd, std.c.F.GETFL);
-    if (flags < 0) return;
-    const nonblock: c_int = @bitCast(std.c.O{ .NONBLOCK = true });
-    if ((flags & nonblock) == 0) return;
-    _ = std.c.fcntl(fd, std.c.F.SETFL, flags & ~nonblock);
 }
 
 // ---------------------------------------------------------------------------

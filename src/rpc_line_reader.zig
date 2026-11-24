@@ -705,13 +705,20 @@ test "fillOnce with drained lines handles frames larger than the buffer" {
     var big: [10_000]u8 = undefined;
     @memset(&big, 'm');
     big[big.len - 1] = '\n';
-    try sys.writeAll(pair[1], &big);
 
+    // Feed the frame in pieces that fit the default AF_UNIX send buffer on
+    // Darwin (8 KiB), draining between writes, so the writer never blocks.
     var got: ?[]u8 = null;
     defer if (got) |line| std.testing.allocator.free(line);
+    var sent: usize = 0;
     var spins: usize = 0;
     while (got == null) : (spins += 1) {
         try std.testing.expect(spins < 100);
+        if (sent < big.len) {
+            const chunk = @min(big.len - sent, 4096);
+            try sys.writeAll(pair[1], big[sent..][0..chunk]);
+            sent += chunk;
+        }
         _ = try reader.fillOnce(pair[0]);
         got = try reader.nextBufferedLineAlloc(std.testing.allocator, 64 * 1024);
     }

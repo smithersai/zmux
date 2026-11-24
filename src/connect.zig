@@ -949,8 +949,11 @@ fn runLoop(
             .{ .fd = if (pending_output != null) stdout_fd else -1, .events = posix.POLL.OUT, .revents = 0 },
         };
         _ = try posix.poll(&fds, run_loop_poll_timeout_ms);
-        if ((fds[2].revents & (posix.POLL.ERR | posix.POLL.NVAL | posix.POLL.HUP)) != 0) return error.OutputClosed;
-        if ((fds[2].revents & posix.POLL.OUT) != 0) {
+        if ((fds[2].revents & (posix.POLL.ERR | posix.POLL.HUP)) != 0) return error.OutputClosed;
+        // POLLNVAL counts as writable: Darwin's poll(2) rejects character
+        // devices such as /dev/null with POLLNVAL. The write then succeeds,
+        // or fails with the real error for a descriptor that is not open.
+        if ((fds[2].revents & (posix.POLL.OUT | posix.POLL.NVAL)) != 0) {
             const bytes = pending_output.?;
             const n = sys.write(stdout_fd, bytes[output_sent..]) catch |err| switch (err) {
                 error.WouldBlock => 0,
@@ -994,7 +997,11 @@ fn runLoop(
             if (stdin_eof) quiet_until = sys.monotonicMs() + pipe_quiet_ms;
         }
 
-        if ((fds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
+        // POLLNVAL counts as readable: Darwin's poll(2) rejects character
+        // devices such as /dev/null with POLLNVAL instead of reporting them
+        // ready. The read then returns EOF (or the real error) rather than
+        // leaving the loop spinning on a descriptor poll will never accept.
+        if ((fds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
             switch (try readStdinChunk(stdin_fd, &buf)) {
                 .again => {},
                 .eof => {
@@ -1776,13 +1783,73 @@ test "run loop completes a frame larger than the line reader staging buffer" {
     @memset(frame, ' ');
     const exit_frame = "{\"method\":\"session_exited\",\"params\":{\"session_id\":\"p\"}}\n";
     @memcpy(frame[frame.len - exit_frame.len ..], exit_frame);
-    try sys.sendAll(pair[1], frame);
-    _ = c.shutdown(pair[1], 1);
+    // The frame exceeds the default AF_UNIX send buffer on Darwin (8 KiB), so
+    // the writer runs beside the loop that drains it.
+    const Writer = struct {
+        fn run(fd: posix.fd_t, bytes: []const u8) void {
+            sys.sendAll(fd, bytes) catch {};
+            _ = c.shutdown(fd, 1);
+        }
+    };
+    const writer = try std.Thread.spawn(.{}, Writer.run, .{ pair[1], frame });
+    var reader: LineReader = .{};
+    defer reader.deinit();
+    const outcome = runLoop(
+        input[0],
+        1,
+        pair[0],
+        &reader,
+        alloc,
+        .{ .pane_id = "p", .io = test_io },
+    );
+    // Unblock the writer if the loop stopped before draining the frame.
+    _ = c.shutdown(pair[0], 0);
+    writer.join();
+    try std.testing.expectEqual(RunOutcome.session_ended, try outcome);
+}
+
+test "run loop ends at EOF when stdin is /dev/null" {
+    const alloc = std.testing.allocator;
+    const pair = try sys.socketPair();
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
+    // Darwin's poll(2) reports POLLNVAL for /dev/null; the loop must still
+    // read it and see EOF instead of spinning.
+    const null_fd = c.open("/dev/null", .{ .ACCMODE = .RDONLY });
+    try std.testing.expect(null_fd >= 0);
+    defer sys.close(null_fd);
+    var reader: LineReader = .{};
+    defer reader.deinit();
+    try std.testing.expectEqual(RunOutcome.exited, try runLoop(
+        null_fd,
+        1,
+        pair[0],
+        &reader,
+        alloc,
+        .{ .pane_id = "p", .io = test_io },
+    ));
+}
+
+test "run loop writes pane output to /dev/null" {
+    const alloc = std.testing.allocator;
+    const pair = try sys.socketPair();
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
+    const input = try sys.pipe();
+    defer sys.close(input[0]);
+    defer sys.close(input[1]);
+    // Darwin's poll(2) reports POLLNVAL for /dev/null; that is not a closed
+    // output.
+    const null_fd = c.open("/dev/null", .{ .ACCMODE = .WRONLY });
+    try std.testing.expect(null_fd >= 0);
+    defer sys.close(null_fd);
+    try sys.sendAll(pair[1], "{\"method\":\"pane_output\",\"params\":{\"pane_id\":\"p\",\"data_base64\":\"aGk=\"}}\n" ++
+        "{\"method\":\"session_exited\",\"params\":{\"session_id\":\"p\"}}\n");
     var reader: LineReader = .{};
     defer reader.deinit();
     try std.testing.expectEqual(RunOutcome.session_ended, try runLoop(
         input[0],
-        1,
+        null_fd,
         pair[0],
         &reader,
         alloc,

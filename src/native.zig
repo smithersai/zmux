@@ -1177,6 +1177,8 @@ test "a descendant holding the terminal open delays session_exited by the drain 
     // The background subshell ignores the hangup sent when the session
     // leader exits and keeps the slave open as its stdout for two seconds.
     // The leader lingers briefly so the trap is installed before it exits.
+    const leader_sleep_ms: i64 = 300;
+    const started_at = sys.monotonicMs();
     const native = try testCreate(&rec, "(trap '' HUP; exec sleep 2) & sleep 0.3; exit 5", .{});
     defer native.destroy();
 
@@ -1188,9 +1190,17 @@ test "a descendant holding the terminal open delays session_exited by the drain 
     const reaped_at = sys.monotonicMs();
     try rec.waitForExit(5_000);
 
-    const delay = rec.exit_at_ms - reaped_at;
-    try std.testing.expect(delay >= exit_drain_grace_ms - 60);
-    try std.testing.expect(delay <= exit_drain_grace_ms + 100);
+    // Lower bound from the spawn, not from `reaped_at`: this thread can
+    // observe the reap late on a loaded machine, but the leader never exits
+    // before its own sleep ends, and the grace runs after that.
+    // Linux only: Darwin revokes the terminal when the session leader exits,
+    // so the master can read EOF at once and no grace is spent.
+    if (builtin.os.tag == .linux) {
+        try std.testing.expect(rec.exit_at_ms - started_at >= leader_sleep_ms + exit_drain_grace_ms - 60);
+    }
+    // Upper bound: the grace, not the descendant's remaining ~1.7 s. The
+    // margin absorbs scheduling delay and stays well below that.
+    try std.testing.expect(rec.exit_at_ms - reaped_at <= exit_drain_grace_ms + 750);
     try std.testing.expectEqual(@as(?u32, 5), rec.exit_code);
     try std.testing.expectEqual(@as(usize, 1), rec.exits);
 }
@@ -1774,9 +1784,16 @@ test "terminate lets a HUP trap finish before SIGTERM follows" {
     // a job with a HUP handler died of SIGTERM before the handler ran.
     var rec: Recorder = .{};
     defer rec.deinit();
-    const native = try testCreate(&rec, "trap 'echo TRAPPED; exit 3' HUP; echo ready; while :; do sleep 1; done", .{});
+    // The shell waits with the `wait` builtin, which a trapped signal
+    // interrupts at once. Waiting on a foreground `sleep` instead defers the
+    // trap until that child exits, and a SIGHUP that lands between its fork
+    // and exec misses it, so the trap would run up to a second late and lose
+    // to the SIGTERM this test is about.
+    const native = try testCreate(&rec, "trap 'echo TRAPPED; exit 3' HUP; echo ready; while :; do sleep 1 & wait $!; done", .{});
     defer native.destroy();
     try rec.waitForOutput("ready", 10_000);
+    // Let the shell get past the fork and park in `wait`.
+    sys.sleepMs(50);
 
     native.terminate();
     try rec.waitForExit(10_000);

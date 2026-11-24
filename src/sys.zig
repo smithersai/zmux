@@ -1094,13 +1094,21 @@ pub fn openOwnedRegularAt(dir_fd: fd_t, name: []const u8, flags: c.O, mode: mode
     open_flags.NOFOLLOW = true;
     open_flags.NONBLOCK = true;
     open_flags.CLOEXEC = true;
+    // Darwin can fail a creating open with ENOENT when another thread or
+    // process creates the same name at the same moment. The file exists by
+    // then, so a retry opens it; the bound keeps a genuinely missing path
+    // component an error.
+    var create_races_left: u8 = if (flags.CREAT) 16 else 0;
     const fd: fd_t = while (true) {
         const rc = c.openat(dir_fd, name_z, open_flags, @as(c_uint, mode));
         switch (posix.errno(rc)) {
             .SUCCESS => break @intCast(rc),
             .INTR => continue,
             .ACCES, .PERM => return error.AccessDenied,
-            .NOENT => return error.FileNotFound,
+            .NOENT => {
+                if (create_races_left == 0) return error.FileNotFound;
+                create_races_left -= 1;
+            },
             .NOTDIR => return error.NotDir,
             // Darwin reports EMLINK-free ELOOP; FreeBSD-style EMLINK is
             // treated the same way.

@@ -3528,6 +3528,45 @@ test "exit_tail_output_not_lost and attach_replay_no_gap_no_dup" {
     try endDaemon(&daemon, dir.socket);
 }
 
+/// Read `conn` at about 20 KiB/s until one line contains both needles, then
+/// consume the rest of the line in progress so the connection's own reader
+/// resumes on a frame boundary.
+fn slowReadUntilLine(conn: *Connection, needle_a: []const u8, needle_b: []const u8, timeout_ms: i64) !void {
+    try std.testing.expectEqual(conn.reader.start, conn.reader.end);
+    const deadline = nowMs() + timeout_ms;
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(test_allocator);
+    var found = false;
+    var chunk: [1024]u8 = undefined;
+    while (true) {
+        if (found and pending.items.len == 0) return;
+        if (nowMs() >= deadline) return error.NotificationTimeout;
+        var fds = [_]posix.pollfd{.{ .fd = conn.fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&fds, 50) == 0) continue;
+        const n = try posix.read(conn.fd, chunk[0..if (found) 1 else chunk.len]);
+        if (n == 0) return error.EndOfStream;
+        try pending.appendSlice(test_allocator, chunk[0..n]);
+        while (std.mem.indexOfScalar(u8, pending.items, '\n')) |end| {
+            const line = pending.items[0..end];
+            if (std.mem.indexOf(u8, line, needle_a) != null and std.mem.indexOf(u8, line, needle_b) != null) found = true;
+            try pending.replaceRange(test_allocator, 0, end + 1, &.{});
+        }
+        if (!found) sleepMs(50);
+    }
+}
+
+/// Read and discard lines from `conn` for `ms` milliseconds.
+fn drainLinesFor(conn: *Connection, ms: i64) !void {
+    const deadline = nowMs() + ms;
+    while (true) {
+        const line = conn.read(test_allocator, 1024 * 1024, deadline) catch |err| switch (err) {
+            error.ReadTimeout => return,
+            else => return err,
+        };
+        test_allocator.free(line);
+    }
+}
+
 test "flood_does_not_disconnect_slow_client or an attached quiet pane client" {
     const dir = try TestDir.init();
     defer dir.deinit();
@@ -3552,11 +3591,30 @@ test "flood_does_not_disconnect_slow_client or an attached quiet pane client" {
     const flood = try rpcOk(&admin, 4, "session.create", .{
         .id = "flood",
         .shell = "/bin/sh",
-        .command = "yes flood | head -c 8388608; printf 'FLOOD_DONE'; sleep 10",
+        // 4 MiB of output is several times the 1 MiB per-connection queue.
+        .command = "yes flood | head -c 4194304; printf 'FLOOD_DONE'; sleep 10",
     });
     defer flood.deinit();
     const flood_id = try expectStringField(try responseResult(flood.value), "paneId");
-    test_allocator.free(try waitForCaptureContains(test_allocator, dir.socket, flood_id, "FLOOD_DONE", 5_000));
+
+    // The slow client reads a trickle (about 20 KiB/s) until its queue has
+    // crossed the high-water mark and the drop notice reaches it. A trickle
+    // rather than no reads at all: a client that leaves one frame unread past
+    // the server's send deadline is disconnected by design, and how long the
+    // flood needs to overflow the queue depends on PTY throughput (a busy
+    // Darwin PTY delivers tens of bytes a read).
+    try slowReadUntilLine(&slow, "\"pane_output_dropped\"", flood_id, 60_000);
+
+    // From here the client keeps up while the rest of the flood arrives. The
+    // bound is for liveness only; a loaded machine needs tens of seconds.
+    const flood_deadline = nowMs() + 120_000;
+    while (true) {
+        const text = try captureSessionText(test_allocator, dir.socket, flood_id);
+        defer test_allocator.free(text);
+        if (std.mem.indexOf(u8, text, "FLOOD_DONE") != null) break;
+        if (nowMs() >= flood_deadline) return error.CaptureTimeout;
+        try drainLinesFor(&slow, 50);
+    }
     (try rpcOk(&admin, 5, "session.send", .{ .sessionId = quiet_id, .text = "\n" })).deinit();
 
     const deadline = nowMs() + 4_000;
@@ -3575,8 +3633,6 @@ test "flood_does_not_disconnect_slow_client or an attached quiet pane client" {
         defer test_allocator.free(chunk);
         try tail.appendSlice(test_allocator, chunk);
     }
-    const dropped = try readNotificationLine(test_allocator, &slow, "pane_output_dropped", flood_id, 4_000);
-    defer test_allocator.free(dropped);
     (try rpcOk(&slow, 6, "daemon.ping", .{})).deinit();
     (try rpcOk(&live, 7, "daemon.ping", .{})).deinit();
     try endDaemon(&daemon, dir.socket);
@@ -3754,6 +3810,18 @@ fn waitForRawMode(fd: posix.fd_t) !posix.termios {
     return error.RawModeTimeout;
 }
 
+/// Compare terminal settings, ignoring `PENDIN`. That bit is kernel state,
+/// not a setting: Darwin sets it itself whenever a `tcsetattr` switches the
+/// line discipline back to canonical mode (to reprocess pending input) and
+/// clears it on the next read, so a faithful restore still reads it back set.
+fn expectTermiosRestored(expected: posix.termios, actual: posix.termios) !void {
+    var want = expected;
+    var got = actual;
+    want.lflag.PENDIN = false;
+    got.lflag.PENDIN = false;
+    try std.testing.expectEqualDeep(want, got);
+}
+
 test "client restores inherited terminal on TSTP and TERM, and re-enters raw on CONT" {
     const dir = try TestDir.init();
     defer dir.deinit();
@@ -3827,13 +3895,13 @@ test "client restores inherited terminal on TSTP and TERM, and re-enters raw on 
         if (nowMs() >= deadline) return error.StopTimeout;
         sleepMs(5);
     }
-    try std.testing.expectEqualDeep(original, try posix.tcgetattr(slave));
+    try expectTermiosRestored(original, try posix.tcgetattr(slave));
     try std.testing.expectEqual(@as(c_int, 0), std.c.kill(pid, .CONT));
     _ = try waitForRawMode(slave);
     try std.testing.expectEqual(@as(c_int, 0), std.c.kill(pid, .TERM));
     const term = try waitChild(&child, 2_000);
     try std.testing.expect(term == .signal and term.signal == .TERM);
-    try std.testing.expectEqualDeep(original, try posix.tcgetattr(slave));
+    try expectTermiosRestored(original, try posix.tcgetattr(slave));
 }
 
 test "auto-spawn keeps daemon startup logs when stderr is closed" {
