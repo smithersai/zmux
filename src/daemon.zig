@@ -139,9 +139,9 @@ pub fn main(init: std.process.Init) void {
     runMain(init) catch |err| {
         switch (err) {
             // Usage errors, already reported with a specific message.
-            error.InvalidArguments => std.process.exit(2),
+            error.InvalidArguments, error.SocketPathTooLong => std.process.exit(2),
             // Already reported with a specific message.
-            error.SocketPathTooLong, error.StartupFailed => {},
+            error.StartupFailed => {},
             else => {
                 var buf: [1024]u8 = undefined;
                 var w = std.Io.File.stderr().writerStreaming(init.io, &buf);

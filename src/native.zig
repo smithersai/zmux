@@ -204,6 +204,9 @@ pub const NativeSession = struct {
     /// Thread id of the live reader thread, 0 when none is running.
     reader_tid: std.atomic.Value(u64) = .init(0),
     reader_finished: std.atomic.Value(bool) = .init(false),
+    /// Set once the child is reaped and the PTY output drain loop has exited,
+    /// immediately before emitting `session_exited`.
+    stream_finalized: std.atomic.Value(bool) = .init(false),
     /// Set when the last reference is dropped from inside a sink callback:
     /// the reader thread detaches and tears the session down itself.
     destroy_on_reader_exit: std.atomic.Value(bool) = .init(false),
@@ -385,6 +388,14 @@ pub const NativeSession = struct {
     /// and outlived its shell); that job is terminated too.
     pub fn stopForOwnerRelease(self: *NativeSession) void {
         if (!self.handle.isReaped() or self.handle.orphanedForegroundGroup() != null) self.terminate();
+    }
+
+    /// Exit info once the PTY stream has been drained (every output byte is in
+    /// scrollback). Returns null while the child is running or while the
+    /// reader thread is still draining final bytes after reap.
+    pub fn finalizedExitInfo(self: *NativeSession) ?ExitInfo {
+        if (!self.stream_finalized.load(.seq_cst)) return null;
+        return self.exitInfo();
     }
 
     /// True once the reader thread has finished: every byte of PTY output
@@ -764,6 +775,15 @@ pub const NativeSession = struct {
     /// `pane_output`), release the master, and hand off or finish teardown.
     fn finishReader(self: *NativeSession) void {
         if (self.handle.isReaped()) {
+            // Re-verify any remembered foreground group right at reap time so
+            // a short-lived job that already exited is cleared immediately and
+            // cannot match a later PID wrap on a retained exited pane.
+            _ = self.handle.orphanedForegroundGroup();
+            // All PTY output is now in scrollback. Flip `stream_finalized`
+            // before emitting `session_exited` so a concurrent attach either
+            // sees `finalizedExitInfo() == null` and receives `session_exited`,
+            // or sees `finalizedExitInfo() != null` with the complete tail.
+            self.stream_finalized.store(true, .seq_cst);
             const exit: ExitInfo = self.exitInfo() orelse .{ .exit_code = null, .signal = null };
             _ = self.emitEvent(.{ .session_exited = .{
                 .session_id = self.id,
@@ -2027,16 +2047,31 @@ test "output buffered at exit survives a slow sink beyond the drain grace" {
 
 test "destroy delivers output that is still buffered when the reader is stopped" {
     if (!supported_os) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const marker = try std.fs.path.join(allocator, &.{ tmp_path, "wrote-mark-last" });
+    defer allocator.free(marker);
+    const cmd = try std.fmt.allocPrint(allocator, "echo first; sleep 0.1; echo MARK-LAST; : > '{s}'; exec sleep 100", .{marker});
+    defer allocator.free(cmd);
 
     var rec: Recorder = .{};
     defer rec.deinit();
-    // The child prints and then idles. The first callback is slow, so the
-    // rest of the output sits unread in the kernel while the owner tears
-    // the session down.
-    rec.output_delay_ms = 600;
-    const native = try testCreate(&rec, "echo first; sleep 0.2; echo MARK-LAST; exec sleep 100", .{});
+    // The child prints and then idles. The first callback is slow, so
+    // MARK-LAST sits unread in the kernel buffer when the owner tears
+    // the session down right after the marker file appears.
+    rec.output_delay_ms = 1200;
+    const native = try testCreate(&rec, cmd, .{});
     try rec.waitForOutput("first", 10_000);
-    sys.sleepMs(350);
+    const marker_deadline = sys.monotonicMs() + 10_000;
+    while (true) {
+        if (sys.statAt(sys.cwd_fd, marker, false)) |_| break else |_| {}
+        if (sys.monotonicMs() >= marker_deadline) return error.Timeout;
+        sys.sleepMs(5);
+    }
     native.destroy();
 
     try std.testing.expect(rec.outputContains("MARK-LAST"));

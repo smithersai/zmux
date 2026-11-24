@@ -991,23 +991,42 @@ pub const PrivateDirError = error{ NotDirectory, ForeignOwner, InsecurePermissio
 
 const MkdirOutcome = union(enum) { created, exists, failed: posix.E };
 
-/// `chmod` without following a final symlink where the platform supports it.
-/// Best effort: `ensurePrivateDir` verifies the result on the pinned fd.
-fn chmodNoFollow(path_z: [*:0]const u8, mode: mode_t) void {
+/// Best-effort `chmod(0700)` for a directory this call just created under a
+/// restrictive umask (e.g. `0777`, where `mkdir` yields mode `0000` and
+/// `open(O_RDONLY)` returns `EACCES`). Verifies `lstat` shows a directory
+/// owned by euid before touching permissions; `ensurePrivateDir` still
+/// validates ownership and final mode on the pinned `O_NOFOLLOW` fd.
+fn chmodCreatedDir(path_z: [*:0]const u8, path: []const u8, mode: mode_t) void {
+    const st = statAt(cwd_fd, path, false) catch return;
+    if (!st.isDir() or st.uid != geteuid() or st.permissions() == mode) return;
     if (c.fchmodat(cwd_fd, path_z, mode, c.AT.SYMLINK_NOFOLLOW) == 0) return;
     switch (posix.errno(@as(c_int, -1))) {
-        // Older libcs and kernels reject the flag outright.
+        // Linux kernels/libcs reject AT_SYMLINK_NOFOLLOW on fchmodat.
         .OPNOTSUPP, .INVAL, .NOSYS => _ = c.fchmodat(cwd_fd, path_z, mode, 0),
         else => {},
     }
 }
 
-/// `mkdir(path, 0700)`. A directory we create is chmod-ed to exactly 0700 so
-/// it is usable even when the process umask masks every bit.
-fn mkdirPrivateZ(path_z: [*:0]const u8) MkdirOutcome {
+/// `mkdir(path, 0700)`. When this call created the directory and its mode is
+/// missing owner rwx (e.g. under `umask 0777`), repair to `0700` via fd-pinned
+/// `fchmod` when openable, falling back to `chmodCreatedDir` only when
+/// `openDirNoFollow` fails with `AccessDenied`.
+fn mkdirPrivateZ(path_z: [*:0]const u8, path: []const u8, repair_mode: bool) MkdirOutcome {
     switch (posix.errno(c.mkdir(path_z, 0o700))) {
         .SUCCESS => {
-            chmodNoFollow(path_z, 0o700);
+            if (repair_mode) {
+                if (openDirNoFollow(path)) |fd| {
+                    defer close(fd);
+                    if (fstat(fd)) |st| {
+                        if (st.isDir() and st.uid == geteuid() and st.permissions() != 0o700) {
+                            fchmod(fd, 0o700) catch {};
+                        }
+                    } else |_| {}
+                } else |err| switch (err) {
+                    error.AccessDenied => chmodCreatedDir(path_z, path, 0o700),
+                    else => {},
+                }
+            }
             return .created;
         },
         .EXIST => return .exists,
@@ -1043,7 +1062,7 @@ pub fn ensurePrivateDir(path: []const u8) PrivateDirError!fd_t {
     buf[trimmed.len] = 0;
     const path_z: [*:0]const u8 = buf[0..trimmed.len :0].ptr;
 
-    var outcome = mkdirPrivateZ(path_z);
+    var outcome = mkdirPrivateZ(path_z, trimmed, false);
     if (outcome == .failed and outcome.failed == .NOENT) {
         // Create missing ancestors front to back, like `mkdir -p`. Errors on
         // ancestors are ignored: the final mkdir reports what matters.
@@ -1051,10 +1070,10 @@ pub fn ensurePrivateDir(path: []const u8) PrivateDirError!fd_t {
         while (index < trimmed.len) : (index += 1) {
             if (buf[index] != '/') continue;
             buf[index] = 0;
-            _ = mkdirPrivateZ(path_z);
+            _ = mkdirPrivateZ(path_z, buf[0..index], true);
             buf[index] = '/';
         }
-        outcome = mkdirPrivateZ(path_z);
+        outcome = mkdirPrivateZ(path_z, trimmed, false);
     }
     switch (outcome) {
         .failed => |err| return privateDirErr(err),
@@ -1062,8 +1081,13 @@ pub fn ensurePrivateDir(path: []const u8) PrivateDirError!fd_t {
     }
 
     const fd = openDirNoFollow(trimmed) catch |err| switch (err) {
+        error.AccessDenied => if (outcome == .created) blk: {
+            // Under `umask 0777` the directory we just created has mode 0000
+            // and cannot be opened until owner rwx is restored.
+            chmodCreatedDir(path_z, trimmed, 0o700);
+            break :blk openDirNoFollow(trimmed) catch return error.AccessDenied;
+        } else return error.AccessDenied,
         error.NameTooLong => return error.NameTooLong,
-        error.AccessDenied => return error.AccessDenied,
         error.FileNotFound => return error.FileNotFound,
         // Linux reports ENOTDIR, Darwin ELOOP, for a symlink opened with
         // O_DIRECTORY|O_NOFOLLOW; lstat tells the two cases apart.

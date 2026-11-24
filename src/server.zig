@@ -1424,7 +1424,7 @@ pub const Server = struct {
         // or is announced after this reply, never in between.
         const native = self.manager.find(client.pane_id) orelse return error.PaneNotFound;
         defer native.release();
-        const exit = native.exitInfo();
+        const exit = native.finalizedExitInfo();
         const generation = native.generation();
         const tail = try native.scrollbackTail(self.allocator, attach_replay_max_bytes);
         defer self.allocator.free(tail.bytes);

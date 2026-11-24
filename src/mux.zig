@@ -574,6 +574,10 @@ pub const Manager = struct {
     /// waiting on a respawn gate, from every native, attached or not.
     /// `clearEventSinks` waits for zero without allocating.
     sink_in_flight: usize = 0,
+    /// Re-entrant `clearEventSinks` calls currently waiting inside a sink
+    /// callback. Tracked so `finishSinkCall` wakes a re-entrant waiter when
+    /// another callback finishes, and two re-entrant callers do not deadlock.
+    sink_reentrant_waiters: usize = 0,
     respawn_listener: ?RespawnListener = null,
     respawn_gates: std.ArrayList(RespawnGate) = .empty,
     sessions: std.ArrayList(*Session) = .empty,
@@ -630,7 +634,7 @@ pub const Manager = struct {
             for (session.windows.items) |window| {
                 for (window.panes.items) |pane| {
                     result.panes += 1;
-                    if (pane.native.state() != .terminated) result.live_panes += 1;
+                    if (pane.native.finalizedExitInfo() == null) result.live_panes += 1;
                 }
             }
         }
@@ -822,7 +826,7 @@ pub const Manager = struct {
             // Like every pane target: a pane id, or a session id or name
             // standing for that session's active pane.
             const pane = (self.resolveTargetPaneLocked(pane_id) orelse return error.PaneNotFound).pane;
-            if (!opts.kill and pane.native.isRunning()) return error.PaneRunning;
+            if (!opts.kill and pane.native.finalizedExitInfo() == null) return error.PaneRunning;
             const generation = pane.native.generation() + 1;
             const sink = self.nativeSinkLocked();
             if (sink != null) {
@@ -894,7 +898,7 @@ pub const Manager = struct {
         };
 
         const client = try self.attachClientLocked(found, rows, cols);
-        const exit = found.pane.native.exitInfo();
+        const exit = found.pane.native.finalizedExitInfo();
         return .{
             .client = client,
             .created = created,
@@ -1428,8 +1432,19 @@ pub const Manager = struct {
         // Outside the manager mutex: a running callback may be waiting for it.
         self.sink_mutex.lockUncancelable(self.io);
         defer self.sink_mutex.unlock(self.io);
-        const own: usize = if (sink_callback_manager == self) 1 else 0;
-        while (self.sink_in_flight > own) self.sink_idle.waitUncancelable(self.io, &self.sink_mutex);
+        const reentrant = sink_callback_manager == self;
+        if (reentrant) {
+            self.sink_reentrant_waiters += 1;
+            if (self.sink_in_flight <= self.sink_reentrant_waiters) {
+                self.sink_idle.broadcast(self.io);
+            }
+        }
+        defer if (reentrant) {
+            self.sink_reentrant_waiters -= 1;
+        };
+        while (self.sink_in_flight > (if (reentrant) self.sink_reentrant_waiters else 0)) {
+            self.sink_idle.waitUncancelable(self.io, &self.sink_mutex);
+        }
     }
 
     /// The sink natives get: the manager trampoline when a sink is set.
@@ -1468,7 +1483,9 @@ pub const Manager = struct {
         self.sink_mutex.lockUncancelable(self.io);
         defer self.sink_mutex.unlock(self.io);
         self.sink_in_flight -= 1;
-        if (self.sink_in_flight == 0) self.sink_idle.broadcast(self.io);
+        if (self.sink_in_flight == 0 or self.sink_in_flight <= self.sink_reentrant_waiters) {
+            self.sink_idle.broadcast(self.io);
+        }
     }
 
     fn announceRespawn(self: *Manager, native: *NativeSession) void {

@@ -3028,17 +3028,33 @@ test "real_zmuxd_creates_private_dir_0700" {
 
 test "foreign_tmp_fallback_refused" {
     if (builtin.os.tag != .linux or sys.geteuid() != 0) return error.SkipZigTest;
+    // Copy `zmuxd` into a world-traversable `/tmp` directory so UID 65534 can
+    // exec it even when the build cache lives under a private `$HOME`/`$RUNNER_TEMP`.
+    const bin_dir = try TestDir.init();
+    defer bin_dir.deinit();
+    const bin_dir_z = try test_allocator.dupeSentinel(u8, bin_dir.path, 0);
+    defer test_allocator.free(bin_dir_z);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(bin_dir_z.ptr, 0o755));
+    const zmuxd_copy = try std.fs.path.join(test_allocator, &.{ bin_dir.path, "zmuxd" });
+    defer test_allocator.free(zmuxd_copy);
+    const zmuxd_copy_z = try test_allocator.dupeSentinel(u8, zmuxd_copy, 0);
+    defer test_allocator.free(zmuxd_copy_z);
+    const cwd = std.Io.Dir.cwd();
+    try cwd.copyFile(build_options.zmuxd_path, cwd, zmuxd_copy, io, .{});
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(zmuxd_copy_z.ptr, 0o755));
+
     const fallback = "/tmp/zmux-65534";
     sys.mkdir(fallback, 0o700) catch |err| switch (err) {
         error.PathAlreadyExists => return error.SkipZigTest,
         else => return err,
     };
-    defer std.Io.Dir.cwd().deleteTree(io, fallback) catch {};
+    defer cwd.deleteTree(io, fallback) catch {};
     try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(fallback, 0o777));
     var env = std.process.Environ.Map.init(test_allocator);
     defer env.deinit();
     var daemon = try std.process.spawn(io, .{
-        .argv = &.{build_options.zmuxd_path},
+        .argv = &.{zmuxd_copy},
+        .cwd = .{ .path = "/tmp" },
         .environ_map = &env,
         .uid = 65534,
         .gid = 65534,
