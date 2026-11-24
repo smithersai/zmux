@@ -3030,17 +3030,33 @@ test "real_zmuxd_creates_private_dir_0700" {
 
 test "foreign_tmp_fallback_refused" {
     if (builtin.os.tag != .linux or sys.geteuid() != 0) return error.SkipZigTest;
+    // Copy `zmuxd` into a world-traversable `/tmp` directory so UID 65534 can
+    // exec it even when the build cache lives under a private `$HOME`/`$RUNNER_TEMP`.
+    const bin_dir = try TestDir.init();
+    defer bin_dir.deinit();
+    const bin_dir_z = try test_allocator.dupeSentinel(u8, bin_dir.path, 0);
+    defer test_allocator.free(bin_dir_z);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(bin_dir_z.ptr, 0o755));
+    const zmuxd_copy = try std.fs.path.join(test_allocator, &.{ bin_dir.path, "zmuxd" });
+    defer test_allocator.free(zmuxd_copy);
+    const zmuxd_copy_z = try test_allocator.dupeSentinel(u8, zmuxd_copy, 0);
+    defer test_allocator.free(zmuxd_copy_z);
+    const cwd = std.Io.Dir.cwd();
+    try cwd.copyFile(build_options.zmuxd_path, cwd, zmuxd_copy, io, .{});
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(zmuxd_copy_z.ptr, 0o755));
+
     const fallback = "/tmp/zmux-65534";
     sys.mkdir(fallback, 0o700) catch |err| switch (err) {
         error.PathAlreadyExists => return error.SkipZigTest,
         else => return err,
     };
-    defer std.Io.Dir.cwd().deleteTree(io, fallback) catch {};
+    defer cwd.deleteTree(io, fallback) catch {};
     try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(fallback, 0o777));
     var env = std.process.Environ.Map.init(test_allocator);
     defer env.deinit();
     var daemon = try std.process.spawn(io, .{
-        .argv = &.{build_options.zmuxd_path},
+        .argv = &.{zmuxd_copy},
+        .cwd = .{ .path = "/tmp" },
         .environ_map = &env,
         .uid = 65534,
         .gid = 65534,
@@ -3271,14 +3287,29 @@ test "symlinked_log_not_followed, FIFO and non-socket rejected" {
 test "overlong socket path fails before spawning" {
     var path: [201]u8 = @splat('x');
     path[0] = '/';
-    var child = try std.process.spawn(io, .{
-        .argv = &.{ build_options.zmux_connect_path, "--socket", &path, "--spawn-daemon", "work" },
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .ignore,
-    });
-    defer killChild(&child);
-    try expectTermExited(try waitChild(&child, 2_000), 2);
+    var env = std.process.Environ.Map.init(test_allocator);
+    defer env.deinit();
+    try env.put("ZMUX_SOCKET", "");
+    try env.put("SMITHERS_SESSION_SOCKET", &path);
+    const expected = try std.fmt.allocPrint(test_allocator, "socket path too long ({d} > {d})", .{ path.len, sys.max_unix_path_len });
+    defer test_allocator.free(expected);
+
+    const cases = [_][]const []const u8{
+        &.{ build_options.zmux_connect_path, "--socket", &path, "--spawn-daemon", "work" },
+        &.{ build_options.zmux_connect_path, "--spawn-daemon", "work" },
+    };
+    for (cases) |argv| {
+        const result = try std.process.run(test_allocator, io, .{
+            .argv = argv,
+            .environ_map = &env,
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        defer test_allocator.free(result.stdout);
+        defer test_allocator.free(result.stderr);
+        try expectTermExited(result.term, 2);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, expected) != null);
+    }
 }
 
 test "three_concurrent_starters_one_daemon and concurrent_open_or_create_single_session" {
@@ -3430,7 +3461,19 @@ test "piped input reaches the pane through POLLHUP" {
     try endDaemon(&daemon, dir.socket);
 }
 
-test "prebuffered_exit_notification_handled" {
+fn acceptAttachHandshake(conn: *Connection) !void {
+    const ping = try conn.read(test_allocator, max_reply, nowMs() + 2_000);
+    defer test_allocator.free(ping);
+    try std.testing.expect(lineMatchesRpcId(test_allocator, ping, 100));
+    const ping_reply = try std.fmt.allocPrint(test_allocator, "{{\"id\":100,\"result\":{{\"version\":\"{s}\"}}}}\n", .{zmux.protocol.version});
+    defer test_allocator.free(ping_reply);
+    try writeAll(conn.fd, ping_reply);
+    const attach = try conn.read(test_allocator, max_reply, nowMs() + 2_000);
+    defer test_allocator.free(attach);
+    try std.testing.expect(lineMatchesRpcId(test_allocator, attach, 1));
+}
+
+test "prebuffered exit before the attach reply is handled" {
     const dir = try TestDir.init();
     defer dir.deinit();
     const listener = try sys.unixStreamSocket();
@@ -3456,20 +3499,14 @@ test "prebuffered_exit_notification_handled" {
     try std.testing.expect(try posix.poll(&pollfds, 2_000) != 0);
     var conn: Connection = .{ .fd = try sys.accept(listener) };
     defer conn.close();
-    const ping = try conn.read(test_allocator, max_reply, nowMs() + 2_000);
-    defer test_allocator.free(ping);
-    try std.testing.expect(lineMatchesRpcId(test_allocator, ping, 100));
-    const ping_reply = try std.fmt.allocPrint(test_allocator, "{{\"id\":100,\"result\":{{\"version\":\"{s}\"}}}}\n", .{zmux.protocol.version});
-    defer test_allocator.free(ping_reply);
-    try writeAll(conn.fd, ping_reply);
-    const attach = try conn.read(test_allocator, max_reply, nowMs() + 2_000);
-    defer test_allocator.free(attach);
-    try std.testing.expect(lineMatchesRpcId(test_allocator, attach, 1));
+    try acceptAttachHandshake(&conn);
 
-    // Replay ends two bytes into the first live frame. It must appear once.
-    try writeAll(conn.fd, "{\"id\":1,\"result\":{\"paneId\":\"p\",\"clientId\":\"c\",\"replayBase64\" : \"YWI=\",\"replayEndOffset\":2,\"generation\":0}}\n" ++
-        "{\"method\":\"pane_output\",\"params\":{\"pane_id\":\"p\",\"data_base64\":\"YWJjZA==\",\"offset\":0,\"generation\":0}}\n" ++
-        "{\"method\":\"session_exited\",\"params\":{\"session_id\":\"p\",\"generation\":0}}\n");
+    // Replay ends two bytes into the first live frame. A drop from the
+    // previous generation must not suppress the non-overlapping bytes.
+    try writeAll(conn.fd, "{\"method\":\"pane_output_dropped\",\"params\":{\"pane_id\":\"p\",\"resume_offset\":100,\"generation\":0}}\n" ++
+        "{\"method\":\"pane_output\",\"params\":{\"pane_id\":\"p\",\"data_base64\":\"YWJjZA==\",\"offset\":0,\"generation\":1}}\n" ++
+        "{\"method\":\"session_exited\",\"params\":{\"session_id\":\"p\",\"generation\":1}}\n" ++
+        "{\"id\":1,\"result\":{\"paneId\":\"p\",\"clientId\":\"c\",\"replayBase64\":\"YWI=\",\"replayEndOffset\":2,\"generation\":1}}\n");
     try expectTermExited(try waitChild(&child, 1_500), 0);
     const bytes = try directory.readFileAlloc(io, "stdout", test_allocator, .limited(128));
     defer test_allocator.free(bytes);
@@ -3530,6 +3567,45 @@ test "exit_tail_output_not_lost and attach_replay_no_gap_no_dup" {
     try endDaemon(&daemon, dir.socket);
 }
 
+/// Read `conn` at about 20 KiB/s until one line contains both needles, then
+/// consume the rest of the line in progress so the connection's own reader
+/// resumes on a frame boundary.
+fn slowReadUntilLine(conn: *Connection, needle_a: []const u8, needle_b: []const u8, timeout_ms: i64) !void {
+    try std.testing.expectEqual(conn.reader.start, conn.reader.end);
+    const deadline = nowMs() + timeout_ms;
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(test_allocator);
+    var found = false;
+    var chunk: [1024]u8 = undefined;
+    while (true) {
+        if (found and pending.items.len == 0) return;
+        if (nowMs() >= deadline) return error.NotificationTimeout;
+        var fds = [_]posix.pollfd{.{ .fd = conn.fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&fds, 50) == 0) continue;
+        const n = try posix.read(conn.fd, chunk[0..if (found) 1 else chunk.len]);
+        if (n == 0) return error.EndOfStream;
+        try pending.appendSlice(test_allocator, chunk[0..n]);
+        while (std.mem.indexOfScalar(u8, pending.items, '\n')) |end| {
+            const line = pending.items[0..end];
+            if (std.mem.indexOf(u8, line, needle_a) != null and std.mem.indexOf(u8, line, needle_b) != null) found = true;
+            try pending.replaceRange(test_allocator, 0, end + 1, &.{});
+        }
+        if (!found) sleepMs(50);
+    }
+}
+
+/// Read and discard lines from `conn` for `ms` milliseconds.
+fn drainLinesFor(conn: *Connection, ms: i64) !void {
+    const deadline = nowMs() + ms;
+    while (true) {
+        const line = conn.read(test_allocator, 1024 * 1024, deadline) catch |err| switch (err) {
+            error.ReadTimeout => return,
+            else => return err,
+        };
+        test_allocator.free(line);
+    }
+}
+
 test "flood_does_not_disconnect_slow_client or an attached quiet pane client" {
     const dir = try TestDir.init();
     defer dir.deinit();
@@ -3562,7 +3638,25 @@ test "flood_does_not_disconnect_slow_client or an attached quiet pane client" {
     });
     defer flood.deinit();
     const flood_id = try expectStringField(try responseResult(flood.value), "paneId");
-    test_allocator.free(try waitForCaptureContains(test_allocator, dir.socket, flood_id, "FLOOD_DONE", 5_000));
+
+    // The slow client reads a trickle (about 20 KiB/s) until its queue has
+    // crossed the high-water mark and the drop notice reaches it. A trickle
+    // rather than no reads at all: a client that leaves one frame unread past
+    // the server's send deadline is disconnected by design, and how long the
+    // flood needs to overflow the queue depends on PTY throughput (a busy
+    // Darwin PTY delivers tens of bytes a read).
+    try slowReadUntilLine(&slow, "\"pane_output_dropped\"", flood_id, 60_000);
+
+    // From here the client keeps up while the rest of the flood arrives. The
+    // bound is for liveness only; a loaded machine needs tens of seconds.
+    const flood_deadline = nowMs() + 120_000;
+    while (true) {
+        const text = try captureSessionText(test_allocator, dir.socket, flood_id);
+        defer test_allocator.free(text);
+        if (std.mem.indexOf(u8, text, "FLOOD_DONE") != null) break;
+        if (nowMs() >= flood_deadline) return error.CaptureTimeout;
+        try drainLinesFor(&slow, 50);
+    }
     (try rpcOk(&admin, 5, "session.send", .{ .sessionId = quiet_id, .text = "\n" })).deinit();
 
     const deadline = nowMs() + 4_000;
@@ -3581,8 +3675,6 @@ test "flood_does_not_disconnect_slow_client or an attached quiet pane client" {
         defer test_allocator.free(chunk);
         try tail.appendSlice(test_allocator, chunk);
     }
-    const dropped = try readNotificationLine(test_allocator, &slow, "pane_output_dropped", flood_id, 4_000);
-    defer test_allocator.free(dropped);
     (try rpcOk(&slow, 6, "daemon.ping", .{})).deinit();
     (try rpcOk(&live, 7, "daemon.ping", .{})).deinit();
     try endDaemon(&daemon, dir.socket);
@@ -3760,6 +3852,18 @@ fn waitForRawMode(fd: posix.fd_t) !posix.termios {
     return error.RawModeTimeout;
 }
 
+/// Compare terminal settings, ignoring `PENDIN`. That bit is kernel state,
+/// not a setting: Darwin sets it itself whenever a `tcsetattr` switches the
+/// line discipline back to canonical mode (to reprocess pending input) and
+/// clears it on the next read, so a faithful restore still reads it back set.
+fn expectTermiosRestored(expected: posix.termios, actual: posix.termios) !void {
+    var want = expected;
+    var got = actual;
+    want.lflag.PENDIN = false;
+    got.lflag.PENDIN = false;
+    try std.testing.expectEqualDeep(want, got);
+}
+
 test "client restores inherited terminal on TSTP and TERM, and re-enters raw on CONT" {
     const dir = try TestDir.init();
     defer dir.deinit();
@@ -3842,19 +3946,6 @@ test "client restores inherited terminal on TSTP and TERM, and re-enters raw on 
     try expectTermiosRestored(original, try posix.tcgetattr(slave));
 }
 
-/// Compare termios ignoring PENDIN, which the kernel owns. XNU's TIOCSETA
-/// sets PENDIN on every non-canonical to canonical switch and ORs the
-/// current PENDIN back into c_lflag, so no caller can set or clear it; the
-/// next read(2) clears it (bsd/kern/tty.c: ttioctl_locked, ttread). Linux
-/// never sets it.
-fn expectTermiosRestored(expected: posix.termios, actual: posix.termios) !void {
-    var want = expected;
-    var got = actual;
-    want.lflag.PENDIN = false;
-    got.lflag.PENDIN = false;
-    try std.testing.expectEqualDeep(want, got);
-}
-
 test "auto-spawn keeps daemon startup logs when stderr is closed" {
     const dir = try TestDir.init();
     defer dir.deinit();
@@ -3888,4 +3979,112 @@ test "daemon preserves a regular file at the socket path" {
     defer killChild(&daemon);
     try expectTermExited(try waitChild(&daemon, 3_000), 1);
     try std.testing.expect(try fileContains(dir, "zmux.sock", "keep"));
+}
+
+fn shutdownAutoSpawned(path: []const u8) void {
+    const reply = rpcLine(test_allocator, path, "{\"id\":1,\"method\":\"daemon.shutdown\"}\n", max_reply) catch return;
+    test_allocator.free(reply);
+}
+
+test "auto-spawn accepts an explicit socket directly under /tmp" {
+    const generated = try tempSocketPath(test_allocator);
+    defer test_allocator.free(generated);
+    const path = try std.fs.path.join(test_allocator, &.{ "/tmp", std.fs.path.basename(generated) });
+    defer test_allocator.free(path);
+    const log = try std.fmt.allocPrint(test_allocator, "{s}.log", .{path});
+    defer test_allocator.free(log);
+    const lock = try std.fmt.allocPrint(test_allocator, "{s}.lock", .{path});
+    defer test_allocator.free(lock);
+    defer std.Io.Dir.deleteFileAbsolute(io, log) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, lock) catch {};
+    defer shutdownAutoSpawned(path);
+
+    // Existing logs may have been created with a looser mode.
+    const log_fd = try sys.open(log, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o600);
+    defer sys.close(log_fd);
+    try sys.fchmod(log_fd, 0o644);
+
+    var client = try std.process.spawn(io, .{
+        .argv = &.{ build_options.zmux_connect_path, "--socket", path, "--spawn-daemon", "work", "--command", "cat" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .inherit,
+    });
+    defer killChild(&client);
+    try expectTermExited(try waitChild(&client, 8_000), 0);
+    try std.testing.expectEqual(@as(u32, 0o600), (try sys.statAt(sys.cwd_fd, log, false)).permissions());
+}
+
+test "auto-spawn upgrades a legacy 0755 managed directory" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+    const parent = try std.fs.path.join(test_allocator, &.{ dir.path, ".smithers" });
+    defer test_allocator.free(parent);
+    const path = try std.fs.path.join(test_allocator, &.{ parent, "sessions.sock" });
+    defer test_allocator.free(path);
+    try sys.mkdir(parent, 0o755);
+    const fd = try sys.openDirNoFollow(parent);
+    defer sys.close(fd);
+    try sys.fchmod(fd, 0o755);
+    defer shutdownAutoSpawned(path);
+    var env = std.process.Environ.Map.init(test_allocator);
+    defer env.deinit();
+    try env.put("HOME", dir.path);
+    var client = try std.process.spawn(io, .{
+        .argv = &.{ build_options.zmux_connect_path, "--spawn-daemon", "work", "--command", "cat" },
+        .environ_map = &env,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .inherit,
+    });
+    defer killChild(&client);
+    try expectTermExited(try waitChild(&client, 8_000), 0);
+    try std.testing.expectEqual(@as(u32, 0o700), (try sys.fstat(fd)).permissions());
+}
+
+test "piped send waits for a delayed daemon error even after session exit" {
+    const dir = try TestDir.init();
+    defer dir.deinit();
+    const listener = try sys.unixStreamSocket();
+    defer sys.close(listener);
+    const address = try sys.UnixAddress.init(dir.socket);
+    try sys.bind(listener, &address);
+    try sys.listen(listener, 1);
+    const directory = try std.Io.Dir.openDirAbsolute(io, dir.path, .{});
+    defer directory.close(io);
+    const stderr = try directory.createFile(io, "stderr", .{});
+    defer stderr.close(io);
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ build_options.zmux_connect_path, "--socket", dir.socket, "attach", "work" },
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .{ .file = stderr },
+    });
+    defer killChild(&child);
+    try child.stdin.?.writeStreamingAll(io, "input");
+    child.stdin.?.close(io);
+    child.stdin = null;
+
+    var pollfds = [_]posix.pollfd{.{ .fd = listener, .events = posix.POLL.IN, .revents = 0 }};
+    try std.testing.expect(try posix.poll(&pollfds, 2_000) != 0);
+    var conn: Connection = .{ .fd = try sys.accept(listener) };
+    defer conn.close();
+    try acceptAttachHandshake(&conn);
+    try writeAll(conn.fd, "{\"id\":1,\"result\":{\"paneId\":\"p\",\"clientId\":\"c\",\"generation\":1}}\n");
+
+    const send_id = while (true) {
+        const line = try conn.read(test_allocator, max_reply, nowMs() + 2_000);
+        defer test_allocator.free(line);
+        const parsed = try std.json.parseFromSlice(std.json.Value, test_allocator, line, .{});
+        defer parsed.deinit();
+        const method = parsed.value.object.get("method").?.string;
+        if (std.mem.eql(u8, method, "session.send")) break try expectIntegerField(parsed.value, "id");
+    };
+    sleepMs(2_200);
+    try writeAll(conn.fd, "{\"method\":\"session_exited\",\"params\":{\"session_id\":\"p\",\"generation\":1}}\n");
+    const failure = try std.fmt.allocPrint(test_allocator, "{{\"id\":{d},\"error\":{{\"code\":-32000,\"message\":\"InputClosed\",\"data\":{{\"kind\":\"io\"}}}}}}\n", .{send_id});
+    defer test_allocator.free(failure);
+    try writeAll(conn.fd, failure);
+    try expectTermExited(try waitChild(&child, 2_000), 1);
+    try std.testing.expect(try fileContains(dir, "stderr", "InputClosed"));
 }

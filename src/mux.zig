@@ -349,7 +349,14 @@ pub const Pane = struct {
 
     /// Tears down the native. Never call this with the manager mutex held: the
     /// reader thread may be blocked in the event sink waiting for that mutex.
+    ///
+    /// The sink is cleared first, waiting for an in-flight callback, so a
+    /// public handle that outlives the pane can never call into the sink's
+    /// context after removal (the reader may still drain final output).
     pub fn deinit(self: *Pane, allocator: Allocator) void {
+        // `setEventSink(null)` waits for in-flight callbacks except on the
+        // native's own reader thread, where waiting would wait for itself.
+        self.native.setEventSink(null);
         self.native.stopForOwnerRelease();
         self.native.destroy();
         self.spawn.deinit(allocator);
@@ -558,14 +565,64 @@ const CommandScanner = struct {
     }
 };
 
+/// Called once per respawn, after the old generation is quiesced and before
+/// the new generation can deliver any event, from every respawn path (RPC,
+/// `executeCommandLine`, `executeBinding`).
+pub const RespawnListener = struct {
+    context: *anyopaque,
+    notify: *const fn (context: *anyopaque, native: *NativeSession) void,
+};
+
+/// A respawned generation whose events wait until its announcement is out.
+const RespawnGate = struct {
+    pane_id: []u8,
+    generation: u64,
+};
+
+/// Manager whose sink the current thread is running inside, so a clear from
+/// inside a callback does not wait for itself.
+threadlocal var sink_callback_manager: ?*const Manager = null;
+
+/// Pane id and generation of an event, for respawn gating. Null for events
+/// that carry no generation.
+fn eventGateKey(event: native_mod.Event) ?struct { pane_id: []const u8, generation: u64 } {
+    return switch (event) {
+        .foreground_changed => null,
+        .session_exited => |params| .{ .pane_id = params.session_id, .generation = params.generation },
+        .pane_output => |params| .{ .pane_id = params.pane_id, .generation = params.generation },
+        .pane_activity => |params| .{ .pane_id = params.pane_id, .generation = params.generation },
+        .pane_bell => |params| .{ .pane_id = params.pane_id, .generation = params.generation },
+    };
+}
+
 pub const Manager = struct {
     allocator: Allocator,
     /// Shared with every spawned `NativeSession`; supplies mutexes, clocks,
     /// and sleeps.
     io: std.Io,
     /// Use `setEventSink`/`clearEventSinks`; they also update existing panes.
+    /// Natives never call this sink directly: they call `emitThroughManager`,
+    /// which counts the callback in `sink_in_flight`. Written holding both
+    /// `mutex` and `sink_mutex`; read under either.
     event_sink: ?native_mod.EventSink = null,
     mutex: std.Io.Mutex = .init,
+    /// Guards `event_sink` writes, `respawn_listener`, `sink_in_flight`, and
+    /// `respawn_gates`. Lock order: `mutex` before `sink_mutex`.
+    sink_mutex: std.Io.Mutex = .init,
+    /// Broadcast when `sink_in_flight` reaches zero.
+    sink_idle: std.Io.Condition = .init,
+    /// Broadcast when a respawn gate lifts.
+    gate_changed: std.Io.Condition = .init,
+    /// Callbacks into `event_sink` or `respawn_listener` currently running or
+    /// waiting on a respawn gate, from every native, attached or not.
+    /// `clearEventSinks` waits for zero without allocating.
+    sink_in_flight: usize = 0,
+    /// Re-entrant `clearEventSinks` calls currently waiting inside a sink
+    /// callback. Tracked so `finishSinkCall` wakes a re-entrant waiter when
+    /// another callback finishes, and two re-entrant callers do not deadlock.
+    sink_reentrant_waiters: usize = 0,
+    respawn_listener: ?RespawnListener = null,
+    respawn_gates: std.ArrayList(RespawnGate) = .empty,
     sessions: std.ArrayList(*Session) = .empty,
     clients: std.ArrayList(*Client) = .empty,
     /// Index over every pane in `sessions`. Keys borrow `Pane.id`; an entry
@@ -601,6 +658,8 @@ pub const Manager = struct {
         self.key_bindings.deinit(self.allocator);
         for (self.detached_clients.items) |item| self.allocator.free(item.client_id);
         self.detached_clients.deinit(self.allocator);
+        for (self.respawn_gates.items) |gate| self.allocator.free(gate.pane_id);
+        self.respawn_gates.deinit(self.allocator);
     }
 
     /// Live panes (native not terminated).
@@ -625,7 +684,7 @@ pub const Manager = struct {
             for (session.windows.items) |window| {
                 for (window.panes.items) |pane| {
                     result.panes += 1;
-                    if (pane.native.state() != .terminated) result.live_panes += 1;
+                    if (pane.native.finalizedExitInfo() == null) result.live_panes += 1;
                 }
             }
         }
@@ -807,22 +866,38 @@ pub const Manager = struct {
     /// at the current geometry, with the next generation. Fails with
     /// `PaneRunning` when the current child is running and `opts.kill` is
     /// false. A failed spawn leaves the old native in place, untouched.
+    ///
+    /// Event order is fixed for every caller: callbacks of the old generation
+    /// stop and drain, then `respawn_listener` announces the new generation,
+    /// and only then can the new generation's events reach the sink.
     pub fn respawnPane(self: *Manager, pane_id: []const u8, opts: RespawnOptions) !*NativeSession {
         var old_native: *NativeSession = undefined;
         var new_native: *NativeSession = undefined;
+        var gated = false;
         {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             // Like every pane target: a pane id, or a session id or name
             // standing for that session's active pane.
             const pane = (self.resolveTargetPaneLocked(pane_id) orelse return error.PaneNotFound).pane;
-            if (!opts.kill and pane.native.isRunning()) return error.PaneRunning;
-            var native_opts = pane.spawn.nativeOptions(pane.id, self.event_sink);
+            if (!opts.kill and pane.native.finalizedExitInfo() == null) return error.PaneRunning;
+            const generation = pane.native.generation() + 1;
+            const sink = self.nativeSinkLocked();
+            if (sink != null) {
+                // Before the spawn: the new reader may emit at once.
+                try self.addRespawnGate(pane.id, generation);
+                gated = true;
+            }
+            errdefer if (gated) self.liftRespawnGate(pane.id, generation);
+            var native_opts = pane.spawn.nativeOptions(pane.id, sink);
             native_opts.title = pane.title;
-            native_opts.generation = pane.native.generation() + 1;
+            native_opts.generation = generation;
             new_native = try NativeSession.create(self.allocator, self.io, native_opts);
             self.spawn_count += 1;
             old_native = pane.native;
+            // No old-generation callback starts once the swap is visible.
+            // Does not wait, so it is safe under the manager mutex.
+            old_native.dropEventSink();
             pane.native = new_native;
             // Reset once, at swap time. A later markExited for the new
             // generation must survive the old native's teardown below.
@@ -832,8 +907,11 @@ pub const Manager = struct {
 
         // Outside the mutex: clearEventSink waits for an in-flight emit, and
         // the sink may itself wait for the manager mutex. Clearing first means
-        // no session_exited for the old generation reaches the sink.
+        // no session_exited for the old generation reaches the sink, and no
+        // old event follows the announcement.
         old_native.clearEventSink();
+        self.announceRespawn(new_native);
+        if (gated) self.liftRespawnGate(new_native.id, new_native.generation());
         old_native.stopForOwnerRelease();
         old_native.destroy();
         return new_native;
@@ -874,7 +952,7 @@ pub const Manager = struct {
         };
 
         const client = try self.attachClientLocked(found, rows, cols);
-        const exit = found.pane.native.exitInfo();
+        const exit = found.pane.native.finalizedExitInfo();
         return .{
             .client = client,
             .created = created,
@@ -1338,6 +1416,27 @@ pub const Manager = struct {
         pane.alerts.exited = true;
     }
 
+    /// `markExited` that reports whether the event is current. False only when
+    /// the pane exists and runs another generation: the event is stale and
+    /// must not be broadcast. An unknown pane (removed, or never a pane) is
+    /// not stale.
+    pub fn markExitedIfCurrent(self: *Manager, pane_id: []const u8, generation: u64) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const pane = self.findPaneLocked(pane_id) orelse return true;
+        if (pane.native.generation() != generation) return false;
+        pane.alerts.exited = true;
+        return true;
+    }
+
+    /// False only when `pane_id` exists and runs another generation.
+    pub fn isCurrentGeneration(self: *Manager, pane_id: []const u8, generation: u64) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const pane = self.findPaneLocked(pane_id) orelse return true;
+        return pane.native.generation() == generation;
+    }
+
     /// `native.stopInput` on every pane: wakes writers blocked on a full PTY.
     pub fn interruptInput(self: *Manager) void {
         self.mutex.lockUncancelable(self.io);
@@ -1351,47 +1450,159 @@ pub const Manager = struct {
 
     /// Set the manager sink and apply it to every existing native, so panes
     /// created before the server starts also report events.
-    /// A null `sink` is `clearEventSinks`.
+    /// A null `sink` is `clearEventSinks`. The manager must not move while a
+    /// sink is installed: natives hold its address.
     pub fn setEventSink(self: *Manager, sink: ?native_mod.EventSink) void {
-        // Removing a sink waits for in-flight emits, which must not happen
-        // under the manager mutex.
         if (sink == null) return self.clearEventSinks();
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.event_sink = sink;
+        {
+            self.sink_mutex.lockUncancelable(self.io);
+            defer self.sink_mutex.unlock(self.io);
+            self.event_sink = sink;
+        }
+        const trampoline = self.nativeSinkLocked();
         for (self.sessions.items) |session| {
             for (session.windows.items) |window| {
-                for (window.panes.items) |pane| pane.native.setEventSink(sink);
+                for (window.panes.items) |pane| pane.native.setEventSink(trampoline);
             }
         }
     }
 
-    /// Null the manager sink, then `native.clearEventSink` on every pane.
-    /// The per-native clears run outside the manager mutex because each one
-    /// waits for an in-flight emit, which may itself wait for that mutex.
-    /// After return, no sink call is running or will start.
+    /// Install (or with null, remove) the respawn announcement hook. Cleared
+    /// by `clearEventSinks`, which also waits for a running announcement.
+    pub fn setRespawnListener(self: *Manager, listener: ?RespawnListener) void {
+        self.sink_mutex.lockUncancelable(self.io);
+        defer self.sink_mutex.unlock(self.io);
+        self.respawn_listener = listener;
+    }
+
+    /// Null the manager sink and the respawn listener, stop every attached
+    /// native from starting a callback, then wait until no callback into the
+    /// sink or listener is running, from any native: attached, removed but
+    /// still draining, or replaced by a respawn. Never allocates, so the
+    /// barrier holds under memory exhaustion. After return the sink's
+    /// context may be freed. From inside a sink callback it waits for every
+    /// callback but the caller's own.
     pub fn clearEventSinks(self: *Manager) void {
-        self.mutex.lockUncancelable(self.io);
-        self.event_sink = null;
-        const natives = self.retainAllNativesLocked() catch {
-            // No memory for the list: null each sink in place.
-            // dropEventSink does not wait for an in-flight emit, so this
-            // cannot deadlock, but an emit already running may still finish
-            // after return.
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            {
+                self.sink_mutex.lockUncancelable(self.io);
+                defer self.sink_mutex.unlock(self.io);
+                self.event_sink = null;
+                self.respawn_listener = null;
+            }
+            // dropEventSink does not wait, so it is safe under the mutex.
             for (self.sessions.items) |session| {
                 for (session.windows.items) |window| {
                     for (window.panes.items) |pane| pane.native.dropEventSink();
                 }
             }
-            self.mutex.unlock(self.io);
-            return;
-        };
-        self.mutex.unlock(self.io);
-        defer self.allocator.free(natives);
-        for (natives) |native| {
-            native.clearEventSink();
-            native.release();
         }
+        // Outside the manager mutex: a running callback may be waiting for it.
+        self.sink_mutex.lockUncancelable(self.io);
+        defer self.sink_mutex.unlock(self.io);
+        const reentrant = sink_callback_manager == self;
+        if (reentrant) {
+            self.sink_reentrant_waiters += 1;
+            if (self.sink_in_flight <= self.sink_reentrant_waiters) {
+                self.sink_idle.broadcast(self.io);
+            }
+        }
+        defer if (reentrant) {
+            self.sink_reentrant_waiters -= 1;
+        };
+        while (self.sink_in_flight > (if (reentrant) self.sink_reentrant_waiters else 0)) {
+            self.sink_idle.waitUncancelable(self.io, &self.sink_mutex);
+        }
+    }
+
+    /// The sink natives get: the manager trampoline when a sink is set.
+    fn nativeSinkLocked(self: *Manager) ?native_mod.EventSink {
+        if (self.event_sink == null) return null;
+        return .{ .context = self, .emit = emitThroughManager };
+    }
+
+    /// Every native event passes through here, so `clearEventSinks` can
+    /// count and wait for callbacks from natives it can no longer reach.
+    fn emitThroughManager(context: *anyopaque, event: native_mod.Event) void {
+        const self: *Manager = @ptrCast(@alignCast(context));
+        const key = eventGateKey(event);
+        self.sink_mutex.lockUncancelable(self.io);
+        // Counted before waiting on a gate: a clear must also wait for a
+        // callback that is parked here.
+        self.sink_in_flight += 1;
+        if (key) |k| {
+            while (self.isGatedLocked(k.pane_id, k.generation)) {
+                self.gate_changed.waitUncancelable(self.io, &self.sink_mutex);
+            }
+        }
+        const sink = self.event_sink;
+        self.sink_mutex.unlock(self.io);
+
+        if (sink) |active| {
+            const previous = sink_callback_manager;
+            sink_callback_manager = self;
+            active.emit(active.context, event);
+            sink_callback_manager = previous;
+        }
+        self.finishSinkCall();
+    }
+
+    fn finishSinkCall(self: *Manager) void {
+        self.sink_mutex.lockUncancelable(self.io);
+        defer self.sink_mutex.unlock(self.io);
+        self.sink_in_flight -= 1;
+        if (self.sink_in_flight == 0 or self.sink_in_flight <= self.sink_reentrant_waiters) {
+            self.sink_idle.broadcast(self.io);
+        }
+    }
+
+    fn announceRespawn(self: *Manager, native: *NativeSession) void {
+        const listener = blk: {
+            self.sink_mutex.lockUncancelable(self.io);
+            defer self.sink_mutex.unlock(self.io);
+            const listener = self.respawn_listener orelse return;
+            self.sink_in_flight += 1;
+            break :blk listener;
+        };
+        defer self.finishSinkCall();
+        const previous = sink_callback_manager;
+        sink_callback_manager = self;
+        defer sink_callback_manager = previous;
+        listener.notify(listener.context, native);
+    }
+
+    /// Caller holds `mutex`. Allocates before the spawn so a failure changes
+    /// nothing.
+    fn addRespawnGate(self: *Manager, pane_id: []const u8, generation: u64) !void {
+        const owned = try self.allocator.dupe(u8, pane_id);
+        errdefer self.allocator.free(owned);
+        self.sink_mutex.lockUncancelable(self.io);
+        defer self.sink_mutex.unlock(self.io);
+        try self.respawn_gates.append(self.allocator, .{ .pane_id = owned, .generation = generation });
+    }
+
+    fn liftRespawnGate(self: *Manager, pane_id: []const u8, generation: u64) void {
+        self.sink_mutex.lockUncancelable(self.io);
+        defer self.sink_mutex.unlock(self.io);
+        for (self.respawn_gates.items, 0..) |gate, index| {
+            if (gate.generation == generation and std.mem.eql(u8, gate.pane_id, pane_id)) {
+                const removed = self.respawn_gates.swapRemove(index);
+                self.allocator.free(removed.pane_id);
+                break;
+            }
+        }
+        self.gate_changed.broadcast(self.io);
+    }
+
+    fn isGatedLocked(self: *Manager, pane_id: []const u8, generation: u64) bool {
+        for (self.respawn_gates.items) |gate| {
+            if (gate.generation == generation and std.mem.eql(u8, gate.pane_id, pane_id)) return true;
+        }
+        return false;
     }
 
     /// Resize a pane: the native PTY (when running), the spawn spec used by
@@ -1629,7 +1840,7 @@ pub const Manager = struct {
         const owned_session_id = try self.allocator.dupe(u8, session.id);
         errdefer self.allocator.free(owned_session_id);
 
-        const native = try NativeSession.create(self.allocator, self.io, spawn.nativeOptions(pane_id, self.event_sink));
+        const native = try NativeSession.create(self.allocator, self.io, spawn.nativeOptions(pane_id, self.nativeSinkLocked()));
         self.spawn_count += 1;
 
         pane.* = .{
@@ -3169,6 +3380,171 @@ test "sink removal never waits for an emit while holding the manager mutex" {
         }
         manager.terminateAll();
     }
+}
+
+/// Allocator that fails every allocation once `fail` is set. Thread-safe as
+/// long as `child` is.
+const ToggleFailAllocator = struct {
+    child: Allocator,
+    fail: std.atomic.Value(bool) = .init(false),
+
+    fn allocator(self: *ToggleFailAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+        const self: *ToggleFailAllocator = @ptrCast(@alignCast(ctx));
+        if (self.fail.load(.seq_cst)) return null;
+        return self.child.rawAlloc(len, alignment, ret);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) bool {
+        const self: *ToggleFailAllocator = @ptrCast(@alignCast(ctx));
+        if (self.fail.load(.seq_cst) and new_len > memory.len) return false;
+        return self.child.rawResize(memory, alignment, new_len, ret);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) ?[*]u8 {
+        const self: *ToggleFailAllocator = @ptrCast(@alignCast(ctx));
+        if (self.fail.load(.seq_cst)) return null;
+        return self.child.rawRemap(memory, alignment, new_len, ret);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+        const self: *ToggleFailAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ret);
+    }
+};
+
+/// Parks the first callback until `release` is set, and counts callbacks
+/// that start after `cleared` is set (each one would touch a freed context).
+const HeldSink = struct {
+    entered: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+    cleared: std.atomic.Value(bool) = .init(false),
+    late_calls: std.atomic.Value(usize) = .init(0),
+
+    fn sink(self: *HeldSink) native_mod.EventSink {
+        return .{ .context = self, .emit = emit };
+    }
+
+    fn emit(context: *anyopaque, event: native_mod.Event) void {
+        _ = event;
+        const self: *HeldSink = @ptrCast(@alignCast(context));
+        if (self.cleared.load(.seq_cst)) _ = self.late_calls.fetchAdd(1, .seq_cst);
+        if (!self.entered.swap(true, .seq_cst)) {
+            while (!self.release.load(.seq_cst)) std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+    }
+
+    fn clearThread(manager: *Manager, done: *std.atomic.Value(bool)) void {
+        manager.clearEventSinks();
+        done.store(true, .seq_cst);
+    }
+};
+
+test "C01: clearEventSinks waits for a held callback under OOM, and a removed pane's retained handle never calls the sink" {
+    const io = std.testing.io;
+    var failing: ToggleFailAllocator = .{ .child = std.testing.allocator };
+    var manager = Manager.init(failing.allocator(), io, null);
+    defer manager.deinit();
+    var held: HeldSink = .{};
+    manager.setEventSink(held.sink());
+
+    // A removed pane whose public handle outlives removal: its native must
+    // lose the sink at removal, before the manager forgets it.
+    var removed = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "cat", .scrollback_bytes = 4096 });
+    defer removed.deinit();
+    var kept = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "printf go; cat", .scrollback_bytes = 4096 });
+    defer kept.deinit();
+
+    const deadline = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(5));
+    while (!held.entered.load(.seq_cst)) {
+        if (std.Io.Clock.awake.now(io).compare(.gt, deadline)) return error.MissingEvents;
+        io.sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+
+    try std.testing.expect(removed.native.event_sink != null);
+    try std.testing.expect(manager.terminate(removed.pane_id));
+    try std.testing.expect(removed.native.event_sink == null);
+
+    // Every allocation fails from here: the barrier must still hold.
+    failing.fail.store(true, .seq_cst);
+    var done = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, HeldSink.clearThread, .{ &manager, &done });
+    io.sleep(.fromMilliseconds(100), .awake) catch {};
+    // The held callback is still running, so the clear has not returned.
+    try std.testing.expect(!done.load(.seq_cst));
+    held.release.store(true, .seq_cst);
+    thread.join();
+    failing.fail.store(false, .seq_cst);
+    try std.testing.expect(done.load(.seq_cst));
+    held.cleared.store(true, .seq_cst);
+
+    // New output on the surviving pane never reaches the cleared sink.
+    try kept.native.send("more", true);
+    io.sleep(.fromMilliseconds(100), .awake) catch {};
+    try std.testing.expectEqual(@as(usize, 0), held.late_calls.load(.seq_cst));
+}
+
+/// Checks the respawn event order: no event of a generation before its
+/// announcement, and no event of an older generation after it.
+const OrderSink = struct {
+    announced: std.atomic.Value(u64) = .init(0),
+    announcements: std.atomic.Value(usize) = .init(0),
+    violations: std.atomic.Value(usize) = .init(0),
+
+    fn sink(self: *OrderSink) native_mod.EventSink {
+        return .{ .context = self, .emit = emit };
+    }
+
+    fn listener(self: *OrderSink) RespawnListener {
+        return .{ .context = self, .notify = notify };
+    }
+
+    fn emit(context: *anyopaque, event: native_mod.Event) void {
+        const self: *OrderSink = @ptrCast(@alignCast(context));
+        const key = eventGateKey(event) orelse return;
+        if (key.generation != self.announced.load(.seq_cst)) _ = self.violations.fetchAdd(1, .seq_cst);
+    }
+
+    fn notify(context: *anyopaque, native: *NativeSession) void {
+        const self: *OrderSink = @ptrCast(@alignCast(context));
+        self.announced.store(native.generation(), .seq_cst);
+        _ = self.announcements.fetchAdd(1, .seq_cst);
+        // Widen the window in which the new reader is already emitting.
+        std.testing.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+};
+
+test "H09: every respawn path announces once, after old events and before new ones" {
+    const io = std.testing.io;
+    var manager = Manager.init(std.testing.allocator, io, null);
+    defer manager.deinit();
+    var order: OrderSink = .{};
+    manager.setEventSink(order.sink());
+    manager.setRespawnListener(order.listener());
+
+    var handle = try manager.createSessionPane(.{ .shell = "/bin/sh", .command = "while :; do echo flood; done", .scrollback_bytes = 4096 });
+    defer handle.deinit();
+    try manager.bindKey("prefix", "R", "respawn-pane", false);
+
+    for (0..6) |round| {
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+        switch (round % 3) {
+            0 => (try manager.respawnPane(handle.pane_id, .{ .kill = true })).release(),
+            1 => try manager.executeCommandLine("respawn-pane", handle.pane_id),
+            else => {
+                const command = (try manager.executeBinding("prefix", "R", handle.pane_id)).?;
+                std.testing.allocator.free(command);
+            },
+        }
+    }
+    io.sleep(.fromMilliseconds(20), .awake) catch {};
+    manager.clearEventSinks();
+    try std.testing.expectEqual(@as(usize, 6), order.announcements.load(.seq_cst));
+    try std.testing.expectEqual(@as(u64, 6), order.announced.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), order.violations.load(.seq_cst));
 }
 
 test "paneScrollbackTail returns pane output and rejects unknown panes" {

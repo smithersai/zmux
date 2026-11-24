@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const rpc_line_reader = @import("rpc_line_reader.zig");
 const protocol = @import("protocol.zig");
+const server = @import("server.zig");
 const socket_path = @import("socket_path.zig");
 const c = std.c;
 
@@ -16,6 +17,8 @@ const write_timeout_ms: i64 = 2_000;
 const spawn_timeout_ms: i64 = 4_000;
 const partial_frame_timeout_ms: i64 = 30_000;
 const pipe_quiet_ms: i64 = 2_000;
+const send_reply_timeout_ms: i64 = 30_000;
+const max_pending_sends = 256;
 const run_loop_poll_timeout_ms: i32 = 100;
 const bootstrap_response_timeout_ms: i64 = 10_000;
 const version_handshake_timeout_ms: i64 = 2_000;
@@ -53,6 +56,7 @@ fn connectPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
 const Deadline = struct {
     io: std.Io,
     at: std.Io.Clock.Timestamp,
+    notifications: ?*BootstrapNotifications = null,
 
     pub fn fromNow(io: std.Io, timeout_ms: i64) Deadline {
         return .{ .io = io, .at = .fromNow(io, .{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake }) };
@@ -212,7 +216,10 @@ fn runMain(init: std.process.Init) !void {
     const stdout_fd: posix.fd_t = 1;
     const is_tty = sys.isatty(stdin_fd);
     const size = currentTerminalSize(stdout_fd, stdin_fd) orelse TerminalSize{ .rows = 24, .cols = 80 };
-    const deadline = Deadline.fromNow(io, bootstrap_response_timeout_ms);
+    var notifications: BootstrapNotifications = .{};
+    defer notifications.deinit(allocator);
+    var deadline = Deadline.fromNow(io, bootstrap_response_timeout_ms);
+    deadline.notifications = &notifications;
     var attach = try attachOrCreate(allocator, &reader, socket_fd, sid, size, parsed.auto_create, parsed.create_command, deadline);
     defer attach.deinit(allocator);
 
@@ -229,13 +236,15 @@ fn runMain(init: std.process.Init) !void {
     try replayScrollback(allocator, attach.result(), stdout_fd);
     if (jsonField(attach.result(), "exited") == .bool and jsonField(attach.result(), "exited").bool) {
         try printExitStatus(io, attach.result());
-        const next = try respawnAndReattach(allocator, &reader, socket_fd, attach.result(), size, .fromNow(io, bootstrap_response_timeout_ms));
+        deadline = .fromNow(io, bootstrap_response_timeout_ms);
+        deadline.notifications = &notifications;
+        const next = try respawnAndReattach(allocator, &reader, socket_fd, attach.result(), size, deadline);
         attach.deinit(allocator);
         attach = next;
         try replayScrollback(allocator, attach.result(), stdout_fd);
         if (jsonField(attach.result(), "exited") == .bool and jsonField(attach.result(), "exited").bool) {
             try printExitStatus(io, attach.result());
-            try stderrWrite(io, "session ended\n");
+            try stderrWrite(io, if (g_termios_saved.load(.seq_cst)) "session ended\r\n" else "session ended\n");
             return;
         }
     }
@@ -247,6 +256,7 @@ fn runMain(init: std.process.Init) !void {
         .replay_end = jsonUnsigned(attach.result(), "replayEndOffset"),
         .detach_key = if (is_tty) parsed.detach_key else null,
         .piped = !is_tty,
+        .bootstrap_lines = notifications.lines.items,
         .io = io,
     });
 
@@ -284,19 +294,19 @@ const Response = struct {
 
 const RpcError = struct {
     message: []const u8,
-    kind: []const u8,
+    kind: ?[]const u8,
 
     fn fromEnvelope(envelope: std.json.Value) ?RpcError {
         const err = jsonField(envelope, "error");
         if (err != .object) return null;
         return .{
             .message = jsonObjectString(err, "message") orelse "unknown RPC error",
-            .kind = jsonObjectString(jsonField(err, "data"), "kind") orelse "",
+            .kind = jsonObjectString(jsonField(err, "data"), "kind"),
         };
     }
 
     fn is(self: RpcError, kind: []const u8) bool {
-        return std.mem.eql(u8, self.kind, kind);
+        return std.mem.eql(u8, self.kind orelse return false, kind);
     }
 };
 
@@ -323,8 +333,10 @@ fn attachOrCreate(
     const response = try sendAttach(allocator, reader, fd, target, size, create, attach_rpc_id, deadline);
     if (create) |params| {
         if (response.rpcError()) |rpc_err| {
-            if (rpc_err.is("not_found")) {
-                // A daemon that implements structured errors but ignores createIfMissing.
+            if (rpc_err.is("not_found") or
+                (rpc_err.kind == null and std.mem.eql(u8, rpc_err.message, "PaneNotFound")))
+            {
+                // Older daemons ignore createIfMissing.
                 response.deinit(allocator);
                 const created = try callRpc(allocator, reader, fd, 2, "session.create", params, deadline);
                 defer created.deinit(allocator);
@@ -404,12 +416,13 @@ fn respawnAndReattach(
 fn printExitStatus(io: std.Io, result: std.json.Value) !void {
     var buf: [128]u8 = undefined;
     const message = if (jsonUnsigned(result, "exitCode")) |code|
-        try std.fmt.bufPrint(&buf, "[session exited: code {d}]\n", .{code})
+        try std.fmt.bufPrint(&buf, "[session exited: code {d}]", .{code})
     else if (jsonUnsigned(result, "signal")) |signal|
-        try std.fmt.bufPrint(&buf, "[session exited: signal {d}]\n", .{signal})
+        try std.fmt.bufPrint(&buf, "[session exited: signal {d}]", .{signal})
     else
-        "[session exited]\n";
+        "[session exited]";
     try stderrWrite(io, message);
+    try stderrWrite(io, if (g_termios_saved.load(.seq_cst)) "\r\n" else "\n");
 }
 
 fn buildFrame(allocator: std.mem.Allocator, id: u32, method: []const u8, params: anytype) ![]u8 {
@@ -457,6 +470,25 @@ fn exchange(
     };
 }
 
+// Replay unmatched notifications through the normal pane, generation and
+// offset checks once the attach reply establishes the initial state.
+const BootstrapNotifications = struct {
+    lines: std.ArrayList([]u8) = .empty,
+    bytes: usize = 0,
+
+    fn deinit(self: *BootstrapNotifications, allocator: std.mem.Allocator) void {
+        for (self.lines.items) |line| allocator.free(line);
+        self.lines.deinit(allocator);
+    }
+
+    fn append(self: *BootstrapNotifications, allocator: std.mem.Allocator, line: []u8) !void {
+        if (self.lines.items.len == 4096 or line.len > rpc_line_max - self.bytes)
+            return error.TooManyBootstrapNotifications;
+        try self.lines.append(allocator, line);
+        self.bytes += line.len;
+    }
+};
+
 fn readRpcResponse(allocator: std.mem.Allocator, reader: *LineReader, fd: posix.fd_t, expected_id: u32, deadline: Deadline) !Response {
     while (deadline.remainingMs() > 0) {
         const line = try reader.readLineAllocTimeout(allocator, deadline.io, fd, rpc_line_max, deadline.timeout());
@@ -465,6 +497,12 @@ fn readRpcResponse(allocator: std.mem.Allocator, reader: *LineReader, fd: posix.
         // so it can only carry an `id` member if `"id"` appears verbatim.
         // Skips a DOM parse of every interleaved pane_output notification.
         if (!mayHaveKey(line, "\"id\"")) {
+            if (deadline.notifications) |pending| {
+                if (mayHaveKey(line, "\"method\"")) {
+                    try pending.append(allocator, line);
+                    continue;
+                }
+            }
             allocator.free(line);
             continue;
         }
@@ -483,7 +521,14 @@ fn readRpcResponse(allocator: std.mem.Allocator, reader: *LineReader, fd: posix.
                 return .{ .line = line, .parsed = parsed };
             }
         }
+        const notification = response_id == null and jsonObjectString(parsed.value, "method") != null;
         parsed.deinit();
+        if (notification) {
+            if (deadline.notifications) |pending| {
+                try pending.append(allocator, line);
+                continue;
+            }
+        }
         allocator.free(line);
     }
     return error.ReadTimeout;
@@ -822,6 +867,7 @@ const RunLoopOptions = struct {
     replay_end: ?u64 = null,
     detach_key: ?u8 = null,
     piped: bool = false,
+    bootstrap_lines: []const []const u8 = &.{},
     io: std.Io,
 };
 
@@ -832,6 +878,8 @@ const RunState = struct {
     next_offset: ?u64,
     client_id: []const u8,
     next_id: u32 = first_interactive_id,
+    pending_sends: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    send_reply_deadline: i64 = 0,
 
     fn queue(self: *RunState, allocator: std.mem.Allocator, out: *WriteQueue, method: []const u8, params: anytype) !void {
         const frame = try buildFrame(allocator, self.next_id, method, params);
@@ -932,6 +980,7 @@ fn runLoop(
         .next_offset = options.replay_end,
     };
     defer if (state.switched_pane) |pane| allocator.free(pane);
+    defer state.pending_sends.deinit(allocator);
     var outbound: WriteQueue = .{};
     defer outbound.bytes.deinit(allocator);
 
@@ -941,7 +990,8 @@ fn runLoop(
     var output_sent: usize = 0;
 
     var stdin_eof = false;
-    var quiet_until: i64 = 0;
+    var quiet_until: ?i64 = null;
+    var bootstrap_lines = options.bootstrap_lines;
     var eof_outcome: ?RunOutcome = null;
     var resize_pending = true;
     var buf: [buffer_size]u8 = undefined;
@@ -949,25 +999,32 @@ fn runLoop(
     const stdout_unpollable = pollUnsupported(stdout_fd);
 
     while (true) {
-        if (pending_output == null and eof_outcome == null) {
-            while (reader.hasBufferedLine()) {
-                const line = (try reader.nextBufferedLineAlloc(allocator, rpc_line_max)).?;
-                defer allocator.free(line);
-                eof_outcome = try handleServerLine(allocator, line, &state, &pending_output, options.io);
+        if (pending_output == null and (eof_outcome == null or state.pending_sends.count() != 0)) {
+            while (bootstrap_lines.len != 0 or reader.hasBufferedLine()) {
+                const owned = if (bootstrap_lines.len == 0)
+                    (try reader.nextBufferedLineAlloc(allocator, rpc_line_max)).?
+                else
+                    null;
+                defer if (owned) |bytes| allocator.free(bytes);
+                const line = owned orelse bootstrap_lines[0];
+                if (owned == null) bootstrap_lines = bootstrap_lines[1..];
+                if (try handleServerLine(allocator, line, &state, &pending_output, options.io)) |outcome|
+                    eof_outcome = outcome;
+                quiet_until = null;
                 partial_since = null;
-                if (pending_output != null or eof_outcome != null) break;
+                if (pending_output != null or (eof_outcome != null and state.pending_sends.count() == 0)) break;
             }
-            // The reader's staging buffer is fixed-size. Move a partial frame
-            // into the reader's heap buffer so large frames never block the
-            // loop; the reader joins it with the rest of the line.
-            if (pending_output == null and eof_outcome == null and reader.end > reader.start) {
+            // Move a partial frame out of the fixed-size staging buffer so
+            // the next read can continue it.
+            if (pending_output == null and !reader.hasBufferedLine() and reader.end > reader.start) {
                 if (partial_since == null) partial_since = sys.monotonicMs();
                 _ = try reader.nextBufferedLineAlloc(allocator, rpc_line_max);
             }
         }
 
+        const awaiting_sends = state.pending_sends.count() != 0;
         if (eof_outcome) |outcome| {
-            if (pending_output == null and (outcome != .detached or outbound.pending().len == 0)) return outcome;
+            if (!awaiting_sends and pending_output == null and (outcome != .detached or outbound.pending().len == 0)) return outcome;
         }
         const now = sys.monotonicMs();
         if (partial_since) |started| {
@@ -976,8 +1033,12 @@ fn runLoop(
         if (outbound.pending().len != 0 and now >= outbound.deadline) {
             return diagnostic(options.io, "timed out sending interactive requests", .{});
         }
-        if (stdin_eof and outbound.pending().len == 0 and pending_output == null and partial_since == null and now >= quiet_until)
-            return .exited;
+        if (awaiting_sends and now >= state.send_reply_deadline)
+            return diagnostic(options.io, "timed out waiting for session.send replies", .{});
+        if (stdin_eof and !awaiting_sends and outbound.pending().len == 0 and pending_output == null and partial_since == null) {
+            if (quiet_until == null) quiet_until = now + pipe_quiet_ms;
+            if (now >= quiet_until.?) return .exited;
+        }
 
         resize_pending = g_winch_flag.swap(false, .seq_cst) or resize_pending;
         // Leave space for a worst-case input frame and a detach frame.
@@ -993,9 +1054,9 @@ fn runLoop(
             }
         }
 
-        const socket_events: i16 = (if (pending_output == null and eof_outcome == null) @as(i16, posix.POLL.IN) else 0) |
+        const socket_events: i16 = (if (pending_output == null and (eof_outcome == null or awaiting_sends)) @as(i16, posix.POLL.IN) else 0) |
             (if (outbound.pending().len != 0) @as(i16, posix.POLL.OUT) else 0);
-        const want_stdin = !stdin_eof and eof_outcome == null and can_queue;
+        const want_stdin = !stdin_eof and eof_outcome == null and can_queue and state.pending_sends.count() < max_pending_sends;
         const want_stdout = pending_output != null;
         var fds = [_]posix.pollfd{
             .{ .fd = if (want_stdin and !stdin_unpollable) stdin_fd else -1, .events = posix.POLL.IN, .revents = 0 },
@@ -1007,8 +1068,11 @@ fn runLoop(
         _ = try posix.poll(&fds, if (want_stdout and stdout_unpollable) 0 else run_loop_poll_timeout_ms);
         if (want_stdin and stdin_unpollable) fds[0].revents = posix.POLL.IN;
         if (want_stdout and stdout_unpollable) fds[2].revents = posix.POLL.OUT;
-        if ((fds[2].revents & (posix.POLL.ERR | posix.POLL.NVAL | posix.POLL.HUP)) != 0) return error.OutputClosed;
-        if ((fds[2].revents & posix.POLL.OUT) != 0) {
+        if ((fds[2].revents & (posix.POLL.ERR | posix.POLL.HUP)) != 0) return error.OutputClosed;
+        // POLLNVAL counts as writable: Darwin's poll(2) rejects character
+        // devices such as /dev/null with POLLNVAL. The write then succeeds,
+        // or fails with the real error for a descriptor that is not open.
+        if ((fds[2].revents & (posix.POLL.OUT | posix.POLL.NVAL)) != 0) {
             const bytes = pending_output.?;
             const n = sys.write(stdout_fd, bytes[output_sent..]) catch |err| switch (err) {
                 error.WouldBlock => 0,
@@ -1027,7 +1091,7 @@ fn runLoop(
                 else => return err,
             };
             switch (filled) {
-                .data => quiet_until = sys.monotonicMs() + pipe_quiet_ms,
+                .data => quiet_until = null,
                 .eof => return .connection_lost,
                 .would_block => if ((fds[1].revents & posix.POLL.HUP) != 0) return .connection_lost,
             }
@@ -1049,21 +1113,31 @@ fn runLoop(
                 },
                 else => return err,
             };
-            if (stdin_eof) quiet_until = sys.monotonicMs() + pipe_quiet_ms;
         }
 
-        if ((fds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
+        // POLLNVAL counts as readable: Darwin's poll(2) rejects character
+        // devices such as /dev/null with POLLNVAL instead of reporting them
+        // ready. The read then returns EOF (or the real error) rather than
+        // leaving the loop spinning on a descriptor poll will never accept.
+        if ((fds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
             switch (try readStdinChunk(stdin_fd, &buf)) {
                 .again => {},
                 .eof => {
                     if (!options.piped) return .exited;
                     stdin_eof = true;
-                    quiet_until = sys.monotonicMs() + pipe_quiet_ms;
                 },
                 .bytes => |bytes| {
                     const chord = if (options.detach_key) |key| std.mem.indexOfScalar(u8, bytes, key) else null;
                     const input = bytes[0 .. chord orelse bytes.len];
-                    if (input.len != 0) try state.queueSend(allocator, &outbound, input);
+                    if (input.len != 0) {
+                        const send_id = state.next_id;
+                        try state.queueSend(allocator, &outbound, input);
+                        if (options.piped) {
+                            if (state.pending_sends.count() == 0)
+                                state.send_reply_deadline = sys.monotonicMs() + send_reply_timeout_ms;
+                            try state.pending_sends.put(allocator, send_id, {});
+                        }
+                    }
                     if (chord != null) {
                         try state.queue(allocator, &outbound, "client.detach", .{ .clientId = state.client_id });
                         eof_outcome = .detached;
@@ -1111,22 +1185,16 @@ fn getEnv(name: []const u8) ?[]const u8 {
 }
 
 fn resolveSocketPath(allocator: std.mem.Allocator, io: std.Io, override: ?[]const u8) ![]u8 {
-    return socket_path.resolve(allocator, override, getEnv) catch |err| switch (err) {
-        error.SocketPathTooLong => {
-            // The resolver discards an overlong result. Repeat its resolution
-            // only on this error with a generalized path-length diagnostic.
-            const raw = override orelse getEnv("ZMUX_SOCKET") orelse getEnv("SMITHERS_SESSION_SOCKET");
-            if (raw) |value| {
-                const path = try socket_path.absolutize(allocator, value);
-                defer allocator.free(path);
-                if (path.len > sys.max_unix_path_len)
-                    return fail(io, "socket path too long ({d} > {d})", .{ path.len, sys.max_unix_path_len });
-            }
-            return fail(io, "socket path too long (maximum {d} bytes)", .{sys.max_unix_path_len});
-        },
-        error.EmptySocketPath, error.SocketPathContainsNul => return fail(io, "{s}", .{@errorName(err)}),
-        else => return err,
+    const path = socket_path.resolveUnvalidated(allocator, override, getEnv) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return fail(io, "{s}", .{@errorName(err)}),
     };
+    errdefer allocator.free(path);
+    socket_path.validate(path) catch |err| switch (err) {
+        error.SocketPathTooLong => return fail(io, "socket path too long ({d} > {d})", .{ path.len, sys.max_unix_path_len }),
+        else => return fail(io, "{s}", .{@errorName(err)}),
+    };
+    return path;
 }
 
 fn connectWithRetry(allocator: std.mem.Allocator, io: std.Io, path: []const u8, spawn_daemon: bool) !posix.fd_t {
@@ -1198,6 +1266,22 @@ fn moveAboveStdio(fd: posix.fd_t) !posix.fd_t {
     return moved;
 }
 
+fn openSpawnSocketParent(path: []const u8, getenv: socket_path.GetEnv) !posix.fd_t {
+    if (socket_path.isDefaultManaged(path, getenv)) return server.openSocketParent(path, getenv);
+
+    const parent = std.fs.path.dirname(path) orelse return error.NoSocketDirectory;
+    // Follow the custom directory (including macOS /tmp), then check the
+    // pinned descriptor before creating anything in it.
+    const fd = try sys.open(parent, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    errdefer sys.close(fd);
+    const stat = try sys.fstat(fd);
+    const self_owned = stat.uid == sys.geteuid();
+    const trusted_sticky = (stat.uid == 0 or self_owned) and stat.mode & 0o1000 != 0;
+    if (!trusted_sticky and !(self_owned and stat.mode & 0o022 == 0))
+        return error.InsecureSocketDirectory;
+    return fd;
+}
+
 fn spawnDaemonDetached(allocator: std.mem.Allocator, io: std.Io, path: []const u8, deadline: i64) !void {
     const self_path = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(self_path);
@@ -1210,17 +1294,13 @@ fn spawnDaemonDetached(allocator: std.mem.Allocator, io: std.Io, path: []const u
     const argv = [_:null]?[*:0]const u8{ daemon_z.ptr, "--socket", path_z.ptr };
     const envp = sys.currentEnviron();
 
-    const parent = std.fs.path.dirname(path) orelse return error.NoSocketDirectory;
-    if (!socket_path.isDefaultManaged(path, getEnv)) {
-        const existing = try sys.openDirNoFollow(parent);
-        sys.close(existing);
-    }
-    const dir_fd = try moveAboveStdio(try sys.ensurePrivateDir(parent));
+    const dir_fd = try moveAboveStdio(try openSpawnSocketParent(path, getEnv));
     defer sys.close(dir_fd);
     const log_name = try std.fmt.allocPrint(allocator, "{s}.log", .{std.fs.path.basename(path)});
     defer allocator.free(log_name);
     const log_fd = try moveAboveStdio(try sys.openOwnedRegularAt(dir_fd, log_name, .{ .ACCMODE = .WRONLY, .APPEND = true, .CREAT = true }, 0o600));
     defer sys.close(log_fd);
+    try sys.fchmod(log_fd, 0o600);
     const devnull = try moveAboveStdio(try sys.openZ("/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0));
     defer sys.close(devnull);
 
@@ -1463,8 +1543,9 @@ fn handleServerLine(
         // so a frame can only act on this client if the method names (or the
         // `"error"` key) and the current pane id appear literally.
         const is_error = containsSubstrSimd(line, "\"error\"");
+        const is_result = state.pending_sends.count() != 0 and containsSubstrSimd(line, "\"result\"");
         const is_client = containsSubstrSimd(line, "client_");
-        if (!is_error and !is_client) {
+        if (!is_error and !is_result and !is_client) {
             if (!containsSubstrSimd(line, "pane_") and
                 !containsSubstrSimd(line, protocol.session_exited_method)) return null;
             if (!containsSubstrSimd(line, state.pane_id)) return null;
@@ -1542,8 +1623,18 @@ fn handleServerLineDom(
     };
     defer parsed.deinit();
     const envelope = parsed.value;
-    if (RpcError.fromEnvelope(envelope)) |err| {
-        const id = jsonUnsigned(envelope, "id");
+    const id = jsonUnsigned(envelope, "id");
+    const rpc_error = RpcError.fromEnvelope(envelope);
+    if (id) |number| {
+        if (std.math.cast(u32, number)) |request_id| {
+            if ((rpc_error != null or envelope.object.contains("result")) and state.pending_sends.remove(request_id)) {
+                if (rpc_error) |err| return reportRpcError(io, err);
+                state.send_reply_deadline = sys.monotonicMs() + send_reply_timeout_ms;
+                return null;
+            }
+        }
+    }
+    if (rpc_error) |err| {
         if (id) |n| if (n < first_interactive_id or n >= state.next_id) return null;
         printDiagnostic(io, "{f}", .{escaped(err.message)});
         if (err.is("terminated") or err.is("not_found")) return .session_ended;
@@ -1588,6 +1679,7 @@ fn handleServerLineDom(
         return null;
     }
     if (std.mem.eql(u8, method, protocol.pane_output_dropped_method)) {
+        if (generation != null and generation != state.generation) return null;
         if (jsonUnsigned(params, "resume_offset")) |offset|
             state.next_offset = @max(offset, state.next_offset orelse 0);
         return null;
@@ -2107,17 +2199,73 @@ test "run loop completes a frame larger than the line reader staging buffer" {
     @memset(frame, ' ');
     const exit_frame = "{\"method\":\"session_exited\",\"params\":{\"session_id\":\"p\"}}\n";
     @memcpy(frame[frame.len - exit_frame.len ..], exit_frame);
-    // The whole frame is queued before the loop reads; Darwin's default
-    // 8 KiB AF_UNIX buffer would block this send forever.
-    sys.tuneUnixSocketBuffers(pair[1]);
-    sys.tuneUnixSocketBuffers(pair[0]);
-    try sys.sendAll(pair[1], frame);
-    _ = c.shutdown(pair[1], 1);
+    // The frame exceeds the default AF_UNIX send buffer on Darwin (8 KiB), so
+    // the writer runs beside the loop that drains it.
+    const Writer = struct {
+        fn run(fd: posix.fd_t, bytes: []const u8) void {
+            sys.sendAll(fd, bytes) catch {};
+            _ = c.shutdown(fd, 1);
+        }
+    };
+    const writer = try std.Thread.spawn(.{}, Writer.run, .{ pair[1], frame });
+    var reader: LineReader = .{};
+    defer reader.deinit();
+    const outcome = runLoop(
+        input[0],
+        1,
+        pair[0],
+        &reader,
+        alloc,
+        .{ .pane_id = "p", .io = test_io },
+    );
+    // Unblock the writer if the loop stopped before draining the frame.
+    _ = c.shutdown(pair[0], 0);
+    writer.join();
+    try std.testing.expectEqual(RunOutcome.session_ended, try outcome);
+}
+
+test "run loop ends at EOF when stdin is /dev/null" {
+    const alloc = std.testing.allocator;
+    const pair = try sys.socketPair();
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
+    // Darwin's poll(2) reports POLLNVAL for /dev/null; the loop must still
+    // read it and see EOF instead of spinning.
+    const null_fd = c.open("/dev/null", .{ .ACCMODE = .RDONLY });
+    try std.testing.expect(null_fd >= 0);
+    defer sys.close(null_fd);
+    var reader: LineReader = .{};
+    defer reader.deinit();
+    try std.testing.expectEqual(RunOutcome.exited, try runLoop(
+        null_fd,
+        1,
+        pair[0],
+        &reader,
+        alloc,
+        .{ .pane_id = "p", .io = test_io },
+    ));
+}
+
+test "run loop writes pane output to /dev/null" {
+    const alloc = std.testing.allocator;
+    const pair = try sys.socketPair();
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
+    const input = try sys.pipe();
+    defer sys.close(input[0]);
+    defer sys.close(input[1]);
+    // Darwin's poll(2) reports POLLNVAL for /dev/null; that is not a closed
+    // output.
+    const null_fd = c.open("/dev/null", .{ .ACCMODE = .WRONLY });
+    try std.testing.expect(null_fd >= 0);
+    defer sys.close(null_fd);
+    try sys.sendAll(pair[1], "{\"method\":\"pane_output\",\"params\":{\"pane_id\":\"p\",\"data_base64\":\"aGk=\"}}\n" ++
+        "{\"method\":\"session_exited\",\"params\":{\"session_id\":\"p\"}}\n");
     var reader: LineReader = .{};
     defer reader.deinit();
     try std.testing.expectEqual(RunOutcome.session_ended, try runLoop(
         input[0],
-        1,
+        null_fd,
         pair[0],
         &reader,
         alloc,
@@ -2212,4 +2360,53 @@ test "legacy create fallback branches on kind, independent of the message" {
     );
     defer response.deinit(allocator);
     try std.testing.expectEqualStrings("p", try requiredString(response.result(), "paneId"));
+}
+
+test "spawn socket parent accepts /tmp and tightens an owned legacy managed directory" {
+    const tmp = try openSpawnSocketParent("/tmp/zmux-test.sock", getEnv);
+    sys.close(tmp);
+
+    const home = struct {
+        var path: []const u8 = undefined;
+        fn env(name: []const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, name, "HOME")) path else null;
+        }
+    };
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const alloc = std.testing.allocator;
+    const relative = try std.fs.path.join(alloc, &.{ ".zig-cache/tmp", &temp.sub_path });
+    defer alloc.free(relative);
+    const test_home = try std.Io.Dir.cwd().realPathFileAlloc(test_io, relative, alloc);
+    defer alloc.free(test_home);
+    home.path = test_home;
+    const parent = try std.fs.path.join(alloc, &.{ test_home, ".smithers" });
+    defer alloc.free(parent);
+    const path = try std.fs.path.join(alloc, &.{ parent, "sessions.sock" });
+    defer alloc.free(path);
+    try sys.mkdir(parent, 0o755);
+    const legacy = try sys.openDirNoFollow(parent);
+    defer sys.close(legacy);
+    try sys.fchmod(legacy, 0o755);
+
+    const managed = try openSpawnSocketParent(path, home.env);
+    defer sys.close(managed);
+    try std.testing.expectEqual(@as(u32, 0o700), (try sys.fstat(managed)).permissions());
+    try sys.fchmod(legacy, 0o775);
+    try std.testing.expectError(error.InsecurePermissions, openSpawnSocketParent(path, home.env));
+}
+
+test "legacy PaneNotFound retries attach through session.create" {
+    const alloc = std.testing.allocator;
+    const pair = try sys.socketPair();
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
+    try sys.sendAll(pair[1], "{\"id\":1,\"error\":{\"code\":-32000,\"message\":\"PaneNotFound\"}}\n" ++
+        "{\"id\":2,\"result\":{}}\n" ++
+        "{\"id\":3,\"result\":{\"paneId\":\"p\",\"clientId\":\"c\"}}\n");
+    var reader: LineReader = .{};
+    defer reader.deinit();
+    const attached = try attachOrCreate(alloc, &reader, pair[0], "work", .{ .rows = 24, .cols = 80 }, true, null, .fromNow(test_io, 500));
+    defer attached.deinit(alloc);
+    try std.testing.expectEqualStrings("p", try requiredString(attached.result(), "paneId"));
 }

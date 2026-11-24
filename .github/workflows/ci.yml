@@ -6,6 +6,7 @@ on:
       - main
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
@@ -68,6 +69,15 @@ jobs:
           SMITHERS_CACHE_READ_TOKEN: ${{ secrets.SMITHERS_CACHE_READ_TOKEN }}
           SMITHERS_CACHE_WRITE_TOKEN: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.SMITHERS_CACHE_WRITE_TOKEN || '' }}
 
+      - name: Test foreign UID protection
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -o pipefail
+          sudo env ZIG_GLOBAL_CACHE_DIR="$RUNNER_TEMP/zmux-root-global-cache" ZIG_LOCAL_CACHE_DIR="$RUNNER_TEMP/zmux-root-cache" \
+            NO_COLOR=1 "$(command -v zig)" build test-integration -Dintegration-filter=foreign_ \
+            --summary all 2>&1 | tee "$RUNNER_TEMP/zmux-foreign-uid.log"
+          grep -Eq '2/2 tests passed([;[:space:]]|$)' "$RUNNER_TEMP/zmux-foreign-uid.log"
+
       - name: Benchmark report
         if: success()
         run: |
@@ -83,3 +93,26 @@ jobs:
             ${{ runner.temp }}/smthrs-results.json
             .benchmarks/
           if-no-files-found: ignore
+
+  musl:
+    name: Test on Alpine (musl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.1
+
+      - name: Run unit and integration tests on musl
+        run: |
+          zig_dir=$(dirname "$(readlink -f "$(command -v zig)")")
+          docker run --rm \
+            -v "$zig_dir:/opt/zig:ro" -v "$GITHUB_WORKSPACE:/src" \
+            -w /src alpine:3.23 \
+            /opt/zig/zig build test -Dtarget=x86_64-linux-musl --summary all

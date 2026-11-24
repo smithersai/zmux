@@ -48,6 +48,11 @@ fn envGet(name: []const u8) ?[]const u8 {
 
 /// Serializes daemon startup (and socket/PID cleanup) for one socket path.
 ///
+/// A running daemon holds the lock for its whole lifetime and releases it
+/// only after `Server.deinit`, so holding it is proof of a live (or starting)
+/// daemon. A second starter never reaches the stale-socket probe, which on
+/// macOS reports a live listener with a full accept queue as refused.
+///
 /// The lock is `flock(2)` on a persistent `<socket>.lock` file. The file is
 /// never unlinked: `flock` locks an inode, so removing the name would let one
 /// starter hold the old inode while another creates and locks a new one, and
@@ -134,9 +139,9 @@ pub fn main(init: std.process.Init) void {
     runMain(init) catch |err| {
         switch (err) {
             // Usage errors, already reported with a specific message.
-            error.InvalidArguments => std.process.exit(2),
+            error.InvalidArguments, error.SocketPathTooLong => std.process.exit(2),
             // Already reported with a specific message.
-            error.SocketPathTooLong, error.StartupFailed => {},
+            error.StartupFailed => {},
             else => {
                 var buf: [1024]u8 = undefined;
                 var w = std.Io.File.stderr().writerStreaming(init.io, &buf);
@@ -292,17 +297,26 @@ fn runMain(init: std.process.Init) !void {
     // The socket directory is validated (or created 0700) before the lock,
     // PID file, or socket is touched, and everything below goes through the
     // pinned descriptor.
-    var start = openStartContext(path, envGet, start_lock_timeout_ms, &shutdown_requested) catch |err| {
-        return reportStartupFailure(io, path, err);
+    var start = openStartContext(path, envGet, start_lock_timeout_ms, &shutdown_requested) catch |err| switch (err) {
+        // The lock is held for a daemon's lifetime, so another holder is a
+        // live or starting daemon. Exiting successfully mirrors tmux's
+        // start-server race behavior and never displaces it.
+        error.Timeout => {
+            log.info("daemon_already_running", .{ .socket_path = path, .reason = "start_lock_held" });
+            return;
+        },
+        else => return reportStartupFailure(io, path, err),
     };
+    // Runs last: the lock is released only after the server is torn down
+    // and its names removed.
     defer sys.close(start.dir_fd);
     defer start.lock.release();
     const names = SiblingNames.init(path);
 
     // Server.init decides what an existing socket means. A daemon that is
-    // already listening is not an error: exiting successfully mirrors tmux's
-    // start-server race behavior and never displaces the live socket.
-    var server = initServer(allocator, io, path, idle_timeout_seconds) catch |err| switch (err) {
+    // already listening is not an error. The server binds in the directory
+    // the lock lives in (`initAt`), never a second lookup of its name.
+    var server = initServerAt(allocator, io, start.dir_fd, path, idle_timeout_seconds) catch |err| switch (err) {
         error.AddressInUse => {
             log.info("daemon_already_running", .{ .socket_path = path });
             return;
@@ -310,8 +324,8 @@ fn runMain(init: std.process.Init) !void {
         else => return reportStartupFailure(io, path, err),
     };
 
-    // Still under the start lock: no other starter can see the socket without
-    // its PID file, or remove one while this daemon writes the other.
+    // Under the start lock: no other starter can see the socket without its
+    // PID file, or remove one while this daemon writes the other.
     const pid_stat: ?sys.Stat = writePidFile(start.dir_fd, names.pid()) catch |err| blk: {
         // The pid file is advisory; failing after the socket is bound would
         // leave a healthy daemon unavailable and a stale socket. Keep
@@ -320,16 +334,14 @@ fn runMain(init: std.process.Init) !void {
         log.warn("pid_file_write_failed", .{ .err = err, .socket_path = path });
         break :blk null;
     };
-    start.lock.release();
 
     defer {
-        // Remove the published names under the start lock, and only if they
-        // are still the ones this daemon created. Teardown of the panes can
-        // take a while and happens after the lock is released.
-        var cleanup_lock: ?StartLock = StartLock.acquire(start.dir_fd, names.lock(), start_lock_timeout_ms, null) catch null;
+        // Still under the lifetime start lock: remove the published names
+        // only if they are still the ones this daemon created, then tear
+        // down. The lock is released after this block.
+        std.debug.assert(start.lock.fd >= 0);
         server.unpublish();
         if (pid_stat) |stat| removePidFile(start.dir_fd, names.pid(), stat);
-        if (cleanup_lock) |*held| held.release();
         server.deinit();
     }
 
@@ -356,9 +368,22 @@ fn runMain(init: std.process.Init) !void {
 /// `Server.init`, retried while the stale-socket probe cannot decide whether
 /// a daemon is listening (for example during fd exhaustion).
 fn initServer(allocator: std.mem.Allocator, io: std.Io, path: []const u8, idle_timeout_seconds: i64) !server_mod.Server {
+    return initServerIn(allocator, io, null, path, idle_timeout_seconds);
+}
+
+/// `initServer` in the pinned directory `dir_fd` (borrowed).
+fn initServerAt(allocator: std.mem.Allocator, io: std.Io, dir_fd: sys.fd_t, path: []const u8, idle_timeout_seconds: i64) !server_mod.Server {
+    return initServerIn(allocator, io, dir_fd, path, idle_timeout_seconds);
+}
+
+fn initServerIn(allocator: std.mem.Allocator, io: std.Io, dir_fd: ?sys.fd_t, path: []const u8, idle_timeout_seconds: i64) !server_mod.Server {
     const deadline = sys.monotonicMs() + startup_probe_timeout_ms;
     while (true) {
-        return server_mod.Server.init(allocator, io, path, idle_timeout_seconds) catch |err| {
+        const attempt = if (dir_fd) |fd|
+            server_mod.Server.initAt(allocator, io, fd, path, idle_timeout_seconds)
+        else
+            server_mod.Server.init(allocator, io, path, idle_timeout_seconds);
+        return attempt catch |err| {
             if (err != error.ProbeInconclusive or sys.monotonicMs() >= deadline) return err;
             io.sleep(.fromMilliseconds(50), .awake) catch return err;
             continue;
@@ -993,6 +1018,44 @@ test "an insecure socket directory is refused before any lock file is created" {
     try std.testing.expectEqual(@as(usize, 0), try shared.entryCount());
     try std.testing.expect(startupFailureMessage(error.InsecureSocketDirectory) != null);
     try std.testing.expect(startupFailureMessage(error.InsecurePermissions) != null);
+}
+
+test "H03: the server binds in the locked directory or not at all after its name is swapped" {
+    if (!posix_ok) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var original = try TempDir.init("zmx-daemon-pinned");
+    defer original.deinit();
+    const socket_path = try std.fs.path.join(allocator, &.{ original.path, "z.sock" });
+    defer allocator.free(socket_path);
+
+    var start = try openStartContext(socket_path, envGet, 500, null);
+    defer start.deinit();
+
+    // Same directory: the socket lands beside the lock.
+    {
+        var server = try initServerAt(allocator, test_io, start.dir_fd, socket_path, 0);
+        defer server.deinit();
+        const stat = try sys.statAt(start.dir_fd, "z.sock", false);
+        try std.testing.expect(stat.isSocket());
+    }
+
+    // The directory name now points elsewhere: the bind must fail rather
+    // than publish a socket in a directory the lock does not cover.
+    const moved = try std.fmt.allocPrint(allocator, "{s}-moved", .{original.path});
+    defer allocator.free(moved);
+    defer std.Io.Dir.cwd().deleteTree(test_io, moved) catch {};
+    try std.Io.Dir.renameAbsolute(original.path, moved, test_io);
+    try sys.mkdir(original.path, 0o700);
+    if (initServerAt(allocator, test_io, start.dir_fd, socket_path, 0)) |server_value| {
+        var server = server_value;
+        server.deinit();
+        return error.BoundOutsideLockedDirectory;
+    } else |_| {}
+    var replacement = try std.Io.Dir.openDirAbsolute(test_io, original.path, .{ .iterate = true });
+    defer replacement.close(test_io);
+    var iterator = replacement.iterate();
+    try std.testing.expect((try iterator.next(test_io)) == null);
 }
 
 test "initServer replaces a stale socket promptly and reports a live one as in use" {

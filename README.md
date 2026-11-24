@@ -218,11 +218,13 @@ section. This example uses the default HOME-based socket.
 ```sh
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"daemon.ping"}' \
   | nc -U "$HOME/.smithers/sessions.sock"
-# {"jsonrpc":"2.0","id":1,"result":{"version":"0.3.0","pid":12345,"socketPath":"/home/user/.smithers/sessions.sock","sessions":0,"panes":0}}
+# {"jsonrpc":"2.0","id":1,"result":{"version":"0.4.0","pid":12345,"socketPath":"/home/user/.smithers/sessions.sock","sessions":0,"panes":0}}
 ```
 
 The socket protocol is one JSON document per physical line, terminated by
-`\n`. Do not split one request across multiple lines.
+`\n`. Do not split one request across multiple lines. The daemon disconnects
+clients that do not complete their first frame within 10 seconds of connecting
+or do not complete a started frame within 30 seconds.
 
 `session.create` accepts `id` (or equivalently `name`/`title`) as the
 human-readable session name; the daemon allocates a separate auto-generated
@@ -310,8 +312,8 @@ Every stateful entry point takes a `std.Io` after the allocator:
 connection and PTY reader on its own `std.Thread`. The allocator must be
 thread-safe and outlive `Server.deinit`. Use thread-safe Io such as
 `std.Io.Threaded` (`std.process.Init.io` is one). The
-`Io` supplies mutexes, clocks, sleeps, randomness, and file access. PTY, socket,
-and `poll(2)` work stays on blocking descriptors.
+`Io` supplies mutexes, clocks, sleeps, randomness, and file access. PTY and
+socket descriptors use nonblocking I/O driven by `poll(2)`.
 
 Top-level modules:
 
@@ -375,14 +377,14 @@ where live output resumes.
 | Notification | Params | Sent when |
 |--------------|--------|-----------|
 | `pane_output` | `pane_id`, `data_base64`, `offset`, `generation` | PTY produced bytes |
-| `pane_output_dropped` | `pane_id`, `dropped_bytes`, `resume_offset` | The connection's output queue crossed its high-water mark |
+| `pane_output_dropped` | `pane_id`, `dropped_bytes`, `resume_offset`, `generation` | The connection's output queue crossed its high-water mark |
 | `pane_activity` | `pane_id`, `last_activity_ms`, `generation` | Pane received output after at least a second of inactivity |
 | `pane_bell` | `pane_id`, `last_bell_ms`, `generation` | Pane received a `BEL` |
 | `session_exited` | `session_id`, `pid`, `exit_code`, `signal`, `generation` | Pane's PTY output ended after child exit |
 | `foreground_changed` | `session_id`, `pid`, `comm`, `argv`, `argv_truncated` | Pane's foreground process changed |
 | `pane_respawned` | `pane_id`, `generation`, `pid` | Pane acquired a new PTY child |
 | `client_detached` | `client_id`, `reason` | A client detached remotely or its pane/session was removed |
-| `client_switched` | `client_id`, `pane_id` | A different connection switched this client to another pane |
+| `client_switched` | `client_id`, `pane_id`, `generation`, `replay_base64`, `replay_end_offset` | A different connection switched this client to another pane |
 
 For compatibility, the notification field `session_id` carries a **pane ID**.
 The owning connection receives `client_detached` or `client_switched` when
@@ -427,7 +429,7 @@ as `PaneNotFound` and a category in `error.data.kind`. Branch on the category.
   is `<socket>.pid`.
 - Auto-spawn failure: check `<socket>.log` for daemon startup stderr.
 - Daemon disappeared after inactivity: the default idle timeout is 3600
-  seconds with zero sessions. Restart it or use `--idle-seconds 0`.
+  seconds with zero running panes and zero attached clients. Restart it or use `--idle-seconds 0`.
 - Terminal looks stuck after an interrupted client: run `reset` or
   `stty sane`.
 - Stop the daemon with `zmux-connect shutdown`, a `daemon.shutdown` RPC, or

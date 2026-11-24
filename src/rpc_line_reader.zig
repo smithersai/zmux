@@ -26,6 +26,10 @@ pub const LineReader = struct {
     /// After `error.MessageTooLarge`, input is dropped through the next
     /// newline so the stream resynchronizes on the following frame.
     discarding: bool = false,
+    /// Clock provider for `readFrameAllocMaybeDeadline`. Set it to the `Io`
+    /// the deadline was derived from; null falls back to
+    /// `std.Options.debug_io`.
+    io: ?std.Io = null,
 
     pub fn deinit(self: *LineReader) void {
         self.dropPending();
@@ -182,7 +186,7 @@ pub const LineReader = struct {
 
     /// `readFrameAllocMaybe` that fails with `error.ReadTimeout` at the
     /// absolute `deadline` on the awake (monotonic) clock, as returned by
-    /// `std.Io.Clock.awake.now(io)`. A partial frame stays buffered across the
+    /// `std.Io.Clock.awake.now(io)` for the reader's `io` field. A partial frame stays buffered across the
     /// timeout and the next call resumes it.
     pub fn readFrameAllocMaybeDeadline(
         self: *LineReader,
@@ -191,7 +195,7 @@ pub const LineReader = struct {
         max_len: usize,
         deadline: std.Io.Timestamp,
     ) !?[]u8 {
-        const at: Deadline = .{ .io = std.Options.debug_io, .at = deadline.withClock(.awake) };
+        const at: Deadline = .{ .io = self.io orelse std.Options.debug_io, .at = deadline.withClock(.awake) };
         return frameOrTruncated(allocator, try self.readLineAllocMaybeDeadline(allocator, fd, max_len, at));
     }
 
@@ -498,6 +502,42 @@ test "ReadTimeout keeps a partial frame and the next call resumes it" {
     const next = try reader.readLineAlloc(std.testing.allocator, fds[0], 64);
     defer std.testing.allocator.free(next);
     try std.testing.expectEqualStrings("next\n", next);
+}
+
+test "readFrameAllocMaybeDeadline measures the deadline on the reader's io" {
+    const fds = try sys.pipe();
+    defer sys.close(fds[0]);
+    defer sys.close(fds[1]);
+
+    // Default: no provider set, the debug io is used.
+    var fallback: LineReader = .{};
+    defer fallback.deinit();
+    try std.testing.expect(fallback.io == null);
+    const past = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromMilliseconds(-1));
+    try std.testing.expectError(
+        error.ReadTimeout,
+        fallback.readFrameAllocMaybeDeadline(std.testing.allocator, fds[0], 1024, past),
+    );
+
+    // A caller that derives deadlines from its own io hands the same io to
+    // the reader, so both sides of the comparison share one clock.
+    var reader: LineReader = .{};
+    defer reader.deinit();
+    reader.io = std.testing.io;
+    const soon = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromMilliseconds(20));
+    const started = std.Io.Clock.awake.now(std.testing.io);
+    try std.testing.expectError(
+        error.ReadTimeout,
+        reader.readFrameAllocMaybeDeadline(std.testing.allocator, fds[0], 1024, soon),
+    );
+    const waited = started.durationTo(std.Io.Clock.awake.now(std.testing.io)).toMilliseconds();
+    try std.testing.expect(waited >= 15);
+
+    _ = try sys.write(fds[1], "{}\n");
+    const later = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+    const frame = (try reader.readFrameAllocMaybeDeadline(std.testing.allocator, fds[0], 1024, later)).?;
+    defer std.testing.allocator.free(frame);
+    try std.testing.expectEqualStrings("{}\n", frame);
 }
 
 test "readFrameAllocMaybeDeadline resumes a frame after a timeout" {

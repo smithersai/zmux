@@ -3,7 +3,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 
-pub const version = "0.3.0";
+pub const version = "0.4.0";
 
 pub const foreground_changed_method = "foreground_changed";
 pub const session_exited_method = "session_exited";
@@ -96,6 +96,8 @@ pub const PaneOutputDroppedParams = struct {
     pane_id: []const u8,
     dropped_bytes: u64,
     resume_offset: u64,
+    /// Process generation of the pane whose output was dropped.
+    generation: u64 = 0,
 };
 
 pub const PaneRespawnedParams = struct {
@@ -192,13 +194,14 @@ fn isIntegerToken(text: []const u8) bool {
     return true;
 }
 
-/// Reject a top-level batch and enforce `max_json_depth` / `max_json_nodes`
-/// on the raw bytes. Malformed input is left for std.json to report; the
-/// scanner only has to be exact about string boundaries so brackets inside
-/// strings are not counted.
-fn prescan(line: []const u8) error{ NestingTooDeep, BatchUnsupported }!void {
+/// Enforce `max_json_depth` / `max_json_nodes` on the raw bytes. Malformed
+/// input is left for std.json to report; the scanner only has to be exact
+/// about string boundaries so brackets inside strings are not counted. A
+/// top-level array is not rejected here: `parseRequest` reports a well-formed
+/// batch as `BatchUnsupported` only after std.json accepted its syntax, so
+/// `[not json` is a parse error (-32700), not an invalid request.
+fn prescan(line: []const u8) error{NestingTooDeep}!void {
     const first = std.mem.indexOfNone(u8, line, " \t\r\n") orelse return;
-    if (line[first] == '[') return error.BatchUnsupported;
 
     var depth: usize = 0;
     var nodes: usize = 0;
@@ -787,6 +790,10 @@ test "parseRequest validates the jsonrpc member" {
 
 test "parseRequest rejects batches and non-object requests" {
     try std.testing.expectError(error.BatchUnsupported, parseRequest(std.testing.allocator, "[]"));
+    // Malformed array-prefixed input is a syntax error, not a batch.
+    try std.testing.expectError(error.ParseError, parseRequest(std.testing.allocator, "[not json"));
+    try std.testing.expectError(error.ParseError, parseRequest(std.testing.allocator, " [{\"id\":1,"));
+    try std.testing.expectEqual(@as(i32, -32700), errorCodeFor(error.ParseError).code);
     try std.testing.expectError(error.BatchUnsupported, parseRequest(std.testing.allocator, " \t[{\"id\":1,\"method\":\"x\"}]\n"));
     try std.testing.expectError(error.InvalidRequest, parseRequest(std.testing.allocator, "\"x\""));
     try std.testing.expectError(error.InvalidRequest, parseRequest(std.testing.allocator, "7"));

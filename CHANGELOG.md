@@ -1,9 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.0] - 2026-11-23
 
-Round-1 code review fixes (tracks T1-T5 and their integration). Decisions
-D1-D6 change the wire contract.
+Round-1 and Round-2 review hardening. Decisions D1-D6 change the wire contract.
 
 ### Changed
 
@@ -80,6 +79,23 @@ D1-D6 change the wire contract.
   lets a control connection in when the descriptor table is full.
 - Validate releases on each native target and publish only after every
   platform has supplied its archives and checksums.
+- Darwin foreground inspection handles empty arguments without reading
+  environment entries. Request parsing distinguishes malformed JSON from
+  valid but unsupported batches, and frame reads use the caller's clock.
+- Close inherited descriptors even when the kernel's bulk-close operation
+  is unavailable. Order the respawn announcement before output from the
+  new generation and drain callbacks during sink teardown.
+- Auto-spawn accepts trusted sticky directories such as `/tmp`, tightens
+  legacy managed directories to `0700`, and sets startup logs to `0600`
+  even under a restrictive umask.
+- Reconcile notifications received before attach and respawn replies.
+  Ignore drop offsets from other generations. Preserve automatic session
+  creation when connecting to an existing 0.3.0 daemon.
+- Wait for piped input acknowledgments before the output quiet period and
+  return a failure when the daemon rejects input. Restore proper line endings
+  for exit notices in raw mode and report exact socket path length errors.
+- Enforce first-frame and partial-frame deadlines. Release publication also
+  requires the Alpine musl suite and the privileged Ubuntu foreign-UID tests.
 
 ## [0.3.0] - 2026-11-23
 
