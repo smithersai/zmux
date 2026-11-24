@@ -1,0 +1,24 @@
+---
+description: Run extended coverage-guided and live PTY fuzzing against zmux, minimize any crash, and report it with a reproducing corpus seed.
+capabilities: ["fs:read:**", "fs:write:.smithers/reports/fuzz-soak.json", "proc:spawn:zig *", "proc:spawn:rg *", "proc:spawn:jj --no-pager *"]
+model: sol
+budget:
+  tokens: 64000
+  milliseconds: 3600000
+---
+
+Run from the repository root with Zig 0.17.1. Do not modify source, push, or
+publish. Record `jj --no-pager log -r @ -n 1`, `zig version`, and host OS.
+
+1. Run `zig build fuzz -Doptimize=ReleaseSafe --fuzz=1M --summary all` for the
+   protocol, line reader, buffer, mux, connect, and server targets.
+2. Run `zig build fuzz-live --fuzz=500 --summary all` for real-PTY and
+   UNIX-socket chaos targets.
+3. For any failure, capture the failing input, minimize it, identify the
+   owning module, and state whether an existing seed in `test/fuzz/corpus.zig`
+   already covers it.
+
+Write `.smithers/reports/fuzz-soak.json`:
+{"revision":"...","zig_version":"...","host":"...","runs":[{"step":"fuzz","iterations":"1M","status":"passed|failed"},{"step":"fuzz-live","iterations":"500","status":"passed|failed"}],"crashes":[{"module":"...","input_hex":"...","signal_or_error":"...","existing_seed":false}],"summary":"..."}
+Never fabricate pass results; a step that did not run is `skipped` with the
+reason.

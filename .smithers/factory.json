@@ -1,0 +1,213 @@
+{
+  "summary": "zmux: incremental Zig 0.17.1 CI with per-module tests and benchmarks, coverage-guided protocol and live-PTY fuzzing, and maintainer triage.",
+  "flows": [
+    {
+      "id": "checks/review",
+      "description": "Review a zmux change for PTY lifecycle, JSON-RPC protocol safety, attach semantics, native embedding, and Zig memory ownership.",
+      "summary": "Review changes for PTY lifecycle, JSON-RPC protocol safety, attach semantics, native embedding, and Zig memory ownership.",
+      "featured": true,
+      "kind": "mdx",
+      "path": ".smithers/flows/checks/review/flow.mdx",
+      "capabilities": [
+        "fs:read:**"
+      ],
+      "model": null,
+      "modelInvocable": true,
+      "inputSchema": {
+        "dialect": "draft-2020-12",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "args": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "args"
+          ],
+          "additionalProperties": true
+        },
+        "definitions": {}
+      },
+      "flows": [
+        "coding/ReviewCheck"
+      ]
+    },
+    {
+      "id": "issue/repro",
+      "description": "Reproduce a zmux PTY, daemon, attach, or protocol defect with a minimal real-PTY reproduction before planning a fix.",
+      "summary": "Reproduce a zmux PTY, daemon, attach, or protocol defect with a minimal real-PTY reproduction before planning a fix.",
+      "featured": true,
+      "kind": "mdx",
+      "path": ".smithers/flows/issue/repro/flow.mdx",
+      "capabilities": [
+        "fs:read:**",
+        "proc:spawn:rg *",
+        "proc:spawn:jj --no-pager *",
+        "proc:spawn:zig *",
+        "proc:spawn:smthrs *"
+      ],
+      "model": "sol",
+      "modelInvocable": true,
+      "inputSchema": {
+        "dialect": "draft-2020-12",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "args": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "args"
+          ],
+          "additionalProperties": true
+        },
+        "definitions": {}
+      },
+      "flows": [],
+      "budget": {
+        "tokens": 64000,
+        "milliseconds": 1800000
+      }
+    },
+    {
+      "id": "issue/poc",
+      "description": "Implement a bounded zmux issue proof of concept with a failing unit or integration regression, fuzz seed, and benchmark check.",
+      "summary": "Implement a bounded zmux fix with a failing unit or integration regression, fuzz seed, and benchmark check.",
+      "featured": true,
+      "kind": "mdx",
+      "path": ".smithers/flows/issue/poc/flow.mdx",
+      "capabilities": [
+        "fs:read:**",
+        "fs:write:**",
+        "proc:spawn:rg *",
+        "proc:spawn:jj --no-pager *",
+        "proc:spawn:zig *",
+        "proc:spawn:smthrs *"
+      ],
+      "model": "sol",
+      "modelInvocable": true,
+      "inputSchema": {
+        "dialect": "draft-2020-12",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "args": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "args"
+          ],
+          "additionalProperties": true
+        },
+        "definitions": {}
+      },
+      "flows": [],
+      "budget": {
+        "tokens": 100000,
+        "milliseconds": 3600000
+      }
+    },
+    {
+      "id": "pr-triage",
+      "description": "Triage a zmux pull request from supplied metadata and diff without executing untrusted PR code.",
+      "summary": "Assess pull request readiness from its diff and CI evidence without executing untrusted PR code.",
+      "featured": true,
+      "kind": "mdx",
+      "path": ".smithers/flows/pr-triage/flow.mdx",
+      "capabilities": [
+        "fs:read:**",
+        "fs:write:.smithers/reports/pr-triage.json",
+        "proc:spawn:rg *"
+      ],
+      "model": "sol",
+      "modelInvocable": true,
+      "inputSchema": {
+        "dialect": "draft-2020-12",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "args": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "args"
+          ],
+          "additionalProperties": true
+        },
+        "definitions": {}
+      },
+      "flows": [],
+      "budget": {
+        "tokens": 64000,
+        "milliseconds": 600000
+      }
+    },
+    {
+      "id": "fuzz-soak",
+      "description": "Run extended coverage-guided and live PTY fuzzing against zmux, minimize any crash, and report it with a reproducing corpus seed.",
+      "summary": "Run extended coverage-guided and live PTY fuzzing, minimize any crash, and report it with a corpus seed.",
+      "featured": true,
+      "kind": "mdx",
+      "path": ".smithers/flows/fuzz-soak/flow.mdx",
+      "capabilities": [
+        "fs:read:**",
+        "fs:write:.smithers/reports/fuzz-soak.json",
+        "proc:spawn:zig *",
+        "proc:spawn:rg *",
+        "proc:spawn:jj --no-pager *"
+      ],
+      "model": "sol",
+      "modelInvocable": true,
+      "inputSchema": {
+        "dialect": "draft-2020-12",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "args": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "args"
+          ],
+          "additionalProperties": true
+        },
+        "definitions": {}
+      },
+      "flows": [],
+      "budget": {
+        "tokens": 64000,
+        "milliseconds": 3600000
+      }
+    }
+  ],
+  "on": [
+    {
+      "event": "schedule:0 14 * * 1",
+      "flow": "fuzz-soak",
+      "description": "Weekly Monday extended fuzz soak of the protocol, line reader, and live PTY/daemon targets"
+    }
+  ],
+  "github": {
+    "mirror": "pull",
+    "issues": "read",
+    "changes": "send-upstream",
+    "protectedPaths": [
+      "src/protocol.zig",
+      "src/sys.zig",
+      "src/pty.zig",
+      "src/daemon.zig",
+      "src/native.zig",
+      "build.zig",
+      "build.zig.zon",
+      ".github/workflows/release.yml"
+    ],
+    "maintainers": [
+      "roninjin10"
+    ]
+  }
+}

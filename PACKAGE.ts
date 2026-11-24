@@ -1,5 +1,8 @@
 import { Smithers as S } from "@smthrs/targets"
 
+// mise.toml pins Zig 0.17.1 (build.zig.zon minimum_zig_version). `mise install`
+// puts it on PATH; set ZIG to an absolute zig when PATH carries another one,
+// for example ZIG="$(mise which zig)". The binary's bytes are cache-key input.
 const zig = S.Host.bin("zig", { env: "ZIG" })
 
 // Exact per-module Zig dependency closures so Smithers invalidates and runs
@@ -40,9 +43,12 @@ const unitTest = (step: string, cacheKey: string, srcs: ReadonlyArray<string>) =
     timeout: "5m"
   })
 
+// Benchmarks are Shell.Build targets so their JSON result is a declared,
+// cacheable output: unchanged modules replay the cached JSON into
+// .benchmarks/ and only modules whose closure changed re-measure.
+// (Shell.Test has no outputs, so it cannot feed benchReport.)
 const benchTarget = (step: string, fileStem: string, srcs: ReadonlyArray<string>) =>
-  S.Shell.Test({
-    exclusive: true,
+  S.Shell.Build({
     bin: zig,
     args: [
       "build",
@@ -79,6 +85,29 @@ const build = S.Shell.Build({
   timeout: "10m"
 })
 
+// Release cross-compiles mirror .github/workflows/release.yml targets.
+const crossBuild = (triple: string) =>
+  S.Shell.Build({
+    bin: zig,
+    args: [
+      "build",
+      "--cache-dir",
+      `.zig-cache/smthrs-build-${triple}`,
+      "--prefix",
+      `zig-out/cross/${triple}`,
+      `-Dtarget=${triple}`,
+      "-Doptimize=ReleaseSafe"
+    ],
+    data: files([...mainSrcs, ...buildManifests]),
+    outDirs: [`zig-out/cross/${triple}/bin`],
+    timeout: "10m"
+  })
+
+const buildX8664LinuxMusl = crossBuild("x86_64-linux-musl")
+const buildAarch64LinuxMusl = crossBuild("aarch64-linux-musl")
+const buildX8664Macos = crossBuild("x86_64-macos")
+const buildAarch64Macos = crossBuild("aarch64-macos")
+
 // --- Incremental Unit, Fuzz & Integration Tests -----------------------------
 
 const testBuffer = unitTest("test-buffer", "buffer", bufferSrcs)
@@ -100,6 +129,32 @@ const testFuzz = S.Shell.Test({
   args: ["build", "--cache-dir", ".zig-cache/smthrs-test-fuzz", "fuzz"],
   data: [...files([...mainSrcs, ...buildManifests]), S.glob("test/fuzz/**/*.zig")],
   timeout: "5m"
+})
+
+// Bounded coverage-guided fuzzing. Each run is keyed on its inputs, so an
+// unchanged closure replays the green result instead of re-fuzzing.
+const fuzzCoverage = S.Shell.Test({
+  bin: zig,
+  args: [
+    "build",
+    "--cache-dir",
+    ".zig-cache/smthrs-fuzz-coverage",
+    "fuzz",
+    "-Doptimize=ReleaseSafe",
+    "--fuzz=10K"
+  ],
+  data: [...files([...mainSrcs, ...buildManifests]), S.glob("test/fuzz/**/*.zig")],
+  timeout: "15m"
+})
+
+// Live PTY and UNIX-socket chaos fuzzers spawn real PTYs and daemons, so they
+// sit in the exclusive tier: run with --include-exclusive or by label.
+const fuzzLive = S.Shell.Test({
+  exclusive: true,
+  bin: zig,
+  args: ["build", "--cache-dir", ".zig-cache/smthrs-fuzz-live", "fuzz-live", "--fuzz=30"],
+  data: [...files([...mainSrcs, ...buildManifests]), S.glob("test/fuzz/**/*.zig")],
+  timeout: "15m"
 })
 
 const testIntegration = S.Shell.Test({
@@ -196,6 +251,10 @@ export const Package = S.Package({
   targets: {
     fmtCheck,
     build,
+    buildX8664LinuxMusl,
+    buildAarch64LinuxMusl,
+    buildX8664Macos,
+    buildAarch64Macos,
     testBuffer,
     testProtocol,
     testRpcLineReader,
@@ -210,6 +269,8 @@ export const Package = S.Package({
     testDaemon,
     testMain,
     testFuzz,
+    fuzzCoverage,
+    fuzzLive,
     testIntegration,
     benchBuffer,
     benchProtocol,

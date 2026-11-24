@@ -1,0 +1,39 @@
+{
+  "blocks": [
+    {
+      "type": "text",
+      "title": "zmux factory",
+      "text": "tmux-style PTY session multiplexer in Zig: a daemon owns sessions, windows, panes, and PTYs; clients attach over a UNIX-socket JSON-RPC protocol. Incremental per-module Zig tests and benchmarks, coverage-guided fuzzing, and cross-compiled release builds run through `smthrs ci` with the build.smithers.sh cache."
+    },
+    {
+      "type": "prompt",
+      "title": "Ask about zmux",
+      "placeholder": "Describe a PTY hang, attach bug, protocol issue, or change…"
+    },
+    {
+      "type": "flows",
+      "title": "Review, reproduce, and fuzz"
+    },
+    {
+      "type": "links",
+      "links": [
+        {
+          "label": "Repository",
+          "url": "https://github.com/smithersai/zmux"
+        },
+        {
+          "label": "CI",
+          "url": "https://github.com/smithersai/zmux/actions/workflows/ci.yml"
+        },
+        {
+          "label": "Releases",
+          "url": "https://github.com/smithersai/zmux/releases"
+        },
+        {
+          "label": "README",
+          "url": "https://github.com/smithersai/zmux/blob/main/README.md"
+        }
+      ]
+    }
+  ]
+}

@@ -1313,7 +1313,9 @@ test "idle timeout waits for a live session then exits after it is terminated" {
 }
 
 fn waitForActiveConnections(server: *const server_mod.Server, expected: usize) !void {
-    const deadline = nowMs() + 2_000;
+    // Generous deadline: the loop exits as soon as the count matches, and a
+    // loaded host running parallel suites can take seconds to reap a closed fd.
+    const deadline = nowMs() + 10_000;
     while (server.active_connections.load(.seq_cst) != expected) {
         if (nowMs() >= deadline) return error.ActiveConnectionCountTimeout;
         sleepMs(10);

@@ -427,7 +427,7 @@ zig build fuzz-live --fuzz=150 --summary all
 
 `zig build test` automatically executes every fuzz target's regression corpus
 deterministically without `--fuzz`. CI runs bounded coverage-guided campaigns
-for both `fuzz` and `fuzz-live` on Ubuntu on every push and pull request.
+for `fuzz` on Ubuntu and macOS and `fuzz-live` on Ubuntu through `smthrs ci`.
 
 ### Performance benchmarks & incremental Smithers workflow
 
@@ -437,24 +437,38 @@ and incremental Smithers target declarations ([`.smithers/WORKSPACE.ts`](.smithe
 [`PACKAGE.ts`](PACKAGE.ts)).
 
 Each per-module test and benchmark target declares its exact Zig source
-dependency closure, and every benchmark runs in Smithers' `exclusive` tier with
-cached `.benchmarks/<module>.json` outputs so unchanged modules hit cache and
-only affected benchmarks re-run on any change:
+dependency closure. Benchmarks are `Shell.Build` targets whose
+`.benchmarks/<module>.json` result is a cached output, so unchanged modules
+replay their last measurement and only affected benchmarks re-run:
 
 ```sh
-# Run only affected unit/fuzz/integration tests and benchmarks for your changes
-smithers-build affected test //... --include-exclusive
+# mise.toml pins Zig 0.17.1; use it when PATH carries another zig
+mise install && export ZIG="$(mise which zig)"
 
-# Run benchmarks incrementally (cache-hitting unchanged modules) and print the
-# full Markdown comparison table against bench/baseline.json
-smithers-build run //:bench
+# Everything CI runs: fmt, ReleaseSafe + 4 cross-compiles, per-module tests,
+# integration, bounded coverage-guided fuzz, benchmarks, factory drift
+smthrs ci '//...'
+
+# Also run the live PTY / UNIX-socket chaos fuzzers (exclusive tier)
+smthrs ci '//...' --include-exclusive
+
+# Print the Markdown comparison table against bench/baseline.json
+smthrs run //:bench
 
 # Refresh bench/baseline.json from the latest cached/fresh benchmark results
-smithers-build run //:benchUpdateBaseline
+smthrs run //:benchUpdateBaseline
 
-# Run all non-exclusive unit, fuzz, format, and integration tests
-smithers-build test //...
+# Regenerate .smithers/factory.json and home.json after editing FACTORY.ts
+smthrs target //.smithers:factory-write --write
 ```
+
+Results cache locally under `.smithers/cache` and sync through
+`https://build.smithers.sh` when `SMITHERS_CACHE_READ_TOKEN` and
+`SMITHERS_CACHE_WRITE_TOKEN` are set. The factory at
+`smithers.sh/smithersai/zmux` is declared in
+[`.smithers/FACTORY.ts`](.smithers/FACTORY.ts) with review, issue
+reproduction, issue proof-of-concept, PR triage, and weekly fuzz-soak flows
+under [`.smithers/flows/`](.smithers/flows).
 
 You can also invoke individual suites directly with Zig:
 

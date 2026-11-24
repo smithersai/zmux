@@ -2,78 +2,84 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
+# Every gate is a target in PACKAGE.ts or .smithers/PACKAGE.ts. CI runs the
+# same `smthrs ci //...` a developer runs locally: formatting, ReleaseSafe and
+# four-triple cross-compiles, per-module unit tests, integration, bounded
+# coverage-guided fuzzing, per-module benchmarks, and factory projection drift.
+# Unchanged targets replay from the local .smithers/cache (restored below) or
+# the https://build.smithers.sh remote cache when tokens are configured.
 jobs:
-  test:
-    name: Test ${{ matrix.os }}
+  ci:
+    name: smthrs ci //... (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
+        include:
+          - os: ubuntu-latest
+            # Live PTY and UNIX-socket chaos fuzzers are exclusive-tier targets.
+            exclusive: "--include-exclusive"
+          - os: macos-latest
+            exclusive: ""
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: 0.17.1
+          persist-credentials: false
 
-      - name: Check formatting
-        run: zig fmt --check src test bench build.zig build.zig.zon
+      # mise.toml pins Zig 0.17.1; WORKSPACE.ts resolves zig through it.
+      - name: Setup mise toolchain
+        uses: jdx/mise-action@924e7c586e33d7d4bae9c14e26c5d22e2beb6e78 # v5.3.0
+        with:
+          install: true
+          cache: true
 
-      - name: Run tests
-        run: zig build test --summary all
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "26.4.0"
 
-      - name: Verify benchmarks compile and smoke-check
+      - name: Install smthrs
+        run: npm install --global --ignore-scripts --no-audit --no-fund smthrs@1.0.0-rc.16
+
+      - name: Restore Smithers action cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: .smithers/cache
+          key: smthrs-${{ runner.os }}-${{ github.sha }}
+          restore-keys: smthrs-${{ runner.os }}-
+
+      - name: Every target
+        run: smthrs ci '//...' ${{ matrix.exclusive }} --verbose --results-file "$RUNNER_TEMP/smthrs-results.json"
+        env:
+          SMITHERS_CACHE_READ_TOKEN: ${{ secrets.SMITHERS_CACHE_READ_TOKEN }}
+          SMITHERS_CACHE_WRITE_TOKEN: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.SMITHERS_CACHE_WRITE_TOKEN || '' }}
+
+      - name: Benchmark report
+        if: success()
         run: |
-          zig build bench-check --summary all
-          zig build bench-buffer bench-protocol -- --quick
+          smthrs run //:bench --verbose
+          cat .benchmarks/report.md >> "$GITHUB_STEP_SUMMARY" || true
 
-  fuzz:
-    name: Fuzz (Ubuntu)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+      - name: Upload smthrs results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          version: 0.17.1
-
-      - name: Run coverage-guided fast fuzz suite
-        run: zig build fuzz -Doptimize=ReleaseSafe --fuzz=10K --summary all
-
-      - name: Run coverage-guided live PTY and daemon fuzz suite
-        run: zig build fuzz-live --fuzz=30 --summary all
-
-  cross-compile:
-    name: Cross-compile ${{ matrix.zig_target }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        zig_target:
-          - x86_64-linux-musl
-          - aarch64-linux-musl
-          - x86_64-macos
-          - aarch64-macos
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: 0.17.1
-
-      - name: Build (ReleaseSafe)
-        run: zig build -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe
+          name: smthrs-results-${{ matrix.os }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/smthrs-results.json
+            .benchmarks/
+          if-no-files-found: ignore

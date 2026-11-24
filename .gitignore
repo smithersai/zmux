@@ -4,3 +4,5 @@ zig-out/
 .flows/
 .benchmarks/
 .DS_Store
+.smithers/cache/
+.smithers/reports/
