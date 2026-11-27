@@ -177,6 +177,7 @@ pub fn build(b: *std.Build) void {
     addUnitTestStep(b, target, optimize, test_filters, "test-server", "src/server.zig", "Run server unit tests");
     addUnitTestStep(b, target, optimize, test_filters, "test-daemon", "src/daemon.zig", "Run daemon unit tests");
     addUnitTestStep(b, target, optimize, test_filters, "test-main", "src/main.zig", "Run main library unit tests");
+    addUnitTestStep(b, target, optimize, test_filters, "test-socket-path", "src/socket_path.zig", "Run socket_path unit tests");
     const test_integration_step = b.step("test-integration", "Run integration test suite");
     test_integration_step.dependOn(&b.addRunArtifact(integration_tests).step);
 
@@ -211,6 +212,7 @@ pub fn build(b: *std.Build) void {
     const mod_pty = createRootModule(b, target, bench_optimize, "src/pty.zig");
     const mod_mux = createRootModule(b, target, bench_optimize, "src/mux.zig");
     const mod_daemon = createRootModule(b, target, bench_optimize, "src/daemon.zig");
+    const mod_socket_path = createRootModule(b, target, bench_optimize, "src/socket_path.zig");
 
     addBenchStep(b, bench_step, bench_check_step, target, bench_optimize, bench_harness_mod, "buffer", "bench/buffer_bench.zig", &.{
         .{ .name = "buffer", .module = mod_buffer },
@@ -247,6 +249,9 @@ pub fn build(b: *std.Build) void {
     });
     addBenchStep(b, bench_step, bench_check_step, target, bench_optimize, bench_harness_mod, "server", "bench/server_bench.zig", &.{
         .{ .name = "zmux", .module = mod_zmux },
+    });
+    addBenchStep(b, bench_step, bench_check_step, target, bench_optimize, bench_harness_mod, "socket-path", "bench/socket_path_bench.zig", &.{
+        .{ .name = "socket_path", .module = mod_socket_path },
     });
 
     const report_mod = b.createModule(.{

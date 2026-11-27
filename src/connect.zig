@@ -7,6 +7,8 @@ const socket_path = @import("socket_path.zig");
 const c = std.c;
 
 const posix = std.posix;
+const assert = std.debug.assert;
+const log = @import("log.zig");
 const sys = @import("sys.zig");
 const LineReader = rpc_line_reader.LineReader;
 
@@ -43,7 +45,10 @@ var g_restore_output = std.atomic.Value(bool).init(false);
 var g_output_fd: posix.fd_t = 1;
 var g_output_flags: c_int = 0;
 var g_winch_flag = std.atomic.Value(bool).init(false);
+/// Set when `restoreTerminal` could not reapply the saved termios.
+var g_restore_failed = std.atomic.Value(bool).init(false);
 
+/// Panic handler that restores the terminal before the default report.
 pub const panic = std.debug.FullPanic(connectPanic);
 
 fn connectPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
@@ -63,7 +68,8 @@ const Deadline = struct {
     }
 
     fn remainingMs(self: Deadline) i64 {
-        return @intCast(@max(0, self.at.durationFromNow(self.io).raw.toNanoseconds() + std.time.ns_per_ms - 1) / std.time.ns_per_ms);
+        const remaining_ns = self.at.durationFromNow(self.io).raw.toNanoseconds();
+        return @intCast(@max(0, remaining_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms);
     }
 
     fn timeout(self: Deadline) std.Io.Timeout {
@@ -71,8 +77,12 @@ const Deadline = struct {
     }
 };
 
+/// Entry point of `zmux-connect`: exits 2 on usage errors and 1 on any other
+/// failure, after reporting it on stderr.
 pub fn main(init: std.process.Init) void {
+    defer reportRestoreFailure();
     runMain(init) catch |err| {
+        reportRestoreFailure();
         switch (err) {
             error.InvalidArguments => std.process.exit(2),
             error.ReportedFailure, error.RpcError => {},
@@ -82,6 +92,7 @@ pub fn main(init: std.process.Init) void {
     };
 }
 
+/// Options accepted by `zmux-connect [attach] <session_id>`.
 pub const ParsedAttachArgs = struct {
     session_id: ?[]const u8 = null,
     explicit_socket_path: ?[]const u8 = null,
@@ -93,6 +104,7 @@ pub const ParsedAttachArgs = struct {
     detach_key: ?u8 = default_detach_key,
 };
 
+/// Every way `parseAttachArgs` can reject a command line.
 pub const ParseAttachArgsError = error{
     MissingSocketValue,
     MissingCommandValue,
@@ -102,12 +114,18 @@ pub const ParseAttachArgsError = error{
     UnexpectedArgument,
 };
 
+/// Detail for a `parseAttachArgs` failure: the error and offending argument.
 pub const ParseAttachArgsFailure = struct {
     err: ParseAttachArgsError,
     arg: ?[]const u8 = null,
 };
 
-pub fn parseAttachArgs(argv: []const []const u8, failure: ?*ParseAttachArgsFailure) ParseAttachArgsError!ParsedAttachArgs {
+/// Parse attach-mode `argv` (program name at index 0). On error, `failure`
+/// (when given) receives the details needed for a usage message.
+pub fn parseAttachArgs(
+    argv: []const []const u8,
+    failure: ?*ParseAttachArgsFailure,
+) ParseAttachArgsError!ParsedAttachArgs {
     var parsed: ParsedAttachArgs = .{};
     var options = true;
     var explicit_attach = false;
@@ -169,29 +187,11 @@ fn runMain(init: std.process.Init) !void {
     const io = init.io;
 
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-
-    // Global socket options may precede the management verb.
-    var verb_index: usize = 1;
-    var global_socket: ?[]const u8 = null;
-    while (verb_index + 1 < argv.len and std.mem.eql(u8, argv[verb_index], "--socket")) : (verb_index += 2) {
-        global_socket = argv[verb_index + 1];
-    }
-    if (verb_index < argv.len) {
-        if (parseVerb(argv[verb_index])) |verb| {
-            return runVerb(allocator, io, verb, argv[verb_index + 1 ..], global_socket);
-        }
+    if (findVerb(argv)) |call| {
+        return runVerb(allocator, io, call.verb, argv[call.index + 1 ..], call.global_socket);
     }
 
-    var failure: ParseAttachArgsFailure = .{ .err = error.UnknownFlag };
-    const parsed = parseAttachArgs(argv, &failure) catch |err| switch (err) {
-        error.MissingSocketValue => return fail(io, "missing value for --socket", .{}),
-        error.MissingCommandValue => return fail(io, "missing value for --command", .{}),
-        error.MissingDetachKeyValue => return fail(io, "missing value for --detach-key", .{}),
-        error.InvalidDetachKeyValue => return fail(io, "invalid --detach-key: {f}", .{escaped(failure.arg.?)}),
-        error.UnknownFlag => return fail(io, "unknown flag: {f}", .{escaped(failure.arg.?)}),
-        error.UnexpectedArgument => return fail(io, "unexpected argument: {f}", .{escaped(failure.arg.?)}),
-    };
-
+    const parsed = try parseAttachArgsOrFail(io, argv);
     if (parsed.show_help) {
         try printUsage(io);
         return;
@@ -200,13 +200,56 @@ fn runMain(init: std.process.Init) !void {
         try printVersion(io);
         return;
     }
+    return runAttach(allocator, io, parsed);
+}
 
+/// A management verb found on the command line.
+const VerbCall = struct {
+    verb: Verb,
+    /// Index of the verb in argv; its arguments follow it.
+    index: usize,
+    global_socket: ?[]const u8,
+};
+
+/// The management verb in `argv`, if any. Global socket options may precede
+/// the verb.
+fn findVerb(argv: []const []const u8) ?VerbCall {
+    var verb_index: usize = 1;
+    var global_socket: ?[]const u8 = null;
+    while (verb_index + 1 < argv.len and std.mem.eql(u8, argv[verb_index], "--socket")) : (verb_index += 2) {
+        global_socket = argv[verb_index + 1];
+    }
+    if (verb_index >= argv.len) return null;
+    const verb = parseVerb(argv[verb_index]) orelse return null;
+    return .{ .verb = verb, .index = verb_index, .global_socket = global_socket };
+}
+
+/// `parseAttachArgs`, with every failure reported as a usage message.
+fn parseAttachArgsOrFail(io: std.Io, argv: []const []const u8) error{InvalidArguments}!ParsedAttachArgs {
+    var failure: ParseAttachArgsFailure = .{ .err = error.UnknownFlag };
+    return parseAttachArgs(argv, &failure) catch |err| {
+        const arg = escaped(failure.arg orelse "");
+        return switch (err) {
+            error.MissingSocketValue => fail(io, "missing value for --socket", .{}),
+            error.MissingCommandValue => fail(io, "missing value for --command", .{}),
+            error.MissingDetachKeyValue => fail(io, "missing value for --detach-key", .{}),
+            error.InvalidDetachKeyValue => fail(io, "invalid --detach-key: {f}", .{arg}),
+            error.UnknownFlag => fail(io, "unknown flag: {f}", .{arg}),
+            error.UnexpectedArgument => fail(io, "unexpected argument: {f}", .{arg}),
+        };
+    };
+}
+
+/// Attach to (or create) the session named on the command line and run the
+/// interactive loop until it ends.
+fn runAttach(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedAttachArgs) !void {
     const sid = parsed.session_id orelse return fail(io, "session_id is required", .{});
     const path = try resolveSocketPath(allocator, io, parsed.explicit_socket_path);
     defer allocator.free(path);
 
     const socket_fd = try connectWithRetry(allocator, io, path, parsed.spawn_daemon);
     defer sys.close(socket_fd);
+    assert(socket_fd >= 3);
     var reader: LineReader = .{};
     defer reader.deinit();
 
@@ -220,21 +263,17 @@ fn runMain(init: std.process.Init) !void {
     defer notifications.deinit(allocator);
     var deadline = Deadline.fromNow(io, bootstrap_response_timeout_ms);
     deadline.notifications = &notifications;
-    var attach = try attachOrCreate(allocator, &reader, socket_fd, sid, size, parsed.auto_create, parsed.create_command, deadline);
+    const create_command = parsed.create_command;
+    const auto_create = parsed.auto_create;
+    var attach = try attachOrCreate(allocator, &reader, socket_fd, sid, size, auto_create, create_command, deadline);
     defer attach.deinit(allocator);
 
-    var previous_mask: posix.sigset_t = undefined;
-    const signals = terminalSignalSet();
-    posix.sigprocmask(posix.SIG.BLOCK, &signals, &previous_mask);
-    installTerminalHandlers();
-    g_terminal_active.store(true, .seq_cst);
-    const setup = enterTerminal(stdin_fd, stdout_fd, is_tty);
-    posix.sigprocmask(posix.SIG.SETMASK, &previous_mask, null);
+    const setup = enterTerminalGuarded(stdin_fd, stdout_fd, is_tty);
     defer leaveTerminal();
     try setup;
 
     try replayScrollback(allocator, attach.result(), stdout_fd);
-    if (jsonField(attach.result(), "exited") == .bool and jsonField(attach.result(), "exited").bool) {
+    if (attachExited(attach)) {
         try printExitStatus(io, attach.result());
         deadline = .fromNow(io, bootstrap_response_timeout_ms);
         deadline.notifications = &notifications;
@@ -242,7 +281,7 @@ fn runMain(init: std.process.Init) !void {
         attach.deinit(allocator);
         attach = next;
         try replayScrollback(allocator, attach.result(), stdout_fd);
-        if (jsonField(attach.result(), "exited") == .bool and jsonField(attach.result(), "exited").bool) {
+        if (attachExited(attach)) {
             try printExitStatus(io, attach.result());
             try stderrWrite(io, if (g_termios_saved.load(.seq_cst)) "session ended\r\n" else "session ended\n");
             return;
@@ -261,6 +300,30 @@ fn runMain(init: std.process.Init) !void {
     });
 
     leaveTerminal();
+    try reportOutcome(io, outcome);
+}
+
+/// True when an attach reply says the pane's process has already exited.
+fn attachExited(attach: Response) bool {
+    const exited = jsonField(attach.result(), "exited");
+    return exited == .bool and exited.bool;
+}
+
+/// Install the terminal signal handlers and enter raw mode with those signals
+/// blocked. The caller must `leaveTerminal` even when this fails.
+fn enterTerminalGuarded(stdin_fd: posix.fd_t, stdout_fd: posix.fd_t, is_tty: bool) !void {
+    var previous_mask: posix.sigset_t = undefined;
+    const signals = terminalSignalSet();
+    posix.sigprocmask(posix.SIG.BLOCK, &signals, &previous_mask);
+    installTerminalHandlers();
+    g_terminal_active.store(true, .seq_cst);
+    const setup = enterTerminal(stdin_fd, stdout_fd, is_tty);
+    posix.sigprocmask(posix.SIG.SETMASK, &previous_mask, null);
+    return setup;
+}
+
+/// Tell the user how the interactive session ended.
+fn reportOutcome(io: std.Io, outcome: RunOutcome) !void {
     switch (outcome) {
         .detached => try stderrWrite(io, "[detached]\n"),
         .detached_remotely => try stderrWrite(io, "[detached remotely]\n"),
@@ -402,7 +465,8 @@ fn respawnAndReattach(
 ) !Response {
     const pane_id = try requiredString(result, "paneId");
     const client_id = try requiredString(result, "clientId");
-    const respawned = try callRpc(allocator, reader, fd, 4, "pane.respawn", .{ .paneId = pane_id, .kill = false }, deadline);
+    const respawn_params = .{ .paneId = pane_id, .kill = false };
+    const respawned = try callRpc(allocator, reader, fd, 4, "pane.respawn", respawn_params, deadline);
     defer respawned.deinit(allocator);
     // Another client may have respawned the pane while we were printing replay.
     if (respawned.rpcError()) |err| if (!err.is("conflict")) return reportRpcError(deadline.io, err);
@@ -445,6 +509,7 @@ fn callRpc(
 ) !Response {
     const frame = try buildFrame(allocator, id, method, params);
     defer allocator.free(frame);
+    assert(frame[frame.len - 1] == '\n');
     return exchange(allocator, reader, fd, id, method, frame, deadline);
 }
 
@@ -457,6 +522,7 @@ fn exchange(
     frame: []const u8,
     deadline: Deadline,
 ) !Response {
+    assert(frame.len > 0);
     sendFrame(fd, frame, deadline.remainingMs()) catch |err| switch (err) {
         error.WriteTimeout => return diagnostic(deadline.io, "timed out sending {s}", .{operation}),
         // The daemon may close immediately after writing a null-id capacity
@@ -486,10 +552,18 @@ const BootstrapNotifications = struct {
             return error.TooManyBootstrapNotifications;
         try self.lines.append(allocator, line);
         self.bytes += line.len;
+        assert(self.bytes <= rpc_line_max);
+        assert(self.lines.items.len <= 4096);
     }
 };
 
-fn readRpcResponse(allocator: std.mem.Allocator, reader: *LineReader, fd: posix.fd_t, expected_id: u32, deadline: Deadline) !Response {
+fn readRpcResponse(
+    allocator: std.mem.Allocator,
+    reader: *LineReader,
+    fd: posix.fd_t,
+    expected_id: u32,
+    deadline: Deadline,
+) !Response {
     while (deadline.remainingMs() > 0) {
         const line = try reader.readLineAllocTimeout(allocator, deadline.io, fd, rpc_line_max, deadline.timeout());
         errdefer allocator.free(line);
@@ -545,7 +619,11 @@ fn parseDetachKey(spec: []const u8) !?u8 {
 // Map a key name to its ASCII control byte: letters => C-a..C-z (0x01..0x1A),
 // and backslash => 0x1C so the default Ctrl-\ chord is expressible.
 fn controlByte(key: u8) ?u8 {
-    if (std.ascii.isAlphabetic(key)) return std.ascii.toUpper(key) - 'A' + 1;
+    if (std.ascii.isAlphabetic(key)) {
+        const byte = std.ascii.toUpper(key) - 'A' + 1;
+        assert(byte >= 0x01 and byte <= 0x1A);
+        return byte;
+    }
     if (key == '\\') return 0x1C;
     return null;
 }
@@ -561,7 +639,11 @@ fn warnOnVersionMismatch(
     if (response.rpcError()) |err| return reportRpcError(deadline.io, err);
     const daemon_ver = try requiredString(response.result(), "version");
     if (!std.mem.eql(u8, daemon_ver, protocol.version)) {
-        printDiagnostic(deadline.io, "warning: daemon protocol {f} differs from client {s}; continuing", .{ escaped(daemon_ver), protocol.version });
+        printDiagnostic(
+            deadline.io,
+            "warning: daemon protocol {f} differs from client {s}; continuing",
+            .{ escaped(daemon_ver), protocol.version },
+        );
     }
 }
 
@@ -590,6 +672,7 @@ fn verbName(verb: Verb) []const u8 {
     };
 }
 
+/// Arguments of a management verb (`ls`, `kill`, `rename`, `shutdown`).
 pub const ParsedVerbArgs = struct {
     target: ?[]const u8 = null,
     new_name: ?[]const u8 = null,
@@ -598,6 +681,7 @@ pub const ParsedVerbArgs = struct {
     show_help: bool = false,
 };
 
+/// Every way `parseVerbArgs` can reject a verb's arguments.
 pub const ParseVerbArgsError = error{
     MissingSocketValue,
     UnknownFlag,
@@ -606,12 +690,19 @@ pub const ParseVerbArgsError = error{
     MissingNewName,
 };
 
+/// Detail for a `parseVerbArgs` failure: the error and offending argument.
 pub const ParseVerbArgsFailure = struct {
     err: ParseVerbArgsError,
     arg: ?[]const u8 = null,
 };
 
-pub fn parseVerbArgs(verb: Verb, rest: []const []const u8, failure: ?*ParseVerbArgsFailure) ParseVerbArgsError!ParsedVerbArgs {
+/// Parse the arguments after `verb`. On error, `failure` (when given)
+/// receives the details needed for a usage message.
+pub fn parseVerbArgs(
+    verb: Verb,
+    rest: []const []const u8,
+    failure: ?*ParseVerbArgsFailure,
+) ParseVerbArgsError!ParsedVerbArgs {
     var parsed: ParsedVerbArgs = .{};
     const needs_target = (verb == .kill or verb == .rename);
     const needs_new_name = (verb == .rename);
@@ -766,7 +857,8 @@ fn buildVerbRequest(
         ),
         .rename => std.fmt.allocPrint(
             allocator,
-            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"session.rename\",\"params\":{{\"sessionId\":{f},\"name\":{f}}}}}\n",
+            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"session.rename\"," ++
+                "\"params\":{{\"sessionId\":{f},\"name\":{f}}}}}\n",
             .{ verb_rpc_id, std.json.fmt(target.?, .{}), std.json.fmt(new_name.?, .{}) },
         ),
     };
@@ -782,7 +874,11 @@ fn formatVerbResult(
     return switch (verb) {
         .list => formatSessionList(allocator, result),
         .kill => std.fmt.allocPrint(allocator, "killed session {f}\n", .{escaped(target.?)}),
-        .rename => std.fmt.allocPrint(allocator, "renamed session {f} to {f}\n", .{ escaped(target.?), escaped(new_name.?) }),
+        .rename => std.fmt.allocPrint(
+            allocator,
+            "renamed session {f} to {f}\n",
+            .{ escaped(target.?), escaped(new_name.?) },
+        ),
         .shutdown => allocator.dupe(u8, "daemon shutdown\n"),
     };
 }
@@ -816,6 +912,7 @@ const Escaped = struct {
             // Preserve printable UTF-8, including continuation bytes that
             // would otherwise look like standalone C1 controls.
             const len = std.unicode.utf8ByteSequenceLength(byte) catch 1;
+            assert(len >= 1 and len <= 4);
             const codepoint = if (len > 1 and i + len <= self.bytes.len)
                 std.unicode.utf8Decode(self.bytes[i..][0..len]) catch null
             else
@@ -852,10 +949,16 @@ fn diagnostic(io: std.Io, comptime fmt: []const u8, args: anytype) error{Reporte
 }
 
 fn printDiagnostic(io: std.Io, comptime fmt: []const u8, args: anytype) void {
+    writeStderr(io, "zmux-connect: " ++ fmt ++ "\n", args);
+}
+
+/// Write one best-effort message to stderr. A failed write has nowhere better
+/// to go, so it is logged at debug level and otherwise ignored.
+fn writeStderr(io: std.Io, comptime fmt: []const u8, args: anytype) void {
     var buf: [1024]u8 = undefined;
     var w = std.Io.File.stderr().writerStreaming(io, &buf);
-    w.interface.print("zmux-connect: " ++ fmt ++ "\n", args) catch {};
-    w.interface.flush() catch {};
+    w.interface.print(fmt, args) catch |err| return log.debug("stderr_write_failed", .{ .err = err });
+    w.interface.flush() catch |err| log.debug("stderr_write_failed", .{ .err = err });
 }
 
 const RunOutcome = enum { exited, session_ended, detached, detached_remotely, connection_lost };
@@ -881,9 +984,17 @@ const RunState = struct {
     pending_sends: std.AutoHashMapUnmanaged(u32, void) = .empty,
     send_reply_deadline: i64 = 0,
 
-    fn queue(self: *RunState, allocator: std.mem.Allocator, out: *WriteQueue, method: []const u8, params: anytype) !void {
+    fn queue(
+        self: *RunState,
+        allocator: std.mem.Allocator,
+        out: *WriteQueue,
+        method: []const u8,
+        params: anytype,
+    ) !void {
+        assert(self.next_id >= first_interactive_id);
         const frame = try buildFrame(allocator, self.next_id, method, params);
         defer allocator.free(frame);
+        assert(frame[frame.len - 1] == '\n');
         self.next_id += 1;
         try out.append(allocator, frame);
     }
@@ -893,8 +1004,11 @@ const RunState = struct {
     /// base64 straight into the frame: one allocation and no JSON escape scan
     /// over the base64 alphabet.
     fn queueSend(self: *RunState, allocator: std.mem.Allocator, out: *WriteQueue, input: []const u8) !void {
+        assert(self.next_id >= first_interactive_id);
+        assert(input.len > 0);
         const frame = try buildSendFrame(allocator, self.next_id, self.pane_id, input);
         defer allocator.free(frame);
+        assert(frame[frame.len - 1] == '\n');
         self.next_id += 1;
         try out.append(allocator, frame);
     }
@@ -907,8 +1021,9 @@ fn buildSendFrame(allocator: std.mem.Allocator, id: u32, session_id: []const u8,
         return buildFrame(allocator, id, "session.send", .{ .sessionId = session_id, .dataBase64 = encoded });
     }
     const encoder = std.base64.standard.Encoder;
-    var id_buf: [10]u8 = undefined;
-    const id_text = std.fmt.bufPrint(&id_buf, "{d}", .{id}) catch unreachable;
+    var id_buf: [std.fmt.count("{d}", .{std.math.maxInt(u32)})]u8 = undefined;
+    const id_text = try std.fmt.bufPrint(&id_buf, "{d}", .{id});
+    assert(id_text.len > 0);
     const parts = [_][]const u8{
         "{\"jsonrpc\":\"2.0\",\"id\":",
         id_text,
@@ -926,9 +1041,11 @@ fn buildSendFrame(allocator: std.mem.Allocator, id: u32, session_id: []const u8,
         @memcpy(frame[pos..][0..part.len], part);
         pos += part.len;
     }
+    assert(pos == head_len);
     _ = encoder.encode(frame[pos..][0..b64_len], input);
     pos += b64_len;
     @memcpy(frame[pos..][0..suffix.len], suffix);
+    assert(pos + suffix.len == frame.len);
     return frame;
 }
 
@@ -938,6 +1055,7 @@ const WriteQueue = struct {
     deadline: i64 = 0,
 
     fn pending(self: *const WriteQueue) []const u8 {
+        assert(self.sent <= self.bytes.items.len);
         return self.bytes.items[self.sent..];
     }
 
@@ -951,6 +1069,7 @@ const WriteQueue = struct {
             self.sent = 0;
         }
         try self.bytes.appendSlice(allocator, frame);
+        assert(self.pending().len <= outbound_max);
     }
 
     fn flush(self: *WriteQueue, fd: posix.fd_t) !void {
@@ -973,180 +1092,262 @@ fn runLoop(
     options: RunLoopOptions,
 ) !RunOutcome {
     try sys.setNonBlocking(socket_fd);
-    var state: RunState = .{
-        .pane_id = options.pane_id,
-        .client_id = options.client_id,
-        .generation = options.generation,
-        .next_offset = options.replay_end,
+    var loop: RunLoop = .{
+        .stdin_fd = stdin_fd,
+        .stdout_fd = stdout_fd,
+        .socket_fd = socket_fd,
+        .reader = reader,
+        .allocator = allocator,
+        .options = options,
+        .state = .{
+            .pane_id = options.pane_id,
+            .client_id = options.client_id,
+            .generation = options.generation,
+            .next_offset = options.replay_end,
+        },
+        .bootstrap_lines = options.bootstrap_lines,
+        .stdin_unpollable = pollUnsupported(stdin_fd),
+        .stdout_unpollable = pollUnsupported(stdout_fd),
     };
-    defer if (state.switched_pane) |pane| allocator.free(pane);
-    defer state.pending_sends.deinit(allocator);
-    var outbound: WriteQueue = .{};
-    defer outbound.bytes.deinit(allocator);
-
-    var partial_since: ?i64 = null;
-    var pending_output: ?[]u8 = null;
-    defer if (pending_output) |bytes| allocator.free(bytes);
-    var output_sent: usize = 0;
-
-    var stdin_eof = false;
-    var quiet_until: ?i64 = null;
-    var bootstrap_lines = options.bootstrap_lines;
-    var eof_outcome: ?RunOutcome = null;
-    var resize_pending = true;
-    var buf: [buffer_size]u8 = undefined;
-    const stdin_unpollable = pollUnsupported(stdin_fd);
-    const stdout_unpollable = pollUnsupported(stdout_fd);
-
+    defer loop.deinit();
     while (true) {
-        if (pending_output == null and (eof_outcome == null or state.pending_sends.count() != 0)) {
-            while (bootstrap_lines.len != 0 or reader.hasBufferedLine()) {
-                const owned = if (bootstrap_lines.len == 0)
-                    (try reader.nextBufferedLineAlloc(allocator, rpc_line_max)).?
-                else
-                    null;
-                defer if (owned) |bytes| allocator.free(bytes);
-                const line = owned orelse bootstrap_lines[0];
-                if (owned == null) bootstrap_lines = bootstrap_lines[1..];
-                if (try handleServerLine(allocator, line, &state, &pending_output, options.io)) |outcome|
-                    eof_outcome = outcome;
-                quiet_until = null;
-                partial_since = null;
-                if (pending_output != null or (eof_outcome != null and state.pending_sends.count() == 0)) break;
-            }
-            // Move a partial frame out of the fixed-size staging buffer so
-            // the next read can continue it.
-            if (pending_output == null and !reader.hasBufferedLine() and reader.end > reader.start) {
-                if (partial_since == null) partial_since = sys.monotonicMs();
-                _ = try reader.nextBufferedLineAlloc(allocator, rpc_line_max);
-            }
+        if (try loop.step()) |outcome| return outcome;
+    }
+}
+
+/// The interactive attach loop's state. `step` runs one poll turn; each
+/// phase of a turn is its own method.
+const RunLoop = struct {
+    stdin_fd: posix.fd_t,
+    stdout_fd: posix.fd_t,
+    socket_fd: posix.fd_t,
+    reader: *LineReader,
+    allocator: std.mem.Allocator,
+    options: RunLoopOptions,
+    state: RunState,
+    outbound: WriteQueue = .{},
+    partial_since: ?i64 = null,
+    pending_output: ?[]u8 = null,
+    output_sent: usize = 0,
+    stdin_eof: bool = false,
+    quiet_until: ?i64 = null,
+    bootstrap_lines: []const []const u8,
+    eof_outcome: ?RunOutcome = null,
+    resize_pending: bool = true,
+    buf: [buffer_size]u8 = undefined,
+    stdin_unpollable: bool,
+    stdout_unpollable: bool,
+
+    // Leave space for a worst-case input frame and a detach frame.
+    const queue_headroom = buffer_size * 2 + 4096;
+    comptime {
+        assert(queue_headroom < outbound_max);
+    }
+
+    fn deinit(self: *RunLoop) void {
+        if (self.state.switched_pane) |pane| self.allocator.free(pane);
+        self.state.pending_sends.deinit(self.allocator);
+        self.outbound.bytes.deinit(self.allocator);
+        if (self.pending_output) |bytes| self.allocator.free(bytes);
+    }
+
+    /// One loop turn. Returns the outcome once the session is over.
+    fn step(self: *RunLoop) !?RunOutcome {
+        assert(self.output_sent == 0 or self.pending_output != null);
+        if (self.pending_output == null and (self.eof_outcome == null or self.state.pending_sends.count() != 0)) {
+            try self.drainLines();
         }
 
-        const awaiting_sends = state.pending_sends.count() != 0;
-        if (eof_outcome) |outcome| {
-            if (!awaiting_sends and pending_output == null and (outcome != .detached or outbound.pending().len == 0)) return outcome;
-        }
-        const now = sys.monotonicMs();
-        if (partial_since) |started| {
-            if (now - started >= partial_frame_timeout_ms) return .connection_lost;
-        }
-        if (outbound.pending().len != 0 and now >= outbound.deadline) {
-            return diagnostic(options.io, "timed out sending interactive requests", .{});
-        }
-        if (awaiting_sends and now >= state.send_reply_deadline)
-            return diagnostic(options.io, "timed out waiting for session.send replies", .{});
-        if (stdin_eof and !awaiting_sends and outbound.pending().len == 0 and pending_output == null and partial_since == null) {
-            if (quiet_until == null) quiet_until = now + pipe_quiet_ms;
-            if (now >= quiet_until.?) return .exited;
-        }
+        const awaiting_sends = self.state.pending_sends.count() != 0;
+        if (try self.checkDeadlines(awaiting_sends)) |outcome| return outcome;
 
-        resize_pending = g_winch_flag.swap(false, .seq_cst) or resize_pending;
-        // Leave space for a worst-case input frame and a detach frame.
-        const can_queue = outbound.pending().len <= outbound_max - (buffer_size * 2 + 4096);
-        if (eof_outcome == null and resize_pending and can_queue) {
-            resize_pending = false;
-            if (currentTerminalSize(stdout_fd, stdin_fd)) |size| {
-                try state.queue(allocator, &outbound, "session.resize", .{
-                    .sessionId = state.pane_id,
-                    .rows = size.rows,
-                    .cols = size.cols,
-                });
-            }
-        }
+        const can_queue = self.outbound.pending().len <= outbound_max - queue_headroom;
+        try self.queueResize(can_queue);
 
-        const socket_events: i16 = (if (pending_output == null and (eof_outcome == null or awaiting_sends)) @as(i16, posix.POLL.IN) else 0) |
-            (if (outbound.pending().len != 0) @as(i16, posix.POLL.OUT) else 0);
-        const want_stdin = !stdin_eof and eof_outcome == null and can_queue and state.pending_sends.count() < max_pending_sends;
-        const want_stdout = pending_output != null;
+        const read_socket = self.pending_output == null and (self.eof_outcome == null or awaiting_sends);
+        const socket_events: i16 = (if (read_socket) @as(i16, posix.POLL.IN) else 0) |
+            (if (self.outbound.pending().len != 0) @as(i16, posix.POLL.OUT) else 0);
+        const want_stdin = !self.stdin_eof and self.eof_outcome == null and can_queue and
+            self.state.pending_sends.count() < max_pending_sends;
+        const want_stdout = self.pending_output != null;
+        const stdin_poll_fd = if (want_stdin and !self.stdin_unpollable) self.stdin_fd else -1;
+        const stdout_poll_fd = if (want_stdout and !self.stdout_unpollable) self.stdout_fd else -1;
         var fds = [_]posix.pollfd{
-            .{ .fd = if (want_stdin and !stdin_unpollable) stdin_fd else -1, .events = posix.POLL.IN, .revents = 0 },
-            .{ .fd = if (socket_events != 0) socket_fd else -1, .events = socket_events, .revents = 0 },
-            .{ .fd = if (want_stdout and !stdout_unpollable) stdout_fd else -1, .events = posix.POLL.OUT, .revents = 0 },
+            .{ .fd = stdin_poll_fd, .events = posix.POLL.IN, .revents = 0 },
+            .{ .fd = if (socket_events != 0) self.socket_fd else -1, .events = socket_events, .revents = 0 },
+            .{ .fd = stdout_poll_fd, .events = posix.POLL.OUT, .revents = 0 },
         };
         // An unpollable stdout (see pollUnsupported) is written without
         // waiting; an unpollable stdin is read once per loop turn.
-        _ = try posix.poll(&fds, if (want_stdout and stdout_unpollable) 0 else run_loop_poll_timeout_ms);
-        if (want_stdin and stdin_unpollable) fds[0].revents = posix.POLL.IN;
-        if (want_stdout and stdout_unpollable) fds[2].revents = posix.POLL.OUT;
+        _ = try posix.poll(&fds, if (want_stdout and self.stdout_unpollable) 0 else run_loop_poll_timeout_ms);
+        if (want_stdin and self.stdin_unpollable) fds[0].revents = posix.POLL.IN;
+        if (want_stdout and self.stdout_unpollable) fds[2].revents = posix.POLL.OUT;
         if ((fds[2].revents & (posix.POLL.ERR | posix.POLL.HUP)) != 0) return error.OutputClosed;
         // POLLNVAL counts as writable: Darwin's poll(2) rejects character
         // devices such as /dev/null with POLLNVAL. The write then succeeds,
         // or fails with the real error for a descriptor that is not open.
-        if ((fds[2].revents & (posix.POLL.OUT | posix.POLL.NVAL)) != 0) {
-            const bytes = pending_output.?;
-            const n = sys.write(stdout_fd, bytes[output_sent..]) catch |err| switch (err) {
-                error.WouldBlock => 0,
-                else => return err,
-            };
-            output_sent += n;
-            if (output_sent == bytes.len) {
-                allocator.free(bytes);
-                pending_output = null;
-                output_sent = 0;
-            }
-        }
-        if (socket_events & posix.POLL.IN != 0 and (fds[1].revents & (posix.POLL.IN | posix.POLL.HUP)) != 0) {
-            const filled = reader.fillOnce(socket_fd) catch |err| switch (@as(anyerror, err)) {
-                error.ConnectionClosed, error.ConnectionResetByPeer => return .connection_lost,
-                else => return err,
-            };
-            switch (filled) {
-                .data => quiet_until = null,
-                .eof => return .connection_lost,
-                .would_block => if ((fds[1].revents & posix.POLL.HUP) != 0) return .connection_lost,
-            }
-        } else if ((fds[1].revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0 or
-            (socket_events & posix.POLL.OUT != 0 and fds[1].revents & posix.POLL.HUP != 0 and pending_output == null))
-        {
-            return .connection_lost;
-        }
-        if ((fds[1].revents & posix.POLL.HUP) != 0 and socket_events & posix.POLL.IN == 0) {
-            // Finish pending terminal output before reading EOF from the socket.
-            outbound.bytes.clearRetainingCapacity();
-            outbound.sent = 0;
-        } else if ((fds[1].revents & posix.POLL.OUT) != 0) {
-            outbound.flush(socket_fd) catch |err| switch (err) {
-                error.BrokenPipe, error.ConnectionResetByPeer => {
-                    // Read already queued final frames before handling EOF.
-                    outbound.bytes.clearRetainingCapacity();
-                    outbound.sent = 0;
-                },
-                else => return err,
-            };
-        }
+        if ((fds[2].revents & (posix.POLL.OUT | posix.POLL.NVAL)) != 0) try self.writeOutput();
+        if (try self.serviceSocket(fds[1].revents, socket_events)) |outcome| return outcome;
 
         // POLLNVAL counts as readable: Darwin's poll(2) rejects character
         // devices such as /dev/null with POLLNVAL instead of reporting them
         // ready. The read then returns EOF (or the real error) rather than
         // leaving the loop spinning on a descriptor poll will never accept.
         if ((fds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
-            switch (try readStdinChunk(stdin_fd, &buf)) {
-                .again => {},
-                .eof => {
-                    if (!options.piped) return .exited;
-                    stdin_eof = true;
-                },
-                .bytes => |bytes| {
-                    const chord = if (options.detach_key) |key| std.mem.indexOfScalar(u8, bytes, key) else null;
-                    const input = bytes[0 .. chord orelse bytes.len];
-                    if (input.len != 0) {
-                        const send_id = state.next_id;
-                        try state.queueSend(allocator, &outbound, input);
-                        if (options.piped) {
-                            if (state.pending_sends.count() == 0)
-                                state.send_reply_deadline = sys.monotonicMs() + send_reply_timeout_ms;
-                            try state.pending_sends.put(allocator, send_id, {});
-                        }
-                    }
-                    if (chord != null) {
-                        try state.queue(allocator, &outbound, "client.detach", .{ .clientId = state.client_id });
-                        eof_outcome = .detached;
-                    }
-                },
-            }
+            return self.serviceStdin();
+        }
+        return null;
+    }
+
+    /// Handle bootstrap lines and complete buffered frames until output is
+    /// pending or the session is over.
+    fn drainLines(self: *RunLoop) !void {
+        const allocator = self.allocator;
+        while (self.bootstrap_lines.len != 0 or self.reader.hasBufferedLine()) {
+            const owned = if (self.bootstrap_lines.len == 0)
+                (try self.reader.nextBufferedLineAlloc(allocator, rpc_line_max)).?
+            else
+                null;
+            defer if (owned) |bytes| allocator.free(bytes);
+            const line = owned orelse self.bootstrap_lines[0];
+            if (owned == null) self.bootstrap_lines = self.bootstrap_lines[1..];
+            if (try handleServerLine(allocator, line, &self.state, &self.pending_output, self.options.io)) |outcome|
+                self.eof_outcome = outcome;
+            self.quiet_until = null;
+            self.partial_since = null;
+            if (self.pending_output != null) break;
+            if (self.eof_outcome != null and self.state.pending_sends.count() == 0) break;
+        }
+        // Move a partial frame out of the fixed-size staging buffer so
+        // the next read can continue it.
+        if (self.pending_output == null and !self.reader.hasBufferedLine() and self.reader.end > self.reader.start) {
+            if (self.partial_since == null) self.partial_since = sys.monotonicMs();
+            _ = try self.reader.nextBufferedLineAlloc(allocator, rpc_line_max);
         }
     }
-}
+
+    /// The outcome to return now, if the session is done or a deadline passed.
+    fn checkDeadlines(self: *RunLoop, awaiting_sends: bool) !?RunOutcome {
+        if (self.eof_outcome) |outcome| {
+            const detach_flushed = outcome != .detached or self.outbound.pending().len == 0;
+            if (!awaiting_sends and self.pending_output == null and detach_flushed) return outcome;
+        }
+        const now = sys.monotonicMs();
+        if (self.partial_since) |started| {
+            if (now - started >= partial_frame_timeout_ms) return .connection_lost;
+        }
+        if (self.outbound.pending().len != 0 and now >= self.outbound.deadline) {
+            return diagnostic(self.options.io, "timed out sending interactive requests", .{});
+        }
+        if (awaiting_sends and now >= self.state.send_reply_deadline)
+            return diagnostic(self.options.io, "timed out waiting for session.send replies", .{});
+        const idle = !awaiting_sends and self.outbound.pending().len == 0 and
+            self.pending_output == null and self.partial_since == null;
+        if (self.stdin_eof and idle) {
+            const quiet_until = self.quiet_until orelse now + pipe_quiet_ms;
+            self.quiet_until = quiet_until;
+            if (now >= quiet_until) return .exited;
+        }
+        return null;
+    }
+
+    /// Queue `session.resize` after SIGWINCH (and once at start).
+    fn queueResize(self: *RunLoop, can_queue: bool) !void {
+        self.resize_pending = g_winch_flag.swap(false, .seq_cst) or self.resize_pending;
+        if (self.eof_outcome != null or !self.resize_pending or !can_queue) return;
+        self.resize_pending = false;
+        const size = currentTerminalSize(self.stdout_fd, self.stdin_fd) orelse return;
+        assert(size.rows > 0 and size.cols > 0);
+        try self.state.queue(self.allocator, &self.outbound, "session.resize", .{
+            .sessionId = self.state.pane_id,
+            .rows = size.rows,
+            .cols = size.cols,
+        });
+    }
+
+    /// Write as much pending pane output to stdout as it accepts.
+    fn writeOutput(self: *RunLoop) !void {
+        const bytes = self.pending_output orelse return;
+        const n = sys.write(self.stdout_fd, bytes[self.output_sent..]) catch |err| switch (err) {
+            error.WouldBlock => 0,
+            else => return err,
+        };
+        self.output_sent += n;
+        assert(self.output_sent <= bytes.len);
+        if (self.output_sent == bytes.len) {
+            self.allocator.free(bytes);
+            self.pending_output = null;
+            self.output_sent = 0;
+        }
+    }
+
+    /// Read from and flush to the daemon socket per its poll result.
+    fn serviceSocket(self: *RunLoop, revents: i16, socket_events: i16) !?RunOutcome {
+        const hup = (revents & posix.POLL.HUP) != 0;
+        if (socket_events & posix.POLL.IN != 0 and (revents & (posix.POLL.IN | posix.POLL.HUP)) != 0) {
+            const filled = self.reader.fillOnce(self.socket_fd) catch |err| switch (@as(anyerror, err)) {
+                error.ConnectionClosed, error.ConnectionResetByPeer => return .connection_lost,
+                else => return err,
+            };
+            switch (filled) {
+                .data => self.quiet_until = null,
+                .eof => return .connection_lost,
+                .would_block => if (hup) return .connection_lost,
+            }
+        } else if ((revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0 or
+            (socket_events & posix.POLL.OUT != 0 and hup and self.pending_output == null))
+        {
+            return .connection_lost;
+        }
+        if (hup and socket_events & posix.POLL.IN == 0) {
+            // Finish pending terminal output before reading EOF from the socket.
+            self.outbound.bytes.clearRetainingCapacity();
+            self.outbound.sent = 0;
+        } else if ((revents & posix.POLL.OUT) != 0) {
+            self.outbound.flush(self.socket_fd) catch |err| switch (err) {
+                error.BrokenPipe, error.ConnectionResetByPeer => {
+                    // Read already queued final frames before handling EOF.
+                    self.outbound.bytes.clearRetainingCapacity();
+                    self.outbound.sent = 0;
+                },
+                else => return err,
+            };
+        }
+        return null;
+    }
+
+    /// Forward one stdin chunk as `session.send`, honoring the detach chord.
+    fn serviceStdin(self: *RunLoop) !?RunOutcome {
+        switch (try readStdinChunk(self.stdin_fd, &self.buf)) {
+            .again => {},
+            .eof => {
+                if (!self.options.piped) return .exited;
+                self.stdin_eof = true;
+            },
+            .bytes => |bytes| {
+                assert(bytes.len > 0);
+                const chord = if (self.options.detach_key) |key| std.mem.indexOfScalar(u8, bytes, key) else null;
+                const input = bytes[0 .. chord orelse bytes.len];
+                if (input.len != 0) {
+                    const send_id = self.state.next_id;
+                    try self.state.queueSend(self.allocator, &self.outbound, input);
+                    if (self.options.piped) {
+                        if (self.state.pending_sends.count() == 0)
+                            self.state.send_reply_deadline = sys.monotonicMs() + send_reply_timeout_ms;
+                        try self.state.pending_sends.put(self.allocator, send_id, {});
+                    }
+                }
+                if (chord != null) {
+                    try self.state.queue(self.allocator, &self.outbound, "client.detach", .{
+                        .clientId = self.state.client_id,
+                    });
+                    self.eof_outcome = .detached;
+                }
+            },
+        }
+        return null;
+    }
+};
 
 /// Whether `fd` is open but cannot be polled. Darwin's poll(2) "does not
 /// support devices" (BUGS section): an open character device such as
@@ -1172,6 +1373,7 @@ fn readStdinChunk(fd: posix.fd_t, buf: []u8) !StdinReadResult {
         else => return err,
     };
     if (n == 0) return .eof;
+    assert(n <= buf.len);
     return .{ .bytes = buf[0..n] };
 }
 
@@ -1191,24 +1393,31 @@ fn resolveSocketPath(allocator: std.mem.Allocator, io: std.Io, override: ?[]cons
     };
     errdefer allocator.free(path);
     socket_path.validate(path) catch |err| switch (err) {
-        error.SocketPathTooLong => return fail(io, "socket path too long ({d} > {d})", .{ path.len, sys.max_unix_path_len }),
+        error.SocketPathTooLong => return failSocketPathTooLong(io, path),
         else => return fail(io, "{s}", .{@errorName(err)}),
     };
+    assert(path.len <= sys.max_unix_path_len);
     return path;
+}
+
+fn failSocketPathTooLong(io: std.Io, path: []const u8) error{InvalidArguments} {
+    return fail(io, "socket path too long ({d} > {d})", .{ path.len, sys.max_unix_path_len });
 }
 
 fn connectWithRetry(allocator: std.mem.Allocator, io: std.Io, path: []const u8, spawn_daemon: bool) !posix.fd_t {
     const first_deadline = sys.monotonicMs() + write_timeout_ms;
     if (tryConnect(io, path, first_deadline)) |fd| return fd else |err| switch (err) {
         error.ConnectionRefused, error.FileNotFound => {
-            if (!spawn_daemon) return diagnostic(io, "no daemon at {f}; start zmuxd or pass --spawn-daemon", .{escaped(path)});
+            if (!spawn_daemon)
+                return diagnostic(io, "no daemon at {f}; start zmuxd or pass --spawn-daemon", .{escaped(path)});
         },
         else => return err,
     }
 
     // A refused connect can also mean an existing regular file or symlink.
     if (sys.statAt(sys.cwd_fd, path, false)) |st| {
-        if (!st.isSocket() or st.uid != sys.geteuid()) return diagnostic(io, "refusing to replace socket path {f}", .{escaped(path)});
+        if (!st.isSocket() or st.uid != sys.geteuid())
+            return diagnostic(io, "refusing to replace socket path {f}", .{escaped(path)});
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
@@ -1217,7 +1426,8 @@ fn connectWithRetry(allocator: std.mem.Allocator, io: std.Io, path: []const u8, 
     const deadline = sys.monotonicMs() + spawn_timeout_ms;
     spawnDaemonDetached(allocator, io, path, deadline) catch |err| {
         if (err == error.ReportedFailure) return err;
-        return diagnostic(io, "could not start daemon at {f}: {s}; see {f}.log", .{ escaped(path), @errorName(err), escaped(path) });
+        const args = .{ escaped(path), @errorName(err), escaped(path) };
+        return diagnostic(io, "could not start daemon at {f}: {s}; see {f}.log", args);
     };
     while (sys.monotonicMs() < deadline) {
         if (tryConnect(io, path, deadline)) |fd| return fd else |err| switch (err) {
@@ -1226,18 +1436,22 @@ fn connectWithRetry(allocator: std.mem.Allocator, io: std.Io, path: []const u8, 
             else => return err,
         }
     }
-    return diagnostic(io, "daemon at {f} did not become ready within 4s; see {f}.log", .{ escaped(path), escaped(path) });
+    const args = .{ escaped(path), escaped(path) };
+    return diagnostic(io, "daemon at {f} did not become ready within 4s; see {f}.log", args);
 }
 
 fn tryConnect(io: std.Io, path: []const u8, deadline: i64) !posix.fd_t {
     const connected = sys.connectUnixDeadline(path, deadline) catch |err| switch (err) {
-        error.NameTooLong => return fail(io, "socket path too long ({d} > {d})", .{ path.len, sys.max_unix_path_len }),
-        error.Timeout, error.ConnectionTimedOut => return diagnostic(io, "timed out connecting to daemon at {f}", .{escaped(path)}),
+        error.NameTooLong => return failSocketPathTooLong(io, path),
+        error.Timeout, error.ConnectionTimedOut => {
+            return diagnostic(io, "timed out connecting to daemon at {f}", .{escaped(path)});
+        },
         else => return err,
     };
     // Keep a socket out of stdin/stdout/stderr when the caller closed one.
     const fd = try moveAboveStdio(connected);
     errdefer sys.close(fd);
+    assert(fd >= 3);
     sys.tuneUnixSocketBuffers(fd);
     const uid = sys.peerEuid(fd) catch
         return diagnostic(io, "could not authenticate daemon at {f}; refusing", .{escaped(path)});
@@ -1252,7 +1466,11 @@ fn tryConnect(io: std.Io, path: []const u8, deadline: i64) !posix.fd_t {
         defer sys.close(dir);
         const st = try sys.fstat(dir);
         if (!st.isDir() or st.uid != sys.geteuid() or st.permissions() & 0o077 != 0)
-            return diagnostic(io, "socket directory {f} must be private and owned by the current user", .{escaped(parent)});
+            return diagnostic(
+                io,
+                "socket directory {f} must be private and owned by the current user",
+                .{escaped(parent)},
+            );
     }
     try sys.setNonBlocking(fd);
     return fd;
@@ -1263,6 +1481,8 @@ fn moveAboveStdio(fd: posix.fd_t) !posix.fd_t {
     defer sys.close(fd);
     const moved = c.fcntl(fd, c.F.DUPFD_CLOEXEC, @as(c_int, 3));
     if (moved < 0) return error.Unexpected;
+    // F_DUPFD_CLOEXEC returns the lowest free descriptor >= 3.
+    assert(moved >= 3);
     return moved;
 }
 
@@ -1285,7 +1505,8 @@ fn openSpawnSocketParent(path: []const u8, getenv: socket_path.GetEnv) !posix.fd
 fn spawnDaemonDetached(allocator: std.mem.Allocator, io: std.Io, path: []const u8, deadline: i64) !void {
     const self_path = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(self_path);
-    const daemon_path = try findDaemonSibling(allocator, io, std.fs.path.dirname(self_path) orelse ".", std.fs.path.basename(self_path));
+    const self_dir = std.fs.path.dirname(self_path) orelse ".";
+    const daemon_path = try findDaemonSibling(allocator, io, self_dir, std.fs.path.basename(self_path));
     defer allocator.free(daemon_path);
     const daemon_z = try allocator.dupeSentinel(u8, daemon_path, 0);
     defer allocator.free(daemon_z);
@@ -1296,10 +1517,13 @@ fn spawnDaemonDetached(allocator: std.mem.Allocator, io: std.Io, path: []const u
 
     const dir_fd = try moveAboveStdio(try openSpawnSocketParent(path, getEnv));
     defer sys.close(dir_fd);
+    assert(dir_fd >= 3);
     const log_name = try std.fmt.allocPrint(allocator, "{s}.log", .{std.fs.path.basename(path)});
     defer allocator.free(log_name);
-    const log_fd = try moveAboveStdio(try sys.openOwnedRegularAt(dir_fd, log_name, .{ .ACCMODE = .WRONLY, .APPEND = true, .CREAT = true }, 0o600));
+    const log_flags: posix.O = .{ .ACCMODE = .WRONLY, .APPEND = true, .CREAT = true };
+    const log_fd = try moveAboveStdio(try sys.openOwnedRegularAt(dir_fd, log_name, log_flags, 0o600));
     defer sys.close(log_fd);
+    assert(log_fd >= 3);
     try sys.fchmod(log_fd, 0o600);
     const devnull = try moveAboveStdio(try sys.openZ("/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0));
     defer sys.close(devnull);
@@ -1311,6 +1535,7 @@ fn spawnDaemonDetached(allocator: std.mem.Allocator, io: std.Io, path: []const u
     };
     defer sys.close(status_read);
     const status_write = try moveAboveStdio(status_pipe[1]);
+    assert(status_read >= 3 and status_write >= 3);
 
     const child = sys.fork() catch |err| {
         sys.close(status_write);
@@ -1360,6 +1585,7 @@ fn terminalSignalSet() posix.sigset_t {
 }
 
 fn enterTerminal(stdin_fd: posix.fd_t, stdout_fd: posix.fd_t, is_tty: bool) !void {
+    assert(stdout_fd >= 0);
     if (is_tty) {
         const current = try posix.tcgetattr(stdin_fd);
         g_saved_termios = current;
@@ -1406,9 +1632,19 @@ fn restoreTerminal() void {
     var previous: posix.sigset_t = undefined;
     const signals = terminalSignalSet();
     posix.sigprocmask(posix.SIG.BLOCK, &signals, &previous);
-    if (g_termios_saved.swap(false, .seq_cst)) posix.tcsetattr(g_saved_termios_fd, .NOW, g_saved_termios) catch {};
+    if (g_termios_saved.swap(false, .seq_cst)) {
+        // Signal context: logging takes the stderr lock, so only record the
+        // failure here; `main` reports it.
+        posix.tcsetattr(g_saved_termios_fd, .NOW, g_saved_termios) catch g_restore_failed.store(true, .seq_cst);
+    }
     if (g_restore_output.swap(false, .seq_cst)) _ = c.fcntl(g_output_fd, c.F.SETFL, g_output_flags);
     posix.sigprocmask(posix.SIG.SETMASK, &previous, null);
+}
+
+/// Log a terminal restore that failed in `restoreTerminal`. Not for signal
+/// context.
+fn reportRestoreFailure() void {
+    if (g_restore_failed.swap(false, .seq_cst)) log.warn("terminal_restore_failed", .{ .fd = g_saved_termios_fd });
 }
 
 fn winchHandler(_: posix.SIG) callconv(.c) void {
@@ -1475,7 +1711,8 @@ fn currentTerminalSize(stdout_fd: posix.fd_t, stdin_fd: posix.fd_t) ?TerminalSiz
 fn terminalSize(fd: posix.fd_t) ?TerminalSize {
     var size: posix.winsize = undefined;
     const rc = if (builtin.os.tag.isDarwin() or builtin.abi.isGnu()) blk: {
-        const ioctl = @extern(*const fn (posix.fd_t, c_ulong, ...) callconv(.c) c_int, .{ .name = "ioctl", .library_name = "c" });
+        const IoctlFn = *const fn (posix.fd_t, c_ulong, ...) callconv(.c) c_int;
+        const ioctl = @extern(IoctlFn, .{ .name = "ioctl", .library_name = "c" });
         break :blk ioctl(fd, tiocgwinsz(), &size);
     } else c.ioctl(fd, @intCast(tiocgwinsz()), &size);
     if (rc != 0 or size.col == 0 or size.row == 0) return null;
@@ -1487,6 +1724,7 @@ fn tiocgwinsz() c_ulong {
 }
 
 fn waitWritableOrReadable(fd: posix.fd_t, event: i16, deadline: i64) !void {
+    assert(event != 0);
     const remaining = deadline - sys.monotonicMs();
     if (remaining <= 0) return error.WriteTimeout;
     var pollfds = [_]posix.pollfd{.{ .fd = fd, .events = event, .revents = 0 }};
@@ -1499,6 +1737,7 @@ fn sendSome(fd: posix.fd_t, bytes: []const u8) !?usize {
         else => return err,
     };
     if (n == 0) return error.WriteZero;
+    assert(n <= bytes.len);
     return n;
 }
 
@@ -1513,6 +1752,7 @@ fn sendFrame(fd: posix.fd_t, bytes: []const u8, timeout_ms: i64) !void {
             try waitWritableOrReadable(fd, posix.POLL.OUT, deadline);
         }
     }
+    assert(offset == bytes.len);
 }
 
 fn writeAllFd(fd: posix.fd_t, bytes: []const u8) !void {
@@ -1529,6 +1769,7 @@ fn writeAllFd(fd: posix.fd_t, bytes: []const u8) !void {
         if (n == 0) return error.WriteZero;
         offset += n;
     }
+    assert(offset == bytes.len);
 }
 
 fn handleServerLine(
@@ -1551,7 +1792,9 @@ fn handleServerLine(
             if (!containsSubstrSimd(line, state.pane_id)) return null;
         }
         if (canonicalPaneOutput(line)) |frame| {
-            if (frame.generation != null and state.generation != null and frame.generation.? < state.generation.?) return null;
+            if (frame.generation) |generation| {
+                if (state.generation) |current| if (generation < current) return null;
+            }
             if (!std.mem.eql(u8, frame.pane_id, state.pane_id)) return null;
             return applyPaneOutput(allocator, state, output, frame.generation, frame.offset, frame.data_base64);
         }
@@ -1580,11 +1823,13 @@ fn canonicalPaneOutput(line: []const u8) ?CanonicalPaneOutput {
     const trimmed = std.mem.trimEnd(u8, line, " \t\r\n");
     if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
     const id_end = std.mem.indexOfScalarPos(u8, trimmed, prefix.len, '"') orelse return null;
+    assert(id_end >= prefix.len);
     const pane_id = trimmed[prefix.len..id_end];
     if (!isPlainJsonAscii(pane_id)) return null;
     if (!std.mem.startsWith(u8, trimmed[id_end..], mid)) return null;
     const b64_start = id_end + mid.len;
     const b64_end = std.mem.indexOfScalarPos(u8, trimmed, b64_start, '"') orelse return null;
+    assert(b64_end >= b64_start);
     const data_base64 = trimmed[b64_start..b64_end];
     if (!isPlainJsonAscii(data_base64)) return null;
 
@@ -1627,7 +1872,8 @@ fn handleServerLineDom(
     const rpc_error = RpcError.fromEnvelope(envelope);
     if (id) |number| {
         if (std.math.cast(u32, number)) |request_id| {
-            if ((rpc_error != null or envelope.object.contains("result")) and state.pending_sends.remove(request_id)) {
+            const is_reply = rpc_error != null or envelope.object.contains("result");
+            if (is_reply and state.pending_sends.remove(request_id)) {
                 if (rpc_error) |err| return reportRpcError(io, err);
                 state.send_reply_deadline = sys.monotonicMs() + send_reply_timeout_ms;
                 return null;
@@ -1645,25 +1891,48 @@ fn handleServerLineDom(
     const method = jsonObjectString(envelope, "method") orelse return null;
     const params = jsonField(envelope, "params");
     if (std.mem.eql(u8, method, protocol.client_detached_method) or std.mem.eql(u8, method, "client_switched")) {
-        if (!jsonAnyStringEquals(params, &.{ "clientId", "client_id" }, state.client_id)) return null;
-        if (std.mem.eql(u8, method, protocol.client_detached_method)) {
-            const reason = jsonObjectString(params, "reason") orelse "";
-            if (std.mem.eql(u8, reason, "remote_detach")) return .detached_remotely;
-            return .session_ended;
-        }
-        const pane = jsonAnyObjectString(params, &.{ "paneId", "pane_id" }) orelse return error.InvalidResponse;
-        if (pane.len == 0) return error.InvalidResponse;
-        const new_pane = try allocator.dupe(u8, pane);
-        if (state.switched_pane) |old_pane| allocator.free(old_pane);
-        state.switched_pane = new_pane;
-        state.pane_id = new_pane;
-        state.generation = jsonUnsigned(params, "generation");
-        state.next_offset = jsonUnsigned(params, "replayEndOffset");
-        output.* = try decodeReplay(allocator, params);
-        g_winch_flag.store(true, .seq_cst);
-        return null;
+        return handleClientNotification(allocator, method, params, state, output);
     }
+    return handlePaneNotification(allocator, method, params, state, output);
+}
 
+/// `client_detached` or `client_switched` addressed to this client.
+fn handleClientNotification(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    params: std.json.Value,
+    state: *RunState,
+    output: *?[]u8,
+) !?RunOutcome {
+    if (!jsonAnyStringEquals(params, &.{ "clientId", "client_id" }, state.client_id)) return null;
+    if (std.mem.eql(u8, method, protocol.client_detached_method)) {
+        const reason = jsonObjectString(params, "reason") orelse "";
+        if (std.mem.eql(u8, reason, "remote_detach")) return .detached_remotely;
+        return .session_ended;
+    }
+    const pane = jsonAnyObjectString(params, &.{ "paneId", "pane_id" }) orelse return error.InvalidResponse;
+    if (pane.len == 0) return error.InvalidResponse;
+    const new_pane = try allocator.dupe(u8, pane);
+    if (state.switched_pane) |old_pane| allocator.free(old_pane);
+    state.switched_pane = new_pane;
+    state.pane_id = new_pane;
+    assert(state.pane_id.len > 0);
+    state.generation = jsonUnsigned(params, "generation");
+    state.next_offset = jsonUnsigned(params, "replayEndOffset");
+    output.* = try decodeReplay(allocator, params);
+    g_winch_flag.store(true, .seq_cst);
+    return null;
+}
+
+/// Session and pane notifications (`session_exited`, `pane_respawned`,
+/// `pane_output_dropped`, `pane_output`) for the current pane.
+fn handlePaneNotification(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    params: std.json.Value,
+    state: *RunState,
+    output: *?[]u8,
+) !?RunOutcome {
     const generation = jsonUnsigned(params, "generation");
     if (generation != null and state.generation != null and generation.? < state.generation.?) return null;
 
@@ -1714,6 +1983,7 @@ fn applyPaneOutput(
         state.next_offset = @max(previous, offset +| bytes.len);
         break :blk @intCast(@min(previous -| offset, bytes.len));
     } else 0;
+    assert(skip <= bytes.len);
     if (skip == 0 and bytes.len != 0) {
         output.* = bytes;
     } else {
@@ -1738,6 +2008,7 @@ fn isPlainJsonAscii(bytes: []const u8) bool {
         const bad = (chunk < low) | (chunk >= high) | (chunk == quote) | (chunk == backslash);
         if (@reduce(.Or, bad)) return false;
     }
+    assert(bytes.len - i < 16);
     for (bytes[i..]) |b| {
         if (b < 0x20 or b >= 0x7f or b == '"' or b == '\\') return false;
     }
@@ -1753,6 +2024,7 @@ fn containsSubstrSimd(haystack: []const u8, needle: []const u8) bool {
     var pos: usize = 0;
     while (pos <= last_start) {
         const hit = std.mem.indexOfScalarPos(u8, haystack[0 .. last_start + 1], pos, needle[0]) orelse return false;
+        assert(hit <= last_start);
         if (std.mem.eql(u8, haystack[hit..][0..needle.len], needle)) return true;
         pos = hit + 1;
     }
@@ -1805,7 +2077,8 @@ fn jsonUnsigned(value: std.json.Value, key: []const u8) ?u64 {
 fn base64Encode(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     const encoder = std.base64.standard.Encoder;
     const out = try allocator.alloc(u8, encoder.calcSize(bytes.len));
-    _ = encoder.encode(out, bytes);
+    const written = encoder.encode(out, bytes);
+    assert(written.len == out.len);
     return out;
 }
 
@@ -1835,11 +2108,7 @@ fn stderrWrite(io: std.Io, bytes: []const u8) !void {
 }
 
 fn fail(io: std.Io, comptime fmt: []const u8, args: anytype) error{InvalidArguments} {
-    var buf: [1024]u8 = undefined;
-    var w = std.Io.File.stderr().writerStreaming(io, &buf);
-    w.interface.print("zmux-connect: " ++ fmt ++ "\n", args) catch {};
-    w.interface.print("Try 'zmux-connect --help' for usage.\n", .{}) catch {};
-    w.interface.flush() catch {};
+    writeStderr(io, "zmux-connect: " ++ fmt ++ "\nTry 'zmux-connect --help' for usage.\n", args);
     return error.InvalidArguments;
 }
 

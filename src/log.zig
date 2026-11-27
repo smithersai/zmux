@@ -21,9 +21,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const assert = std.debug.assert;
+
+/// Event severity. Lower values are more severe; a level enables itself and
+/// every more severe level.
 pub const Level = enum(u8) { err = 0, warn = 1, info = 2, debug = 3 };
 
+/// Level used until `setLevel` or `initFromEnv` picks another one.
 pub const default_level: Level = .warn;
+/// Environment variable `initFromEnv` reads the level from.
 pub const env_var = "ZMUX_LOG_LEVEL";
 
 /// Upper bound for one formatted line, including the trailing newline.
@@ -46,6 +52,7 @@ pub const RateLimiter = struct {
     pub fn admit(self: *RateLimiter, now_ms: i64) ?u64 {
         // 0 is the "never emitted" sentinel.
         const stamp = if (now_ms == 0) 1 else now_ms;
+        assert(stamp != 0);
         const last = self.last_ms.load(.monotonic);
         if (last != 0 and stamp -| last < self.interval_ms) {
             _ = self.suppressed.fetchAdd(1, .monotonic);
@@ -61,13 +68,19 @@ pub const RateLimiter = struct {
 };
 
 var current_level = std.atomic.Value(u8).init(@backingInt(default_level));
+var dropped_lines = std.atomic.Value(u64).init(0);
 
+/// Set the process-wide level. Safe to call from any thread.
 pub fn setLevel(level: Level) void {
     current_level.store(@backingInt(level), .seq_cst);
 }
 
+/// The process-wide level.
 pub fn getLevel() Level {
-    return @fromBackingInt(@intCast(current_level.load(.seq_cst)));
+    const raw = current_level.load(.seq_cst);
+    // Only `setLevel` stores, and it stores a valid `Level`.
+    assert(raw <= @backingInt(Level.debug));
+    return @fromBackingInt(@intCast(raw));
 }
 
 /// True when an event at `level` would be written at the current level.
@@ -75,6 +88,8 @@ pub fn enabled(level: Level) bool {
     return @backingInt(level) <= current_level.load(.seq_cst);
 }
 
+/// Parse a level name (`error`, `err`, `warn`, `warning`, `info`, `debug`),
+/// ignoring ASCII case.
 pub fn parseLevel(text: []const u8) error{InvalidLogLevel}!Level {
     const names = [_]struct { name: []const u8, level: Level }{
         .{ .name = "error", .level = .err },
@@ -97,11 +112,13 @@ pub fn initFromEnv(environ: *const std.process.Environ.Map) void {
     setLevel(levelFromEnvValue(environ.get(env_var)));
 }
 
+/// Level for a raw `ZMUX_LOG_LEVEL` value; null or invalid selects `default_level`.
 pub fn levelFromEnvValue(value: ?[]const u8) Level {
     const text = value orelse return default_level;
     return parseLevel(text) catch default_level;
 }
 
+/// Name written in the `"level"` member of a line.
 pub fn levelName(level: Level) []const u8 {
     return switch (level) {
         .err => "error",
@@ -122,13 +139,17 @@ pub fn emit(level: Level, comptime event: []const u8, fields: anytype) void {
     var buf: [max_line_bytes]u8 = undefined;
     const now_ms = std.Io.Clock.real.now(std.Options.debug_io).toMilliseconds();
     const line = format(&buf, level, now_ms, currentPid(), event, fields);
+    assert(line.len <= max_line_bytes);
+    assert(line[line.len - 1] == '\n');
     writeStderr(line);
 }
 
+/// `emit` at `.err`.
 pub fn err(comptime event: []const u8, fields: anytype) void {
     emit(.err, event, fields);
 }
 
+/// `emit` at `.warn`.
 pub fn warn(comptime event: []const u8, fields: anytype) void {
     emit(.warn, event, fields);
 }
@@ -149,10 +170,12 @@ pub fn warnRateLimited(comptime event: []const u8, limiter: *RateLimiter, fields
     writeStderr(line);
 }
 
+/// `emit` at `.info`.
 pub fn info(comptime event: []const u8, fields: anytype) void {
     emit(.info, event, fields);
 }
 
+/// `emit` at `.debug`.
 pub fn debug(comptime event: []const u8, fields: anytype) void {
     emit(.debug, event, fields);
 }
@@ -174,6 +197,7 @@ pub fn format(
     return formatSuppressed(buf, level, ts_ms, pid, event, 0, fields);
 }
 
+/// The whole line `format` writes when even the header does not fit.
 pub const header_overflow_line = "{\"event\":\"log_header_overflow\"}\n";
 
 /// `format` plus a `"suppressed":N` member after the header when N > 0.
@@ -226,6 +250,8 @@ pub fn formatSuppressed(
     }
 
     var end = line.len;
+    // `line.buf` reserved room for the marker and the closing brace.
+    assert(end + truncated_marker.len + tail.len <= buf.len);
     if (truncated) {
         @memcpy(buf[end..][0..truncated_marker.len], truncated_marker);
         end += truncated_marker.len;
@@ -248,6 +274,7 @@ const Line = struct {
         }
         @memcpy(self.buf[self.len..][0..bytes.len], bytes);
         self.len += bytes.len;
+        assert(self.len <= self.buf.len);
     }
 
     fn int(self: *Line, number: anytype) void {
@@ -279,52 +306,44 @@ const Line = struct {
                 if (i >= bytes.len or self.overflow) break;
             }
 
-            const byte = bytes[i];
-            switch (byte) {
-                '"' => {
-                    self.raw("\\\"");
-                    i += 1;
-                },
-                '\\' => {
-                    self.raw("\\\\");
-                    i += 1;
-                },
-                '\n' => {
-                    self.raw("\\n");
-                    i += 1;
-                },
-                '\r' => {
-                    self.raw("\\r");
-                    i += 1;
-                },
-                '\t' => {
-                    self.raw("\\t");
-                    i += 1;
-                },
-                0...8, 11, 12, 14...0x1f, 0x7f => {
-                    var tmp: [6]u8 = undefined;
-                    self.raw(std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{byte}) catch "?");
-                    i += 1;
-                },
-                0x80...0xff => {
-                    // Emit valid UTF-8 sequences verbatim; replace each stray
-                    // invalid byte with an escaped U+FFFD so the output is
-                    // always valid JSON and never misrepresents the byte.
-                    const seq_len = std.unicode.utf8ByteSequenceLength(byte) catch 0;
-                    if (seq_len > 1 and i + seq_len <= bytes.len and
-                        std.unicode.utf8ValidateSlice(bytes[i .. i + seq_len]))
-                    {
-                        self.raw(bytes[i .. i + seq_len]);
-                        i += seq_len;
-                    } else {
-                        self.raw("\\ufffd");
-                        i += 1;
-                    }
-                },
-                else => unreachable,
-            }
+            i += self.escaped(bytes[i..]);
         }
         self.raw("\"");
+    }
+
+    /// Write the JSON form of the character starting at `rest[0]`, which the
+    /// fast path in `string` did not copy, and return how many input bytes
+    /// it consumed (at least one).
+    fn escaped(self: *Line, rest: []const u8) usize {
+        assert(rest.len > 0);
+        const byte = rest[0];
+        switch (byte) {
+            '"' => self.raw("\\\""),
+            '\\' => self.raw("\\\\"),
+            '\n' => self.raw("\\n"),
+            '\r' => self.raw("\\r"),
+            '\t' => self.raw("\\t"),
+            0...8, 11, 12, 14...0x1f, 0x7f => {
+                var tmp: [6]u8 = undefined;
+                self.raw(std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{byte}) catch "?");
+            },
+            0x80...0xff => {
+                // Emit valid UTF-8 sequences verbatim; replace each stray
+                // invalid byte with an escaped U+FFFD so the output is
+                // always valid JSON and never misrepresents the byte.
+                const seq_len = std.unicode.utf8ByteSequenceLength(byte) catch 0;
+                assert(seq_len <= 4);
+                if (seq_len > 1 and seq_len <= rest.len and std.unicode.utf8ValidateSlice(rest[0..seq_len])) {
+                    self.raw(rest[0..seq_len]);
+                    return seq_len;
+                }
+                self.raw("\\ufffd");
+            },
+            // Printable ASCII is valid JSON as-is. `string` copies it in its
+            // fast path, so this arm is only a fallback.
+            else => self.raw(rest[0..1]),
+        }
+        return 1;
     }
 
     fn value(self: *Line, v: anytype) void {
@@ -375,7 +394,21 @@ fn writeStderr(bytes: []const u8) void {
     // `write(2)` (retried only on a short write).
     const stderr = std.debug.lockStderr(&.{});
     defer std.debug.unlockStderr();
-    stderr.file_writer.interface.writeAll(bytes) catch {};
+    writeLine(&stderr.file_writer.interface, bytes);
+}
+
+/// Write one line to the sink. A failed write cannot be logged through the
+/// logger itself, so it is counted in `droppedLines` instead.
+fn writeLine(writer: *std.Io.Writer, bytes: []const u8) void {
+    writer.writeAll(bytes) catch |write_err| switch (write_err) {
+        error.WriteFailed => _ = dropped_lines.fetchAdd(1, .monotonic),
+    };
+}
+
+/// Number of formatted lines lost because the stderr write failed (for
+/// example, stderr closed or a full pipe). Monotonic for the process.
+pub fn droppedLines() u64 {
+    return dropped_lines.load(.monotonic);
 }
 
 test "parseLevel accepts documented names case-insensitively" {
@@ -599,5 +632,56 @@ test "warnRateLimited below the configured level leaves the limiter untouched" {
     var limiter: RateLimiter = .{ .interval_ms = 1000 };
     warnRateLimited("suppressed_in_test", &limiter, .{ .n = @as(u8, 1) });
     try std.testing.expectEqual(@as(i64, 0), limiter.last_ms.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), limiter.suppressed.load(.monotonic));
+}
+
+test "levelName round-trips through parseLevel for every level" {
+    for ([_]Level{ .err, .warn, .info, .debug }) |level| {
+        try std.testing.expectEqual(level, try parseLevel(levelName(level)));
+    }
+}
+
+test "writeLine counts a failed sink write as a dropped line" {
+    var small: [4]u8 = undefined;
+    var full: std.Io.Writer = .fixed(&small);
+    const before = droppedLines();
+    writeLine(&full, "{\"event\":\"x\"}\n");
+    try std.testing.expect(droppedLines() >= before + 1);
+}
+
+test "writeLine passes a fitting line through unchanged" {
+    var storage: [64]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&storage);
+    writeLine(&sink, "{\"event\":\"x\"}\n");
+    try std.testing.expectEqualStrings("{\"event\":\"x\"}\n", sink.buffered());
+}
+
+test "format writes non-finite floats as null and finite floats as numbers" {
+    var buf: [max_line_bytes]u8 = undefined;
+    const line = format(&buf, .info, 1, 2, "f", .{
+        .nan = std.math.nan(f64),
+        .inf = std.math.inf(f32),
+        .half = @as(f64, 0.5),
+        .none = null,
+    });
+    try std.testing.expectEqualStrings(
+        "{\"ts_ms\":1,\"level\":\"info\",\"pid\":2,\"event\":\"f\",\"nan\":null,\"inf\":null," ++
+            "\"half\":0.5,\"none\":null}\n",
+        line,
+    );
+}
+
+test "format escapes DEL, tab, and carriage return" {
+    var buf: [max_line_bytes]u8 = undefined;
+    const line = format(&buf, .warn, 1, 2, "e", .{ .s = @as([]const u8, "a\x7fb\tc\rd") });
+    var parsed = try expectValidJsonLine(line);
+    defer parsed.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, line, "a\\u007fb\\tc\\rd") != null);
+    try std.testing.expectEqualStrings("a\x7fb\tc\rd", parsed.value.object.get("s").?.string);
+}
+
+test "RateLimiter with a zero interval admits every call" {
+    var limiter: RateLimiter = .{ .interval_ms = 0 };
+    for (0..5) |_| try std.testing.expectEqual(@as(?u64, 0), limiter.admit(42));
     try std.testing.expectEqual(@as(u64, 0), limiter.suppressed.load(.monotonic));
 }

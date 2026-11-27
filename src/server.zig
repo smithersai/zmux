@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const assert = std.debug.assert;
 
 const buffer_mod = @import("buffer.zig");
 const log = @import("log.zig");
@@ -60,6 +61,7 @@ const first_frame_deadline_ms: i64 = 10_000;
 /// Once a frame has started arriving it must complete within this time.
 const partial_frame_deadline_ms: i64 = 30_000;
 
+/// Most client connections served at once; also sizes the listen backlog.
 pub const max_client_connections: usize = 256;
 /// Room for a compact mutation result (three generated ids, a generation, and
 /// the envelope), reserved before the mutation commits.
@@ -121,12 +123,15 @@ const Payload = struct {
     }
 
     fn retain(self: *Payload) *Payload {
-        _ = self.ref_count.fetchAdd(1, .seq_cst);
+        const previous = self.ref_count.fetchAdd(1, .seq_cst);
+        assert(previous > 0);
         return self;
     }
 
     fn release(self: *Payload) void {
-        if (self.ref_count.fetchSub(1, .seq_cst) != 1) return;
+        const previous = self.ref_count.fetchSub(1, .seq_cst);
+        assert(previous > 0);
+        if (previous != 1) return;
         const allocator = self.allocator;
         if (self.output) |meta| allocator.free(meta.pane_id);
         allocator.free(self.bytes);
@@ -154,21 +159,25 @@ const PayloadQueue = struct {
     fn reserveOne(self: *PayloadQueue, allocator: Allocator) !void {
         if (self.len < self.items.len) return;
         const capacity = if (self.items.len == 0) 16 else self.items.len * 2;
+        assert(capacity > self.len);
         const next = try allocator.alloc(*Payload, capacity);
         for (0..self.len) |i| next[i] = self.at(i);
         allocator.free(self.items);
         self.items = next;
         self.head = 0;
+        assert(self.len < self.items.len);
     }
 
     fn pushAssumeCapacity(self: *PayloadQueue, payload: *Payload) void {
         std.debug.assert(self.len < self.items.len);
         self.items[(self.head + self.len) % self.items.len] = payload;
         self.len += 1;
+        assert(self.len <= self.items.len);
     }
 
     fn pop(self: *PayloadQueue) ?*Payload {
         if (self.len == 0) return null;
+        assert(self.head < self.items.len);
         const payload = self.items[self.head];
         self.head = (self.head + 1) % self.items.len;
         self.len -= 1;
@@ -176,10 +185,12 @@ const PayloadQueue = struct {
     }
 
     fn at(self: *const PayloadQueue, index: usize) *Payload {
+        assert(index < self.len);
         return self.items[(self.head + index) % self.items.len];
     }
 
     fn set(self: *PayloadQueue, index: usize, payload: *Payload) void {
+        assert(index < self.len);
         self.items[(self.head + index) % self.items.len] = payload;
     }
 };
@@ -266,12 +277,14 @@ const ClientConnection = struct {
     }
 
     fn retain(self: *ClientConnection) *ClientConnection {
-        _ = self.ref_count.fetchAdd(1, .seq_cst);
+        const previous = self.ref_count.fetchAdd(1, .seq_cst);
+        assert(previous > 0);
         return self;
     }
 
     fn release(self: *ClientConnection) void {
         const prev = self.ref_count.fetchSub(1, .seq_cst);
+        assert(prev > 0);
         if (prev == 1) {
             // Copy the allocator out of `self` before any destroy: reading
             // `self.allocator` after `destroy(self)` is a use-after-free.
@@ -375,6 +388,7 @@ const ClientConnection = struct {
                 try self.queue.reserveOne(self.allocator);
                 self.queue.pushAssumeCapacity(payload.retain());
                 self.queued_output_bytes += len;
+                assert(self.queued_output_bytes <= broadcast_queue_max_bytes);
             }
         } else {
             if (len > control_queue_max_bytes or self.queued_control_bytes > control_queue_max_bytes - len) {
@@ -383,6 +397,7 @@ const ClientConnection = struct {
             try self.queue.reserveOne(self.allocator);
             self.queue.pushAssumeCapacity(payload.retain());
             self.queued_control_bytes += len;
+            assert(self.queued_control_bytes <= control_queue_max_bytes);
         }
 
         try self.ensureWriterLocked();
@@ -419,6 +434,8 @@ const ClientConnection = struct {
                 kept += 1;
             }
         }
+        assert(kept <= total);
+        assert(kept + dropped_count == total);
         self.queue.len = kept;
         self.queued_output_bytes = 0;
         self.noteDropped(dropped_count);
@@ -500,6 +517,7 @@ const ClientConnection = struct {
     /// Write `batch` in queue order under one `write_mutex` hold. Frames that
     /// fit in `writer_coalesce_bytes` go out in one syscall.
     fn writeBatch(self: *ClientConnection, batch: []const *Payload) !void {
+        assert(batch.len > 0);
         if (batch.len == 1) return self.write(batch[0].bytes);
 
         var total: usize = 0;
@@ -512,6 +530,7 @@ const ClientConnection = struct {
                 @memcpy(coalesce_buf[pos..][0..payload.bytes.len], payload.bytes);
                 pos += payload.bytes.len;
             }
+            assert(pos == total);
             return self.write(coalesce_buf[0..pos]);
         }
 
@@ -524,6 +543,7 @@ const ClientConnection = struct {
     /// as in `takeWrite`), blocking until at least one is queued. Returns 0
     /// once the connection is closed. The caller releases each payload.
     fn takeQueuedBatch(self: *ClientConnection, out: []*Payload) usize {
+        assert(out.len > 0);
         var failed = false;
         const count: usize = blk: {
             self.queue_mutex.lockUncancelable(self.io);
@@ -544,14 +564,17 @@ const ClientConnection = struct {
                     };
                 } else if (self.queue.pop()) |payload| {
                     if (payload.output != null) {
+                        assert(self.queued_output_bytes >= payload.bytes.len);
                         self.queued_output_bytes -= payload.bytes.len;
                     } else {
+                        assert(self.queued_control_bytes >= payload.bytes.len);
                         self.queued_control_bytes -= payload.bytes.len;
                     }
                     out[count] = payload;
                 } else break;
                 count += 1;
             }
+            assert(count <= out.len);
             break :blk count;
         };
         // A client that cannot be told about a gap must not keep reading a
@@ -589,8 +612,10 @@ const ClientConnection = struct {
                 }
                 if (self.queue.pop()) |payload| {
                     if (payload.output != null) {
+                        assert(self.queued_output_bytes >= payload.bytes.len);
                         self.queued_output_bytes -= payload.bytes.len;
                     } else {
+                        assert(self.queued_control_bytes >= payload.bytes.len);
                         self.queued_control_bytes -= payload.bytes.len;
                     }
                     break :blk payload;
@@ -606,6 +631,7 @@ const ClientConnection = struct {
     }
 
     fn takeDropNoticeLocked(self: *ClientConnection) !*Payload {
+        assert(self.dropped.items.len > 0);
         const record = self.dropped.items[0];
         var params: protocol.PaneOutputDroppedParams = .{
             .pane_id = record.pane_id,
@@ -757,6 +783,7 @@ const ClientConnection = struct {
         }
         try next.ensureTotalCapacity(self.allocator, pane_ids.len);
         for (pane_ids) |pane_id| next.appendAssumeCapacity(try self.allocator.dupe(u8, pane_id));
+        assert(next.items.len == pane_ids.len);
 
         self.attachment_mutex.lockUncancelable(self.io);
         var previous = self.subscribed_panes;
@@ -880,9 +907,16 @@ pub const Server = struct {
     /// keeps its own duplicate, so the caller's lock and PID files and this
     /// socket are always in the same directory, whatever happens to its
     /// name.
-    pub fn initAt(allocator: Allocator, io: std.Io, dir_fd: posix.fd_t, socket_path: []const u8, idle_timeout_seconds: i64) !Server {
+    pub fn initAt(
+        allocator: Allocator,
+        io: std.Io,
+        dir_fd: posix.fd_t,
+        socket_path: []const u8,
+        idle_timeout_seconds: i64,
+    ) !Server {
         try validateSocketPath(socket_path);
         const owned_dir = try dupCloexec(dir_fd);
+        assert(owned_dir >= 0);
         errdefer sys.close(owned_dir);
         return initOwnedDir(allocator, io, owned_dir, socket_path, idle_timeout_seconds);
     }
@@ -893,10 +927,18 @@ pub const Server = struct {
         if (!std.fs.path.isAbsolute(socket_path)) return error.SocketPathNotAbsolute;
         if (socket_path.len > max_socket_path_len) return error.SocketPathTooLong;
         if (socket_path[socket_path.len - 1] == '/') return error.SocketPathNotSocket;
+        assert(socket_path.len > 0);
+        assert(socket_path.len <= max_socket_path_len);
     }
 
     /// Takes ownership of `dir_fd` on success only.
-    fn initOwnedDir(allocator: Allocator, io: std.Io, dir_fd: posix.fd_t, socket_path: []const u8, idle_timeout_seconds: i64) !Server {
+    fn initOwnedDir(
+        allocator: Allocator,
+        io: std.Io,
+        dir_fd: posix.fd_t,
+        socket_path: []const u8,
+        idle_timeout_seconds: i64,
+    ) !Server {
         const socket_name = std.fs.path.basename(socket_path);
 
         try clearStaleSocket(dir_fd, socket_name, socket_path);
@@ -1001,7 +1043,9 @@ pub const Server = struct {
                     // the same backoff: it keeps a failing accept from
                     // spinning at 100% CPU while still letting the server
                     // recover.
-                    self.io.sleep(.fromMilliseconds(accept_backoff_ms), .awake) catch {};
+                    self.io.sleep(.fromMilliseconds(accept_backoff_ms), .awake) catch |sleep_err| {
+                        log.debug("accept_backoff_sleep_failed", .{ .err = sleep_err });
+                    };
                     continue;
                 },
             };
@@ -1029,6 +1073,7 @@ pub const Server = struct {
         if (err != error.ProcessFdQuotaExceeded and err != error.SystemFdQuotaExceeded) return null;
         if (self.spare_fd < 0) return null;
         self.releaseSpareFd();
+        assert(self.spare_fd < 0);
         const client_fd = self.accept_fn(self.listener_fd) catch return null;
         _ = self.spare_fd_admissions.fetchAdd(1, .monotonic);
         log.warnRateLimited("accept_used_spare_fd", &accept_error_limiter, .{
@@ -1040,6 +1085,7 @@ pub const Server = struct {
     /// Take ownership of an accepted descriptor: check credentials and the
     /// connection limit, then hand it to a worker thread.
     fn admit(self: *Server, client_fd: posix.fd_t) void {
+        assert(client_fd >= 0);
         // Client sockets are non-blocking on every platform: the reader is
         // poll-driven, and `writeAllDeadline` needs `O_NONBLOCK` to bound a
         // send (BSD-derived systems inherit it from the listener; Linux does
@@ -1094,8 +1140,12 @@ pub const Server = struct {
 
     fn writeConnectionLimitError(fd: posix.fd_t) void {
         const message =
-            "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32000,\"message\":\"LimitExceeded\",\"data\":{\"kind\":\"limit\",\"detail\":\"server connection limit reached\"}}}\n";
-        writeAllDeadline(fd, message, 250) catch {};
+            "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32000,\"message\":\"LimitExceeded\"," ++
+            "\"data\":{\"kind\":\"limit\",\"detail\":\"server connection limit reached\"}}}\n";
+        comptime assert(message.len < 512);
+        writeAllDeadline(fd, message, 250) catch |err| {
+            log.debug("connection_limit_reply_failed", .{ .err = err });
+        };
     }
 
     /// The idle interval runs only while there is nothing to keep alive: it
@@ -1182,6 +1232,7 @@ pub const Server = struct {
     }
 
     fn handleClientThread(self: *Server, client_fd: posix.fd_t) void {
+        assert(client_fd >= 0);
         defer self.finishActiveConnection();
 
         const connection = ClientConnection.create(self.allocator, self.io, client_fd, self) catch {
@@ -1242,6 +1293,7 @@ pub const Server = struct {
     /// `first_deadline` is set until the connection's first request arrives.
     fn readFrame(self: *Server, connection: *ClientConnection, first_deadline: ?std.Io.Timestamp) !?[]u8 {
         const reader = &connection.reader;
+        assert(reader.start <= reader.end);
         if (first_deadline == null and reader.end == reader.start) {
             var fds = [_]posix.pollfd{.{
                 .fd = connection.fd,
@@ -1333,7 +1385,12 @@ pub const Server = struct {
     }
 
     /// The legacy session info object plus the compact identifiers.
-    fn replyCreatedSession(self: *Server, connection: *ClientConnection, req: *const protocol.Request, handle: *const mux.PaneHandle) !void {
+    fn replyCreatedSession(
+        self: *Server,
+        connection: *ClientConnection,
+        req: *const protocol.Request,
+        handle: *const mux.PaneHandle,
+    ) !void {
         const info = try handle.native.infoJson(self.allocator);
         defer self.allocator.free(info);
         const trimmed = std.mem.trimEnd(u8, info, " \t\r\n");
@@ -1468,18 +1525,23 @@ pub const Server = struct {
         try self.replySnapshot(connection, req);
     }
 
+    /// Parse an attach's optional `createIfMissing` object, with server
+    /// defaults applied. The caller deinits the result.
+    fn attachCreateArgs(self: *Server, params: ?Value) !?MuxCreateArgs {
+        const create_params = try objectParam(params, "createIfMissing") orelse return null;
+        var args = try muxCreateArgsFromParams(self.allocator, create_params, .{ .id_aliases_title = true });
+        self.applyCreateDefaults(&args.opts);
+        return args;
+    }
+
     fn attachMuxClient(self: *Server, connection: *ClientConnection, req: *const protocol.Request) !void {
         const params = req.params();
         const target = try paneIdParam(params) orelse return error.InvalidParams;
         const rows = try dimensionParam(params, "rows", 24);
         const cols = try dimensionParam(params, "cols", 80);
 
-        var create_args: ?MuxCreateArgs = null;
+        var create_args = try self.attachCreateArgs(params);
         defer if (create_args) |*args| args.deinit();
-        if (try objectParam(params, "createIfMissing")) |create_params| {
-            create_args = try muxCreateArgsFromParams(self.allocator, create_params, .{ .id_aliases_title = true });
-            self.applyCreateDefaults(&create_args.?.opts);
-        }
 
         // Manager attach and connection tracking are one ownership step: a
         // detach or pane removal drained in between would find no owner.
@@ -1487,7 +1549,8 @@ pub const Server = struct {
         var routing_held = true;
         defer if (routing_held) self.routing_mutex.unlock(self.io);
 
-        var attached = try self.manager.attachOrCreateClient(target, rows, cols, if (create_args) |args| args.opts else null);
+        const create_opts = if (create_args) |args| args.opts else null;
+        var attached = try self.manager.attachOrCreateClient(target, rows, cols, create_opts);
         defer attached.client.deinit(self.allocator);
         const client = &attached.client;
         errdefer _ = self.manager.detachClient(client.id);
@@ -1625,7 +1688,8 @@ pub const Server = struct {
             // Resolve a session name or alias to its pane id; an unknown
             // target is kept verbatim so a pane can be subscribed by id.
             const resolved = blk: {
-                const native = self.manager.find(item.string) orelse break :blk try self.allocator.dupe(u8, item.string);
+                const native = self.manager.find(item.string) orelse
+                    break :blk try self.allocator.dupe(u8, item.string);
                 defer native.release();
                 break :blk try self.allocator.dupe(u8, native.id);
             };
@@ -1786,7 +1850,12 @@ pub const Server = struct {
         try self.writeResponse(connection, response);
     }
 
-    fn replyRaw(self: *Server, connection: *ClientConnection, req: *const protocol.Request, raw_json: []const u8) !void {
+    fn replyRaw(
+        self: *Server,
+        connection: *ClientConnection,
+        req: *const protocol.Request,
+        raw_json: []const u8,
+    ) !void {
         if (protocol.isNotification(req)) return;
         if (raw_json.len > max_response_bytes) return error.LimitExceeded;
         const response = try protocol.resultRaw(self.allocator, req.id_json, raw_json);
@@ -1821,9 +1890,17 @@ pub const Server = struct {
         if (mapping.kind == .internal) {
             log.warnRateLimited("rpc_internal_error", &internal_error_limiter, .{ .err = err });
         }
-        const response = protocol.errorWithKind(self.allocator, id_json, mapping.code, @errorName(err), mapping.kind) catch return;
+        const response = protocol.errorWithKind(
+            self.allocator,
+            id_json,
+            mapping.code,
+            @errorName(err),
+            mapping.kind,
+        ) catch return;
         defer self.allocator.free(response);
-        connection.write(response) catch {};
+        connection.write(response) catch |write_err| {
+            log.debug("error_reply_write_failed", .{ .err = write_err });
+        };
     }
 
     // -- Connection registry ---------------------------------------------------
@@ -1838,6 +1915,7 @@ pub const Server = struct {
             connection.release();
             return false;
         };
+        assert(self.connections.items.len > 0);
         self.connected_clients.store(self.connections.items.len, .release);
         return true;
     }
@@ -1928,14 +2006,16 @@ pub const Server = struct {
 
     fn finishActiveWriter(self: *Server) void {
         self.active_mutex.lockUncancelable(self.io);
-        _ = self.active_writer_threads.fetchSub(1, .seq_cst);
+        const previous = self.active_writer_threads.fetchSub(1, .seq_cst);
+        assert(previous > 0);
         self.active_condition.broadcast(self.io);
         self.active_mutex.unlock(self.io);
     }
 
     fn finishActiveConnection(self: *Server) void {
         self.active_mutex.lockUncancelable(self.io);
-        _ = self.active_connections.fetchSub(1, .seq_cst);
+        const previous = self.active_connections.fetchSub(1, .seq_cst);
+        assert(previous > 0);
         self.active_condition.broadcast(self.io);
         self.active_mutex.unlock(self.io);
     }
@@ -1964,6 +2044,7 @@ pub const Server = struct {
             snapshot.heap = allocated;
             break :blk allocated;
         };
+        assert(slots.len == total);
         var count: usize = 0;
         for (self.connections.items) |connection| {
             if (pane_filter) |pane_id| {
@@ -1972,6 +2053,7 @@ pub const Server = struct {
             slots[count] = connection.retain();
             count += 1;
         }
+        assert(count <= total);
         snapshot.len = count;
         return snapshot;
     }
@@ -1986,6 +2068,7 @@ pub const Server = struct {
 
         fn items(self: *Snapshot) []*ClientConnection {
             const slots = if (self.heap) |heap| heap else self.stack[0..];
+            assert(self.len <= slots.len);
             return slots[0..self.len];
         }
     };
@@ -2035,6 +2118,7 @@ pub const Server = struct {
             self.allocator.free(bytes);
             return;
         }
+        assert(bytes.len <= max_event_bytes);
         const payload = Payload.create(self.allocator, bytes, null) catch {
             self.allocator.free(bytes);
             return;
@@ -2154,6 +2238,7 @@ fn nameZ(buf: *[posix.PATH_MAX]u8, name: []const u8) error{NameTooLong}![*:0]con
 }
 
 fn mkdirAt(dir_fd: posix.fd_t, name: []const u8, mode: std.c.mode_t) !void {
+    assert(name.len > 0);
     var buf: [posix.PATH_MAX]u8 = undefined;
     const name_z = try nameZ(&buf, name);
     switch (posix.errno(std.c.mkdirat(dir_fd, name_z, mode))) {
@@ -2176,6 +2261,8 @@ fn rmdirAt(dir_fd: posix.fd_t, name: []const u8) void {
 /// `linkat(2)` without following: fails with `error.AddressInUse` when
 /// `new_name` exists, so publication never replaces a live entry.
 fn linkAt(old_dir_fd: posix.fd_t, old_name: []const u8, new_dir_fd: posix.fd_t, new_name: []const u8) !void {
+    assert(old_name.len > 0);
+    assert(new_name.len > 0);
     var old_buf: [posix.PATH_MAX]u8 = undefined;
     var new_buf: [posix.PATH_MAX]u8 = undefined;
     const old_z = try nameZ(&old_buf, old_name);
@@ -2198,14 +2285,19 @@ fn linkAt(old_dir_fd: posix.fd_t, old_name: []const u8, new_dir_fd: posix.fd_t, 
 fn unlinkIfSame(dir_fd: posix.fd_t, name: []const u8, expected: sys.Stat) void {
     const current = sys.statAt(dir_fd, name, false) catch return;
     if (!current.sameFile(expected)) return;
-    sys.unlinkAt(dir_fd, name) catch {};
+    sys.unlinkAt(dir_fd, name) catch |err| {
+        log.debug("socket_unlink_failed", .{ .err = err });
+    };
 }
 
 fn dupCloexec(fd: posix.fd_t) !posix.fd_t {
     while (true) {
         const rc = std.c.fcntl(fd, posix.F.DUPFD_CLOEXEC, @as(c_int, 0));
         switch (posix.errno(rc)) {
-            .SUCCESS => return @intCast(rc),
+            .SUCCESS => {
+                assert(rc >= 0);
+                return @intCast(rc);
+            },
             .INTR => continue,
             .MFILE => return error.ProcessFdQuotaExceeded,
             .BADF => return error.NotOpenForReading,
@@ -2229,7 +2321,10 @@ fn openDirAt(dir_fd: posix.fd_t, name: []const u8) !posix.fd_t {
     while (true) {
         const rc = std.c.openat(dir_fd, name_z, flags, @as(c_uint, 0));
         switch (posix.errno(rc)) {
-            .SUCCESS => return @intCast(rc),
+            .SUCCESS => {
+                assert(rc >= 0);
+                return @intCast(rc);
+            },
             .INTR => continue,
             .ACCES, .PERM => return error.AccessDenied,
             .NOENT => return error.FileNotFound,
@@ -2327,7 +2422,8 @@ fn clearStaleSocket(dir_fd: posix.fd_t, socket_name: []const u8, socket_path: []
     if (!existing.isSocket()) return error.SocketPathNotSocket;
     if (existing.uid != sys.geteuid()) return error.AccessDenied;
 
-    const probe = sys.connectUnixDeadline(socket_path, sys.monotonicMs() + stale_probe_timeout_ms) catch |err| switch (err) {
+    const probe_deadline = sys.monotonicMs() + stale_probe_timeout_ms;
+    const probe = sys.connectUnixDeadline(socket_path, probe_deadline) catch |err| switch (err) {
         error.ConnectionRefused => {
             // No listener: stale. Remove it only if it is still the entry
             // that was inspected.
@@ -2350,7 +2446,11 @@ fn clearStaleSocket(dir_fd: posix.fd_t, socket_name: []const u8, socket_path: []
 
     const peer = sys.peerEuid(probe) catch return error.ProbeInconclusive;
     if (peer != sys.geteuid()) {
-        log.err("socket_owned_by_other_user", .{ .socket_path = socket_path, .peer_euid = peer, .euid = sys.geteuid() });
+        log.err("socket_owned_by_other_user", .{
+            .socket_path = socket_path,
+            .peer_euid = peer,
+            .euid = sys.geteuid(),
+        });
         return error.AccessDenied;
     }
     return error.AddressInUse;
@@ -2384,7 +2484,15 @@ fn clearStaleSocket(dir_fd: posix.fd_t, socket_name: []const u8, socket_path: []
 /// it cannot fit in `sun_path`, the socket is bound in place only if that is
 /// provably private (see bindSocketInPlace); otherwise the bind is refused
 /// rather than exposed.
-fn bindPrivateSocket(io: std.Io, listener: posix.fd_t, dir_fd: posix.fd_t, socket_name: []const u8, socket_path: []const u8) !sys.Stat {
+fn bindPrivateSocket(
+    io: std.Io,
+    listener: posix.fd_t,
+    dir_fd: posix.fd_t,
+    socket_name: []const u8,
+    socket_path: []const u8,
+) !sys.Stat {
+    assert(socket_name.len > 0);
+    assert(socket_path.len >= socket_name.len);
     // Linux derives the socket file mode from the socket inode's mode, so this
     // makes bind create the file 0600 outright. macOS rejects fchmod on
     // sockets; staging covers both.
@@ -2401,15 +2509,65 @@ fn bindPrivateSocket(io: std.Io, listener: posix.fd_t, dir_fd: posix.fd_t, socke
         return bindSocketInPlace(listener, dir_fd, socket_name, socket_path, mode_preset);
     }
     const hex_len = @min(staging_dir_random_hex_max, max_socket_path_len - fixed_len);
+    assert(hex_len >= staging_dir_random_hex_min);
+    assert(fixed_len + hex_len <= max_socket_path_len);
 
     var name_buf: [staging_dir_prefix.len + staging_dir_random_hex_max]u8 = undefined;
-    var staging_name: []const u8 = undefined;
+    const staging_name = try makeStagingDir(io, dir_fd, &name_buf, hex_len);
+    defer rmdirAt(dir_fd, staging_name);
+
+    // Hold the directory by fd and validate that fd, so later checks cannot be
+    // redirected by someone swapping the name in a writable parent.
+    const staging_fd = try openDirAt(dir_fd, staging_name);
+    defer sys.close(staging_fd);
+    try verifyStagingDir(staging_fd);
+
+    var staged_buf: [max_socket_path_len]u8 = undefined;
+    const staged_path = try std.fmt.bufPrint(
+        &staged_buf,
+        "{s}{s}/{s}",
+        .{ dir_prefix, staging_name, staged_socket_name },
+    );
+    assert(staged_path.len <= max_socket_path_len);
+
+    const address = try sys.UnixAddress.init(staged_path);
+    try sys.bind(listener, &address);
+    // The staged name always goes: after a successful link the public name
+    // keeps the inode.
+    defer sys.unlinkAt(staging_fd, staged_socket_name) catch |err| {
+        log.debug("staged_socket_unlink_failed", .{ .err = err });
+    };
+
+    const socket_stat = try secureStagedSocket(staging_fd, staged_path);
+
+    // Size the accept backlog to the connection cap so a burst of clients
+    // (e.g. a leader spawning many attachers at once) is queued rather than
+    // refused while the accept loop drains it. The kernel silently clamps to
+    // somaxconn.
+    try sys.listen(listener, @intCast(max_client_connections));
+    // No-replace publish; the deferred unlink then drops the staged name.
+    try linkAt(staging_fd, staged_socket_name, dir_fd, socket_name);
+    return socket_stat;
+}
+
+/// Create a fresh 0700-or-narrower staging directory under `dir_fd` with a
+/// random `hex_len`-character suffix, retrying name collisions. Returns the
+/// directory name, which lives in `name_buf`.
+fn makeStagingDir(
+    io: std.Io,
+    dir_fd: posix.fd_t,
+    name_buf: *[staging_dir_prefix.len + staging_dir_random_hex_max]u8,
+    hex_len: usize,
+) ![]const u8 {
+    assert(hex_len >= staging_dir_random_hex_min);
+    assert(hex_len <= staging_dir_random_hex_max);
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         var random: [staging_dir_random_hex_max / 2]u8 = undefined;
         io.random(&random);
         const hex = std.fmt.bytesToHex(random, .lower);
-        staging_name = std.fmt.bufPrint(&name_buf, "{s}{s}", .{ staging_dir_prefix, hex[0..hex_len] }) catch unreachable;
+        const staging_name = try std.fmt.bufPrint(name_buf, "{s}{s}", .{ staging_dir_prefix, hex[0..hex_len] });
+        assert(staging_name.len == staging_dir_prefix.len + hex_len);
         mkdirAt(dir_fd, staging_name, 0o700) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 if (attempt + 1 >= staging_dir_attempts) return err;
@@ -2417,20 +2575,21 @@ fn bindPrivateSocket(io: std.Io, listener: posix.fd_t, dir_fd: posix.fd_t, socke
             },
             else => return err,
         };
-        break;
+        // A restrictive umask (0777) leaves the new directory 000, which its
+        // unprivileged owner cannot open. Restore 0700 by name first: in a
+        // trusted parent (owner-only, or sticky and owned by root or us)
+        // nobody else can replace the entry just created. The caller's fd
+        // checks still verify type, owner, and mode.
+        sys.fchmodat(dir_fd, staging_name, 0o700) catch |err| {
+            log.debug("staging_dir_chmod_failed", .{ .err = err });
+        };
+        return staging_name;
     }
-    defer rmdirAt(dir_fd, staging_name);
-    // A restrictive umask (0777) leaves the new directory 000, which its
-    // unprivileged owner cannot open. Restore 0700 by name first: in a
-    // trusted parent (owner-only, or sticky and owned by root or us) nobody
-    // else can replace the entry just created. The fd checks below still
-    // verify type, owner, and mode.
-    sys.fchmodat(dir_fd, staging_name, 0o700) catch {};
+}
 
-    // Hold the directory by fd and validate that fd, so later checks cannot be
-    // redirected by someone swapping the name in a writable parent.
-    const staging_fd = try openDirAt(dir_fd, staging_name);
-    defer sys.close(staging_fd);
+/// Check that the staging directory held by `staging_fd` is a directory we
+/// own, then force and verify mode 0700.
+fn verifyStagingDir(staging_fd: posix.fd_t) !void {
     // Ownership first: never chmod something that is not ours.
     const created = try sys.fstat(staging_fd);
     if (!created.isDir()) return error.PermissionDenied;
@@ -2439,16 +2598,12 @@ fn bindPrivateSocket(io: std.Io, listener: posix.fd_t, dir_fd: posix.fd_t, socke
     try sys.fchmod(staging_fd, 0o700);
     const dir_stat = try sys.fstat(staging_fd);
     if (dir_stat.permissions() != 0o700) return error.PermissionDenied;
+}
 
-    var staged_buf: [max_socket_path_len]u8 = undefined;
-    const staged_path = std.fmt.bufPrint(&staged_buf, "{s}{s}/{s}", .{ dir_prefix, staging_name, staged_socket_name }) catch unreachable;
-
-    const address = try sys.UnixAddress.init(staged_path);
-    try sys.bind(listener, &address);
-    // The staged name always goes: after a successful link the public name
-    // keeps the inode.
-    defer sys.unlinkAt(staging_fd, staged_socket_name) catch {};
-
+/// Verify the freshly bound staged socket is ours and is the file at
+/// `staged_path`, then chmod it to 0600. Returns its identity.
+fn secureStagedSocket(staging_fd: posix.fd_t, staged_path: []const u8) !sys.Stat {
+    assert(staged_path.len > 0);
     const bound = try sys.statAt(staging_fd, staged_socket_name, false);
     if (!bound.isSocket()) return error.PermissionDenied;
     if (bound.uid != sys.geteuid()) return error.PermissionDenied;
@@ -2459,14 +2614,6 @@ fn bindPrivateSocket(io: std.Io, listener: posix.fd_t, dir_fd: posix.fd_t, socke
     const socket_stat = try sys.statAt(staging_fd, staged_socket_name, false);
     if (!socket_stat.sameFile(bound)) return error.PermissionDenied;
     if (socket_stat.permissions() != 0o600) return error.PermissionDenied;
-
-    // Size the accept backlog to the connection cap so a burst of clients
-    // (e.g. a leader spawning many attachers at once) is queued rather than
-    // refused while the accept loop drains it. The kernel silently clamps to
-    // somaxconn.
-    try sys.listen(listener, @intCast(max_client_connections));
-    // No-replace publish; the deferred unlink then drops the staged name.
-    try linkAt(staging_fd, staged_socket_name, dir_fd, socket_name);
     return socket_stat;
 }
 
@@ -2485,6 +2632,8 @@ fn bindSocketInPlace(
     socket_path: []const u8,
     mode_preset: bool,
 ) !sys.Stat {
+    assert(socket_name.len > 0);
+    assert(socket_path.len >= socket_name.len);
     if (!mode_preset) {
         const parent_stat = try sys.fstat(dir_fd);
         const private = parent_stat.isDir() and
@@ -2527,6 +2676,7 @@ fn bindSocketInPlace(
 /// non-blocking state), so a full buffer would block in the kernel.
 fn writeAllDeadline(fd: posix.fd_t, bytes: []const u8, timeout_ms: i64) !void {
     if (std.debug.runtime_safety) std.debug.assert(sys.isNonBlocking(fd));
+    assert(timeout_ms > 0);
     const deadline = sys.monotonicMs() + timeout_ms;
     ensureNonBlocking(fd) catch return error.Unexpected;
     const flags: u32 = std.c.MSG.NOSIGNAL | std.c.MSG.DONTWAIT;
@@ -2537,6 +2687,7 @@ fn writeAllDeadline(fd: posix.fd_t, bytes: []const u8, timeout_ms: i64) !void {
             .SUCCESS => {
                 const written: usize = @intCast(rc);
                 if (written == 0) return error.WriteZero;
+                assert(written <= bytes.len - offset);
                 offset += written;
             },
             .INTR => {},
@@ -2552,6 +2703,7 @@ fn writeAllDeadline(fd: posix.fd_t, bytes: []const u8, timeout_ms: i64) !void {
             else => return error.Unexpected,
         }
     }
+    assert(offset == bytes.len);
 }
 
 /// Set `O_NONBLOCK` unless it is already set (one `fcntl` in the common case).
@@ -2817,18 +2969,22 @@ fn captureTailStart(text: []const u8, budget: usize) usize {
         escaped += cost;
         start -= 1;
     }
+    assert(start <= text.len);
     return start;
 }
 
 fn truncatedReplay(scrollback: []const u8, max_bytes: usize) []const u8 {
     if (scrollback.len <= max_bytes) return scrollback;
-    return scrollback[scrollback.len - max_bytes ..];
+    const tail = scrollback[scrollback.len - max_bytes ..];
+    assert(tail.len == max_bytes);
+    return tail;
 }
 
 fn base64Encode(allocator: Allocator, bytes: []const u8) ![]u8 {
     const encoder = std.base64.standard.Encoder;
     const out = try allocator.alloc(u8, encoder.calcSize(bytes.len));
-    _ = encoder.encode(out, bytes);
+    const encoded = encoder.encode(out, bytes);
+    assert(encoded.len == out.len);
     return out;
 }
 
@@ -2996,7 +3152,9 @@ fn noEnv(_: []const u8) ?[]const u8 {
 }
 
 fn sleepMs(ms: i64) void {
-    test_io.sleep(.fromMilliseconds(ms), .awake) catch {};
+    test_io.sleep(.fromMilliseconds(ms), .awake) catch |err| {
+        log.debug("test_sleep_failed", .{ .err = err });
+    };
 }
 
 fn waitForFlag(flag: *const std.atomic.Value(bool), timeout_ms: i64) bool {
@@ -3045,8 +3203,9 @@ const TestClient = struct {
         errdefer sys.close(fds[1]);
         // Pane children fork from this process: keep them from inheriting
         // either end.
-        sys.setCloseOnExec(fds[0]) catch {};
-        sys.setCloseOnExec(fds[1]) catch {};
+        for (fds) |end| sys.setCloseOnExec(end) catch |err| {
+            log.debug("test_cloexec_failed", .{ .err = err });
+        };
         const thread = std.Thread.spawn(.{}, drive, .{ server, fds[0] }) catch |err| {
             sys.close(fds[0]);
             return err;
@@ -3055,7 +3214,9 @@ const TestClient = struct {
     }
 
     fn drive(server: *Server, fd: posix.fd_t) void {
-        fuzz_hooks.driveClient(server, fd) catch {};
+        fuzz_hooks.driveClient(server, fd) catch |err| {
+            log.debug("test_drive_client_failed", .{ .err = err });
+        };
     }
 
     fn stop(self: *TestClient) void {
@@ -3158,7 +3319,7 @@ const QueueProbe = struct {
         defer std.testing.allocator.free(frame);
         for (needles) |needle| {
             if (std.mem.indexOf(u8, frame, needle) == null) {
-                std.debug.print("frame {s} lacks {s}\n", .{ frame[0..@min(frame.len, 300)], needle });
+                log.err("test_frame_mismatch", .{ .frame = frame[0..@min(frame.len, 300)], .needle = needle });
                 return error.FrameMismatch;
             }
         }
@@ -3167,7 +3328,7 @@ const QueueProbe = struct {
     fn expectEmpty(self: *QueueProbe) !void {
         if (self.take()) |frame| {
             defer std.testing.allocator.free(frame);
-            std.debug.print("unexpected frame {s}\n", .{frame[0..@min(frame.len, 300)]});
+            log.err("test_unexpected_frame", .{ .frame = frame[0..@min(frame.len, 300)] });
             return error.UnexpectedFrame;
         }
     }
@@ -4429,7 +4590,9 @@ const LateRegistration = struct {
     fn hook(server: *Server) void {
         if (calls.fetchAdd(1, .seq_cst) != 0) return;
         entered.store(true, .seq_cst);
-        while (!released.load(.seq_cst)) server.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        while (!released.load(.seq_cst)) server.io.sleep(.fromMilliseconds(1), .awake) catch |err| {
+            log.debug("test_hook_sleep_failed", .{ .err = err });
+        };
     }
 
     fn probe() bool {
@@ -4441,7 +4604,9 @@ const LateRegistration = struct {
         done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
         fn run(self: *Runner) void {
-            self.server.run() catch {};
+            self.server.run() catch |err| {
+                log.debug("test_server_run_failed", .{ .err = err });
+            };
             self.done.store(true, .seq_cst);
         }
     };
@@ -4458,7 +4623,7 @@ const LateRegistration = struct {
 
         const socket_path = try tempPath(allocator, "zmx-late-register");
         defer allocator.free(socket_path);
-        defer std.Io.Dir.deleteFileAbsolute(test_io, socket_path) catch {};
+        defer deleteTestFile(socket_path);
         try requireUnixSocketBind(socket_path);
 
         var server = try Server.init(allocator, test_io, socket_path, if (trigger == .idle) 1 else 0);
@@ -5401,7 +5566,14 @@ fn requireUnixSocketBind(path: []const u8) !void {
         else => return err,
     };
     sys.close(listener);
-    std.Io.Dir.deleteFileAbsolute(test_io, path) catch {};
+    deleteTestFile(path);
+}
+
+/// Best-effort removal of a test socket or file; a failure is only logged.
+fn deleteTestFile(path: []const u8) void {
+    std.Io.Dir.deleteFileAbsolute(test_io, path) catch |err| {
+        log.debug("test_file_delete_failed", .{ .err = err });
+    };
 }
 
 fn socketExists(path: []const u8) bool {

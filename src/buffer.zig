@@ -1,12 +1,19 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
+const assert = std.debug.assert;
 
+/// Scrollback capacity in bytes a pane gets when the client does not ask for one.
 pub const default_capacity = 10 * 1024 * 1024;
+/// Largest ring `ScrollbackBuffer.init` allocates; bigger requests are clamped.
 pub const max_capacity = 64 * 1024 * 1024;
 
+/// A copied tail of the ring: `bytes` covers stream offsets
+/// `[start_offset, end_offset)`. The caller owns `bytes`.
 pub const Tail = struct { bytes: []u8, start_offset: u64, end_offset: u64 };
 
+/// Fixed-capacity byte ring that keeps the newest output of a pane and tracks
+/// absolute stream offsets across wraps.
 pub const ScrollbackBuffer = struct {
     allocator: Allocator,
     data: []u8,
@@ -15,24 +22,30 @@ pub const ScrollbackBuffer = struct {
     /// Total bytes ever appended.
     total_appended: u64 = 0,
 
+    /// Allocate a ring of `capacity_bytes`, clamped to `[1, max_capacity]`.
     pub fn init(allocator: Allocator, capacity_bytes: usize) !ScrollbackBuffer {
         const clamped = @max(capacity_bytes, 1);
         const cap = @min(clamped, max_capacity);
+        assert(cap >= 1);
+        assert(cap <= max_capacity);
         return .{
             .allocator = allocator,
             .data = try allocator.alloc(u8, cap),
         };
     }
 
+    /// Free the ring. The buffer is unusable afterwards.
     pub fn deinit(self: *ScrollbackBuffer) void {
         self.allocator.free(self.data);
         self.* = undefined;
     }
 
+    /// Ring size in bytes; the most bytes the buffer retains.
     pub fn capacity(self: *const ScrollbackBuffer) usize {
         return self.data.len;
     }
 
+    /// Append `bytes`, evicting the oldest retained bytes when the ring is full.
     pub fn append(self: *ScrollbackBuffer, bytes: []const u8) void {
         if (bytes.len == 0) return;
         self.total_appended += bytes.len;
@@ -63,8 +76,11 @@ pub const ScrollbackBuffer = struct {
             @memcpy(self.data[0 .. bytes.len - first_len], bytes[first_len..]);
         }
         self.len += bytes.len;
+        assert(self.len <= self.data.len);
+        assert(self.start < self.data.len);
     }
 
+    /// Copy every retained byte, oldest first. The caller owns the result.
     pub fn snapshot(self: *const ScrollbackBuffer, allocator: Allocator) ![]u8 {
         return self.copyRange(allocator, 0);
     }
@@ -102,6 +118,7 @@ pub const ScrollbackBuffer = struct {
         const out = try allocator.alloc(u8, parts[0].len + parts[1].len);
         @memcpy(out[0..parts[0].len], parts[0]);
         @memcpy(out[parts[0].len..], parts[1]);
+        assert(out.len == self.len - from);
         return out;
     }
 
@@ -117,6 +134,7 @@ pub const ScrollbackBuffer = struct {
         };
     }
 
+    /// The last `max_lines` lines of the whole ring; see `captureLastLinesBounded`.
     pub fn captureLastLines(self: *const ScrollbackBuffer, allocator: Allocator, max_lines: usize) ![]u8 {
         return self.captureLastLinesBounded(allocator, max_lines, self.capacity());
     }
@@ -126,11 +144,17 @@ pub const ScrollbackBuffer = struct {
     /// backwards and makes one allocation of the result size. When the byte
     /// cap or ring eviction cuts into a UTF-8 sequence, the start moves
     /// forward to the next lead byte.
-    pub fn captureLastLinesBounded(self: *const ScrollbackBuffer, allocator: Allocator, max_lines: usize, max_bytes: usize) ![]u8 {
+    pub fn captureLastLinesBounded(
+        self: *const ScrollbackBuffer,
+        allocator: Allocator,
+        max_lines: usize,
+        max_bytes: usize,
+    ) ![]u8 {
         if (max_lines == 0 or self.len == 0 or max_bytes == 0) return allocator.alloc(u8, 0);
 
         const window = @min(self.len, max_bytes);
         const floor = self.len - window;
+        assert(floor < self.len);
 
         var scan_end = self.len;
         if (self.byteAt(scan_end - 1) == '\n') scan_end -= 1;
@@ -153,7 +177,9 @@ pub const ScrollbackBuffer = struct {
             // The start was not chosen at a newline; skip continuation bytes
             // (at most three) of a sequence that began before the window.
             var skipped: usize = 0;
-            while (start < self.len and skipped < 3 and (self.byteAt(start) & 0xc0) == 0x80) : (skipped += 1) start += 1;
+            while (start < self.len and skipped < 3 and (self.byteAt(start) & 0xc0) == 0x80) : (skipped += 1) {
+                start += 1;
+            }
         }
 
         return self.copyRange(allocator, start);
@@ -526,4 +552,79 @@ test "scrollback captureLastLines matches full snapshot reference across all wra
             try std.testing.expectEqualStrings(expected, actual);
         }
     }
+}
+
+test "append of an empty slice leaves a wrapped ring untouched" {
+    var buffer = try ScrollbackBuffer.init(std.testing.allocator, 4);
+    defer buffer.deinit();
+    buffer.append("abcdef");
+    const start = buffer.start;
+    buffer.append("");
+    try std.testing.expectEqual(start, buffer.start);
+    try std.testing.expectEqual(@as(u64, 6), buffer.endOffset());
+    try std.testing.expectEqual(@as(u64, 2), buffer.startOffset());
+    const snap = try buffer.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snap);
+    try std.testing.expectEqualStrings("cdef", snap);
+}
+
+test "init with zero capacity clamps to a one-byte ring" {
+    var buffer = try ScrollbackBuffer.init(std.testing.allocator, 0);
+    defer buffer.deinit();
+    try std.testing.expectEqual(@as(usize, 1), buffer.capacity());
+    buffer.append("ab");
+    buffer.append("c");
+    const snap = try buffer.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snap);
+    try std.testing.expectEqualStrings("c", snap);
+    try std.testing.expectEqual(@as(u64, 2), buffer.startOffset());
+    try std.testing.expectEqual(@as(u64, 3), buffer.endOffset());
+}
+
+test "init propagates allocation failure" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, ScrollbackBuffer.init(failing.allocator(), 16));
+}
+
+test "captureLastLinesBounded returns empty for zero lines, zero bytes, or an empty ring" {
+    var buffer = try ScrollbackBuffer.init(std.testing.allocator, 16);
+    defer buffer.deinit();
+    const empty_ring = try buffer.captureLastLinesBounded(std.testing.allocator, 3, 16);
+    defer std.testing.allocator.free(empty_ring);
+    try std.testing.expectEqual(@as(usize, 0), empty_ring.len);
+
+    buffer.append("a\nb\n");
+    const zero_lines = try buffer.captureLastLinesBounded(std.testing.allocator, 0, 16);
+    defer std.testing.allocator.free(zero_lines);
+    try std.testing.expectEqual(@as(usize, 0), zero_lines.len);
+    const zero_bytes = try buffer.captureLastLinesBounded(std.testing.allocator, 3, 0);
+    defer std.testing.allocator.free(zero_bytes);
+    try std.testing.expectEqual(@as(usize, 0), zero_bytes.len);
+}
+
+test "snapshotTail with zero or oversized max_bytes uses the ring bounds" {
+    var buffer = try ScrollbackBuffer.init(std.testing.allocator, 4);
+    defer buffer.deinit();
+    buffer.append("0123456");
+
+    const none = try buffer.snapshotTail(std.testing.allocator, 0);
+    defer std.testing.allocator.free(none.bytes);
+    try std.testing.expectEqual(@as(usize, 0), none.bytes.len);
+    try std.testing.expectEqual(@as(u64, 7), none.start_offset);
+    try std.testing.expectEqual(@as(u64, 7), none.end_offset);
+
+    const all = try buffer.snapshotTail(std.testing.allocator, 1000);
+    defer std.testing.allocator.free(all.bytes);
+    try std.testing.expectEqualStrings("3456", all.bytes);
+    try std.testing.expectEqual(@as(u64, 3), all.start_offset);
+    try std.testing.expectEqual(@as(u64, 7), all.end_offset);
+}
+
+test "captureLastLines without a newline returns the whole retained text" {
+    var buffer = try ScrollbackBuffer.init(std.testing.allocator, 32);
+    defer buffer.deinit();
+    buffer.append("no newline here");
+    const capture = try buffer.captureLastLines(std.testing.allocator, 5);
+    defer std.testing.allocator.free(capture);
+    try std.testing.expectEqualStrings("no newline here", capture);
 }

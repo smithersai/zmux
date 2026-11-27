@@ -2,23 +2,35 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
+const assert = std.debug.assert;
 
+/// zmux wire protocol version reported by `daemon.ping` and handshakes.
 pub const version = "0.4.0";
 
+/// Notification method sent when a session's foreground process changes.
 pub const foreground_changed_method = "foreground_changed";
+/// Notification method sent when a session's root process exits.
 pub const session_exited_method = "session_exited";
+/// Notification method carrying base64-encoded PTY output for a pane.
 pub const pane_output_method = "pane_output";
+/// Notification method sent when a pane records new output activity.
 pub const pane_activity_method = "pane_activity";
+/// Notification method sent when a pane rings the terminal bell.
 pub const pane_bell_method = "pane_bell";
+/// Notification method sent when a slow client missed pane output.
 pub const pane_output_dropped_method = "pane_output_dropped";
+/// Notification method sent when a pane's process is respawned.
 pub const pane_respawned_method = "pane_respawned";
+/// Notification method sent when the daemon detaches a client.
 pub const client_detached_method = "client_detached";
 
 /// Upper bounds enforced on incoming JSON-RPC requests before the value tree
 /// is built.
 pub const max_json_depth: usize = 64;
+/// Maximum count of JSON values and object keys in one request.
 pub const max_json_nodes: usize = 100_000;
 
+/// JSON-RPC 2.0 error codes; `session_error` covers zmux domain failures.
 pub const ErrorCode = struct {
     pub const parse_error = -32700;
     pub const invalid_request = -32600;
@@ -28,8 +40,18 @@ pub const ErrorCode = struct {
     pub const session_error = -32000;
 };
 
-pub const ParseRequestError = error{ ParseError, InvalidRequest, InvalidId, NestingTooDeep, BatchUnsupported, OutOfMemory };
+/// Errors `parseRequest` returns for malformed or unsupported request lines.
+pub const ParseRequestError = error{
+    ParseError,
+    InvalidRequest,
+    InvalidId,
+    NestingTooDeep,
+    BatchUnsupported,
+    OutOfMemory,
+};
 
+/// A parsed JSON-RPC request. Owns its value tree, id text and method name;
+/// release them with `deinit`.
 pub const Request = struct {
     allocator: Allocator,
     parsed: std.json.Parsed(Value),
@@ -39,6 +61,7 @@ pub const Request = struct {
     /// False for JSON-RPC notifications (no `"id"` member).
     has_id: bool,
 
+    /// Free the id, method and parsed value tree.
     pub fn deinit(self: *Request) void {
         self.allocator.free(self.id_json);
         self.allocator.free(self.method);
@@ -56,6 +79,7 @@ pub const Request = struct {
     }
 };
 
+/// Params of a `foreground_changed` notification.
 pub const ForegroundChangedParams = struct {
     session_id: []const u8,
     pid: std.posix.pid_t,
@@ -64,6 +88,8 @@ pub const ForegroundChangedParams = struct {
     argv_truncated: bool = false,
 };
 
+/// Params of a `session_exited` notification. `exit_code` and `signal` are
+/// null when the process did not exit that way.
 pub const SessionExitedParams = struct {
     session_id: []const u8,
     pid: std.posix.pid_t,
@@ -72,6 +98,7 @@ pub const SessionExitedParams = struct {
     generation: u64 = 0,
 };
 
+/// Params of a `pane_output` notification.
 pub const PaneOutputParams = struct {
     pane_id: []const u8,
     data_base64: []const u8,
@@ -80,18 +107,22 @@ pub const PaneOutputParams = struct {
     generation: u64 = 0,
 };
 
+/// Params of a `pane_activity` notification.
 pub const PaneActivityParams = struct {
     pane_id: []const u8,
     last_activity_ms: i64,
     generation: u64 = 0,
 };
 
+/// Params of a `pane_bell` notification.
 pub const PaneBellParams = struct {
     pane_id: []const u8,
     last_bell_ms: i64,
     generation: u64 = 0,
 };
 
+/// Params of a `pane_output_dropped` notification. A client resumes reading
+/// at `resume_offset`.
 pub const PaneOutputDroppedParams = struct {
     pane_id: []const u8,
     dropped_bytes: u64,
@@ -100,12 +131,14 @@ pub const PaneOutputDroppedParams = struct {
     generation: u64 = 0,
 };
 
+/// Params of a `pane_respawned` notification.
 pub const PaneRespawnedParams = struct {
     pane_id: []const u8,
     generation: u64,
     pid: std.posix.pid_t,
 };
 
+/// Params of a `client_detached` notification.
 pub const ClientDetachedParams = struct {
     client_id: []const u8,
     /// `"pane_removed"`, `"session_removed"`, or `"remote_detach"`.
@@ -157,6 +190,8 @@ pub fn parseRequest(allocator: Allocator, line: []const u8) ParseRequestError!Re
 
     const method = try allocator.dupe(u8, method_value.string);
     errdefer allocator.free(method);
+    assert(parsed.value == .object);
+    assert(id_json.len > 0);
 
     return .{
         .allocator = allocator,
@@ -231,6 +266,8 @@ fn prescan(line: []const u8) error{NestingTooDeep}!void {
         }
         if (nodes > max_json_nodes) return error.NestingTooDeep;
     }
+    assert(depth <= max_json_depth);
+    assert(nodes <= max_json_nodes);
 }
 
 fn isScalarByte(c: u8) bool {
@@ -240,10 +277,12 @@ fn isScalarByte(c: u8) bool {
     };
 }
 
+/// True when `req` had no `"id"` member, so it must not receive a response.
 pub fn isNotification(req: *const Request) bool {
     return !req.has_id;
 }
 
+/// Machine-readable error category sent in `error.data.kind`.
 pub const ErrorKind = enum {
     parse,
     invalid_request,
@@ -258,22 +297,35 @@ pub const ErrorKind = enum {
     internal,
 };
 
+/// JSON-RPC error code and kind for one Zig error name.
 pub const ErrorMapping = struct { code: i32, kind: ErrorKind };
 
 /// Global error-name to JSON-RPC code table (review K0).
 pub fn errorCodeFor(err: anyerror) ErrorMapping {
     const Entry = struct { names: []const []const u8, mapping: ErrorMapping };
+    const C = ErrorCode;
+    const e = struct {
+        fn f(names: []const []const u8, code: i32, kind: ErrorKind) Entry {
+            return .{ .names = names, .mapping = .{ .code = code, .kind = kind } };
+        }
+    }.f;
     const table = [_]Entry{
-        .{ .names = &.{ "ParseError", "SyntaxError", "UnexpectedEndOfInput" }, .mapping = .{ .code = ErrorCode.parse_error, .kind = .parse } },
-        .{ .names = &.{ "InvalidRequest", "InvalidId", "NestingTooDeep", "BatchUnsupported", "MessageTooLarge", "TruncatedFrame" }, .mapping = .{ .code = ErrorCode.invalid_request, .kind = .invalid_request } },
-        .{ .names = &.{"MethodNotFound"}, .mapping = .{ .code = ErrorCode.method_not_found, .kind = .method_not_found } },
-        .{ .names = &.{ "InvalidParams", "InvalidSpawnArgument", "UnknownKey", "ScrollbackBytesTooLarge", "InvalidName", "InvalidAxis", "InvalidDimensions" }, .mapping = .{ .code = ErrorCode.invalid_params, .kind = .invalid_params } },
-        .{ .names = &.{ "SessionNotFound", "WindowNotFound", "PaneNotFound", "ClientNotFound" }, .mapping = .{ .code = ErrorCode.session_error, .kind = .not_found } },
-        .{ .names = &.{"SessionTerminated"}, .mapping = .{ .code = ErrorCode.session_error, .kind = .terminated } },
-        .{ .names = &.{ "DuplicateSessionName", "NameShadowsId", "PaneRunning" }, .mapping = .{ .code = ErrorCode.session_error, .kind = .conflict } },
-        .{ .names = &.{"LimitExceeded"}, .mapping = .{ .code = ErrorCode.session_error, .kind = .limit } },
-        .{ .names = &.{ "OpenPtyFailed", "ForkFailed", "ChildSetupFailed", "SpawnFailed" }, .mapping = .{ .code = ErrorCode.session_error, .kind = .spawn_failed } },
-        .{ .names = &.{ "InputTimeout", "InputClosed", "BrokenPipe", "InputOutput", "WriteZero" }, .mapping = .{ .code = ErrorCode.session_error, .kind = .io } },
+        e(&.{ "ParseError", "SyntaxError", "UnexpectedEndOfInput" }, C.parse_error, .parse),
+        e(&.{
+            "InvalidRequest", "InvalidId", "NestingTooDeep", "BatchUnsupported", "MessageTooLarge", "TruncatedFrame",
+        }, C.invalid_request, .invalid_request),
+        e(&.{"MethodNotFound"}, C.method_not_found, .method_not_found),
+        e(&.{
+            "InvalidParams",           "InvalidSpawnArgument", "UnknownKey",
+            "ScrollbackBytesTooLarge", "InvalidName",          "InvalidAxis",
+            "InvalidDimensions",
+        }, C.invalid_params, .invalid_params),
+        e(&.{ "SessionNotFound", "WindowNotFound", "PaneNotFound", "ClientNotFound" }, C.session_error, .not_found),
+        e(&.{"SessionTerminated"}, C.session_error, .terminated),
+        e(&.{ "DuplicateSessionName", "NameShadowsId", "PaneRunning" }, C.session_error, .conflict),
+        e(&.{"LimitExceeded"}, C.session_error, .limit),
+        e(&.{ "OpenPtyFailed", "ForkFailed", "ChildSetupFailed", "SpawnFailed" }, C.session_error, .spawn_failed),
+        e(&.{ "InputTimeout", "InputClosed", "BrokenPipe", "InputOutput", "WriteZero" }, C.session_error, .io),
     };
     const name = @errorName(err);
     inline for (table) |entry| {
@@ -312,6 +364,7 @@ pub fn writeJsonStringLossy(writer: *std.Io.Writer, bytes: []const u8) !void {
             i += 1;
             continue;
         }
+        assert(i + len <= bytes.len);
         try writeJsonStringBody(writer, bytes[i .. i + len]);
         i += len;
     }
@@ -342,12 +395,15 @@ pub fn sanitizeUtf8Alloc(allocator: Allocator, bytes: []const u8) ![]u8 {
             i += 1;
             continue;
         }
+        assert(i + len <= bytes.len);
         try out.appendSlice(allocator, bytes[i .. i + len]);
         i += len;
     }
     return out.toOwnedSlice(allocator);
 }
 
+/// Format `{"jsonrpc":"2.0","id":<id>,"result":<value>}\n` into a new
+/// allocation. `id_json` must already be serialized JSON.
 pub fn result(allocator: Allocator, id_json: []const u8, value: anytype) ![]u8 {
     var out: std.Io.Writer.Allocating = try .initCapacity(allocator, 256);
     errdefer out.deinit();
@@ -363,6 +419,7 @@ pub fn writeResult(writer: *std.Io.Writer, id_json: []const u8, value: anytype) 
     try writer.writeAll("}\n");
 }
 
+/// Like `result`, but `raw_json` is already-serialized JSON copied verbatim.
 pub fn resultRaw(allocator: Allocator, id_json: []const u8, raw_json: []const u8) ![]u8 {
     const prefix = "{\"jsonrpc\":\"2.0\",\"id\":";
     const mid = ",\"result\":";
@@ -378,26 +435,52 @@ pub fn resultRaw(allocator: Allocator, id_json: []const u8, raw_json: []const u8
     pos += mid.len;
     @memcpy(out[pos..][0..raw_json.len], raw_json);
     pos += raw_json.len;
+    assert(pos + suffix.len == total);
     @memcpy(out[pos..][0..suffix.len], suffix);
     return out;
 }
 
-const pane_output_suffix_max = "\",\"offset\":,\"generation\":}}\n".len + 2 * std.fmt.count("{d}", .{std.math.maxInt(u64)});
+const pane_output_suffix_offset = "\",\"offset\":";
+const pane_output_suffix_generation = ",\"generation\":";
+const pane_output_suffix_end = "}}\n";
+const pane_output_suffix_fixed = pane_output_suffix_offset.len + pane_output_suffix_generation.len +
+    pane_output_suffix_end.len;
+const pane_output_suffix_max = pane_output_suffix_fixed + 2 * std.fmt.count("{d}", .{std.math.maxInt(u64)});
 
 /// The bytes after `data_base64`'s value, in `PaneOutputParams` field order,
 /// so the fast paths match `std.json.Stringify` byte for byte.
 fn paneOutputSuffix(buf: *[pane_output_suffix_max]u8, offset: u64, generation: u64) []const u8 {
-    return std.fmt.bufPrint(buf, "\",\"offset\":{d},\"generation\":{d}}}}}\n", .{ offset, generation }) catch unreachable;
+    // `buf` holds two maximal u64s plus the fixed bytes, so `printInt` and
+    // the copies cannot overflow it.
+    var pos: usize = 0;
+    @memcpy(buf[pos..][0..pane_output_suffix_offset.len], pane_output_suffix_offset);
+    pos += pane_output_suffix_offset.len;
+    pos += std.fmt.printInt(buf[pos..], offset, 10, .lower, .{});
+    @memcpy(buf[pos..][0..pane_output_suffix_generation.len], pane_output_suffix_generation);
+    pos += pane_output_suffix_generation.len;
+    pos += std.fmt.printInt(buf[pos..], generation, 10, .lower, .{});
+    @memcpy(buf[pos..][0..pane_output_suffix_end.len], pane_output_suffix_end);
+    pos += pane_output_suffix_end.len;
+    assert(pos > pane_output_suffix_fixed);
+    assert(pos <= buf.len);
+    return buf[0..pos];
 }
 
 /// Format a `pane_output` notification directly from raw PTY bytes in a single
 /// pre-sized allocation, avoiding intermediate base64 buffers and redundant
 /// JSON escape scans over the base64 alphabet.
-pub fn paneOutputNotification(allocator: Allocator, pane_id: []const u8, raw_bytes: []const u8, offset: u64, generation: u64) ![]u8 {
+pub fn paneOutputNotification(
+    allocator: Allocator,
+    pane_id: []const u8,
+    raw_bytes: []const u8,
+    offset: u64,
+    generation: u64,
+) ![]u8 {
     const prefix = "{\"jsonrpc\":\"2.0\",\"method\":\"pane_output\",\"params\":{\"pane_id\":";
     const mid = ",\"data_base64\":\"";
     var suffix_buf: [pane_output_suffix_max]u8 = undefined;
     const suffix = paneOutputSuffix(&suffix_buf, offset, generation);
+    assert(suffix.len <= suffix_buf.len);
     const b64_len = std.base64.standard.Encoder.calcSize(raw_bytes.len);
 
     if (isPlainJsonAscii(pane_id)) {
@@ -416,6 +499,7 @@ pub fn paneOutputNotification(allocator: Allocator, pane_id: []const u8, raw_byt
         pos += mid.len;
         _ = std.base64.standard.Encoder.encode(out[pos..][0..b64_len], raw_bytes);
         pos += b64_len;
+        assert(pos + suffix.len == total);
         @memcpy(out[pos..][0..suffix.len], suffix);
         return out;
     }
@@ -436,6 +520,7 @@ pub fn paneOutputNotification(allocator: Allocator, pane_id: []const u8, raw_byt
     pos += mid.len;
     _ = std.base64.standard.Encoder.encode(out[pos..][0..b64_len], raw_bytes);
     pos += b64_len;
+    assert(pos + suffix.len == total);
     @memcpy(out[pos..][0..suffix.len], suffix);
     return out;
 }
@@ -456,7 +541,8 @@ pub fn attachResult(
     var head: std.Io.Writer.Allocating = try .initCapacity(allocator, 256);
     defer head.deinit();
     try head.writer.print(
-        "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"clientId\":{f},\"sessionId\":{f},\"windowId\":{f},\"paneId\":{f},\"rows\":{},\"cols\":{},\"replayBase64\":\"",
+        "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"clientId\":{f},\"sessionId\":{f}," ++
+            "\"windowId\":{f},\"paneId\":{f},\"rows\":{},\"cols\":{},\"replayBase64\":\"",
         .{
             id_json,
             std.json.fmt(client_id, .{}),
@@ -468,6 +554,7 @@ pub fn attachResult(
         },
     );
     const head_slice = head.written();
+    assert(head_slice.len > 0);
     const b64_len = std.base64.standard.Encoder.calcSize(replay_bytes.len);
     const suffix = "\"}}\n";
     const out = try allocator.alloc(u8, head_slice.len + b64_len + suffix.len);
@@ -477,6 +564,8 @@ pub fn attachResult(
     return out;
 }
 
+/// Format a JSON-RPC notification line for `method` with `params`. Plain-ASCII
+/// `PaneOutputParams` take a single-allocation fast path with identical bytes.
 pub fn notification(allocator: Allocator, method: []const u8, params: anytype) ![]u8 {
     if (@TypeOf(params) == PaneOutputParams and
         std.mem.eql(u8, method, pane_output_method) and
@@ -498,6 +587,7 @@ pub fn notification(allocator: Allocator, method: []const u8, params: anytype) !
         pos += mid.len;
         @memcpy(out[pos..][0..params.data_base64.len], params.data_base64);
         pos += params.data_base64.len;
+        assert(pos + suffix.len == total);
         @memcpy(out[pos..][0..suffix.len], suffix);
         return out;
     }
@@ -512,6 +602,8 @@ pub fn notification(allocator: Allocator, method: []const u8, params: anytype) !
     return out.toOwnedSlice();
 }
 
+/// Format a JSON-RPC error response without `data`. `id_json` must already be
+/// serialized JSON; `message` is escaped and invalid UTF-8 becomes U+FFFD.
 pub fn @"error"(allocator: Allocator, id_json: []const u8, code: i32, message: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = try .initCapacity(allocator, 160);
     errdefer out.deinit();
@@ -524,6 +616,7 @@ pub fn @"error"(allocator: Allocator, id_json: []const u8, code: i32, message: [
     return out.toOwnedSlice();
 }
 
+/// Serialize `value` to compact JSON in a new allocation.
 pub fn jsonValueAlloc(allocator: Allocator, value: Value) ![]u8 {
     var out: std.Io.Writer.Allocating = try .initCapacity(allocator, 64);
     errdefer out.deinit();
@@ -544,6 +637,7 @@ fn isPlainJsonAscii(bytes: []const u8) bool {
         const bad = (chunk < low) | (chunk >= high) | (chunk == quote) | (chunk == backslash);
         if (@reduce(.Or, bad)) return false;
     }
+    assert(bytes.len - i < 16);
     while (i < bytes.len) : (i += 1) {
         const b = bytes[i];
         if (b < 0x20 or b >= 0x7f or b == '"' or b == '\\') return false;

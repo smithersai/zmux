@@ -1,15 +1,24 @@
 const std = @import("std");
 
 const buffer = @import("buffer.zig");
+const log = @import("log.zig");
 const native_mod = @import("native.zig");
 const sys = @import("sys.zig");
 
 const Allocator = std.mem.Allocator;
+const assert = std.debug.assert;
 const NativeSession = native_mod.NativeSession;
 const NativeSessionOptions = native_mod.NativeSessionOptions;
 
 /// Error names the mux contract returns (review §1.10).
-pub const ContractError = error{ DuplicateSessionName, NameShadowsId, InvalidName, LimitExceeded, PaneRunning, InvalidAxis };
+pub const ContractError = error{
+    DuplicateSessionName,
+    NameShadowsId,
+    InvalidName,
+    LimitExceeded,
+    PaneRunning,
+    InvalidAxis,
+};
 
 /// Shared deadline `terminateAll` gives every pane after `beginTerminate`.
 pub const terminate_all_deadline_ms: i64 = 500;
@@ -32,6 +41,9 @@ pub const PaneHandle = struct {
     /// Allocates the ids up front so the caller can create the pane without a
     /// later allocation failure. `native` is set by `adopt`.
     fn initIds(allocator: Allocator, session_id: []const u8, window_id: []const u8, pane_id: []const u8) !PaneHandle {
+        assert(session_id.len > 0);
+        assert(window_id.len > 0);
+        assert(pane_id.len > 0);
         const owned_session = try allocator.dupe(u8, session_id);
         errdefer allocator.free(owned_session);
         const owned_window = try allocator.dupe(u8, window_id);
@@ -55,6 +67,7 @@ pub const PaneHandle = struct {
     /// Retains `native`. Must run under the manager mutex, while the pane that
     /// owns `native` is still reachable.
     fn adopt(self: *PaneHandle, native: *NativeSession) PaneHandle {
+        assert(self.pane_id.len > 0);
         native.retain();
         self.native = native;
         return self.*;
@@ -67,6 +80,8 @@ fn discardHandle(handle: PaneHandle) void {
     owned.deinit();
 }
 
+/// Result of `Manager.attachOrCreateClient`: the new client, whether the
+/// session was created, and the pane's exit state and generation.
 pub const AttachResult = struct {
     client: ClientSnapshot,
     created: bool,
@@ -75,12 +90,17 @@ pub const AttachResult = struct {
     generation: u64,
 };
 
+/// Options for `Manager.respawnPane`. `kill` replaces a still-running child.
 pub const RespawnOptions = struct { kill: bool = false };
 
+/// Session, pane, and live-pane totals taken in one critical section.
 pub const Counts = struct { sessions: usize, panes: usize, live_panes: usize };
 
+/// Why a client was detached without its owner asking.
 pub const DetachReason = enum { pane_removed, session_removed, remote_detach };
 
+/// A detached client id and its reason, as returned by
+/// `Manager.takeDetachedClients`.
 pub const DetachedClient = struct { client_id: []u8, reason: DetachReason };
 
 /// Free a slice returned by `Manager.takeDetachedClients`.
@@ -89,6 +109,7 @@ pub fn freeDetachedClients(allocator: Allocator, items: []DetachedClient) void {
     allocator.free(items);
 }
 
+/// Resource caps the manager enforces before allocating or spawning.
 pub const Limits = struct {
     max_panes: usize = 256,
     max_clients: usize = 1024,
@@ -97,6 +118,7 @@ pub const Limits = struct {
     max_layout_depth: usize = 32,
 };
 
+/// Split direction of a layout node.
 pub const Axis = enum {
     horizontal,
     vertical,
@@ -106,6 +128,7 @@ pub const Axis = enum {
     }
 };
 
+/// Owned spawn recipe of a pane, kept so `respawnPane` can re-run it.
 pub const SpawnSpec = struct {
     title: ?[]u8 = null,
     shell: ?[]u8 = null,
@@ -134,7 +157,11 @@ pub const SpawnSpec = struct {
         return spec;
     }
 
-    pub fn nativeOptions(self: *const SpawnSpec, id: []const u8, event_sink: ?native_mod.EventSink) NativeSessionOptions {
+    pub fn nativeOptions(
+        self: *const SpawnSpec,
+        id: []const u8,
+        event_sink: ?native_mod.EventSink,
+    ) NativeSessionOptions {
         return .{
             .id = id,
             .title = self.title,
@@ -160,6 +187,7 @@ pub const SpawnSpec = struct {
     }
 };
 
+/// Borrowed spawn parameters for a new pane. The manager copies what it keeps.
 pub const CreateOptions = struct {
     title: ?[]const u8 = null,
     shell: ?[]const u8 = null,
@@ -174,6 +202,8 @@ pub const CreateOptions = struct {
     scrollback_bytes: usize = buffer.default_capacity,
 };
 
+/// Binary layout tree of a window: leaves hold pane ids, splits hold two
+/// children and an axis.
 pub const LayoutNode = union(enum) {
     leaf: []u8,
     split: Split,
@@ -208,6 +238,7 @@ pub const LayoutNode = union(enum) {
         switch (self.*) {
             .leaf => |pane_id| allocator.free(pane_id),
             .split => |split| {
+                assert(split.first != split.second);
                 allocator.free(split.id);
                 split.first.deinit(allocator);
                 allocator.destroy(split.first);
@@ -220,8 +251,14 @@ pub const LayoutNode = union(enum) {
     /// Recursion depth is bounded by `Limits.max_layout_depth`.
     pub fn findLeaf(self: *LayoutNode, pane_id: []const u8, depth: usize) ?LeafHit {
         switch (self.*) {
-            .leaf => |existing| return if (std.mem.eql(u8, existing, pane_id)) .{ .node = self, .depth = depth } else null,
-            .split => |split| return split.first.findLeaf(pane_id, depth + 1) orelse split.second.findLeaf(pane_id, depth + 1),
+            .leaf => |existing| {
+                if (!std.mem.eql(u8, existing, pane_id)) return null;
+                return .{ .node = self, .depth = depth };
+            },
+            .split => |split| {
+                assert(split.first != split.second);
+                return split.first.findLeaf(pane_id, depth + 1) orelse split.second.findLeaf(pane_id, depth + 1);
+            },
         }
     }
 
@@ -248,7 +285,10 @@ pub const LayoutNode = union(enum) {
             allocator.destroy(second);
         }
         const owned_split_id = try allocator.dupe(u8, split_id);
-        return self.replaceLeafWithSplitOwned(allocator, target_pane_id, axis, owned_split_id, first, second);
+        // The leaf was found above and nothing since touched the tree.
+        const replaced = self.replaceLeafWithSplitOwned(allocator, target_pane_id, axis, owned_split_id, first, second);
+        assert(replaced);
+        return replaced;
     }
 
     /// Like `replaceLeafWithSplit`, but takes ownership of `split_id`,
@@ -262,7 +302,11 @@ pub const LayoutNode = union(enum) {
         first: *LayoutNode,
         second: *LayoutNode,
     ) bool {
+        assert(first != second);
+        assert(first != self);
+        assert(second != self);
         const hit = self.findLeaf(target_pane_id, 0) orelse return false;
+        assert(hit.node.* == .leaf);
         allocator.free(hit.node.leaf);
         hit.node.* = .{ .split = .{ .id = split_id, .axis = axis, .first = first, .second = second } };
         return true;
@@ -276,6 +320,7 @@ pub const LayoutNode = union(enum) {
         switch (self.*) {
             .leaf => |existing| return if (std.mem.eql(u8, existing, pane_id)) .self_is_target else .not_found,
             .split => |split| {
+                assert(split.first != split.second);
                 switch (split.first.removeLeafInternal(allocator, pane_id)) {
                     .self_is_target => {
                         const replacement = split.second.*;
@@ -313,6 +358,7 @@ pub const LayoutNode = union(enum) {
                 try writer.print("{{\"kind\":\"leaf\",\"paneId\":{f}}}", .{std.json.fmt(pane_id, .{})});
             },
             .split => |split| {
+                assert(split.first != split.second);
                 try writer.print(
                     "{{\"kind\":\"split\",\"id\":{f},\"axis\":{f},\"first\":",
                     .{ std.json.fmt(split.id, .{}), std.json.fmt(split.axis.label(), .{}) },
@@ -326,6 +372,7 @@ pub const LayoutNode = union(enum) {
     }
 };
 
+/// Activity, bell, and exit flags of a pane, with the last event times.
 pub const AlertState = struct {
     activity: bool = false,
     bell: bool = false,
@@ -334,6 +381,7 @@ pub const AlertState = struct {
     last_bell_ms: i64 = 0,
 };
 
+/// One terminal pane: ids, title, spawn recipe, and its native session.
 pub const Pane = struct {
     id: []u8,
     window_id: []u8,
@@ -368,6 +416,7 @@ pub const Pane = struct {
     }
 };
 
+/// A window: its panes, the layout tree over them, and the active pane.
 pub const Window = struct {
     id: []u8,
     session_id: []u8,
@@ -390,6 +439,7 @@ pub const Window = struct {
     }
 };
 
+/// A named session: its windows, the active window, and index counters.
 pub const Session = struct {
     id: []u8,
     /// Unique across sessions, never empty, never equal to an existing id.
@@ -433,6 +483,7 @@ pub const Client = struct {
     }
 };
 
+/// Owned copy of a `Client`, safe to use after the manager mutex is released.
 pub const ClientSnapshot = struct {
     id: []u8,
     session_id: []u8,
@@ -469,6 +520,7 @@ pub const ClientSnapshot = struct {
     }
 };
 
+/// A key bound to a mux command line within a key table.
 pub const KeyBinding = struct {
     table: []u8,
     key: []u8,
@@ -515,6 +567,7 @@ const CommandScanner = struct {
     }
 
     fn next(self: *CommandScanner, allocator: Allocator) !?Word {
+        assert(self.pos <= self.line.len);
         while (self.pos < self.line.len and isSpace(self.line[self.pos])) self.pos += 1;
         if (self.pos >= self.line.len) return null;
         const start = self.pos;
@@ -523,7 +576,8 @@ const CommandScanner = struct {
         while (self.pos < self.line.len and !isSpace(self.line[self.pos])) {
             switch (self.line[self.pos]) {
                 '\'' => {
-                    const close = std.mem.indexOfScalarPos(u8, self.line, self.pos + 1, '\'') orelse return error.UnsupportedCommand;
+                    const close = std.mem.indexOfScalarPos(u8, self.line, self.pos + 1, '\'') orelse
+                        return error.UnsupportedCommand;
                     try out.appendSlice(allocator, self.line[self.pos + 1 .. close]);
                     self.pos = close + 1;
                 },
@@ -556,10 +610,14 @@ const CommandScanner = struct {
                 },
             }
         }
+        // Every branch above consumes at least one byte.
+        assert(self.pos > start);
+        assert(self.pos <= self.line.len);
         return .{ .start = start, .text = try out.toOwnedSlice(allocator) };
     }
 
     fn tail(line: []const u8, start: usize) ?[]const u8 {
+        assert(start <= line.len);
         const rest = std.mem.trim(u8, line[start..], " \t\r\n");
         return if (rest.len == 0) null else rest;
     }
@@ -595,6 +653,8 @@ fn eventGateKey(event: native_mod.Event) ?struct { pane_id: []const u8, generati
     };
 }
 
+/// Owns every session, window, pane, client, and key binding. All public
+/// methods lock `mutex`; methods named `*Locked` require it held.
 pub const Manager = struct {
     allocator: Allocator,
     /// Shared with every spawned `NativeSession`; supplies mutexes, clocks,
@@ -650,6 +710,9 @@ pub const Manager = struct {
 
     pub fn deinit(self: *Manager) void {
         self.terminateAll();
+        assert(self.sessions.items.len == 0);
+        assert(self.clients.items.len == 0);
+        assert(self.panes_by_id.count() == 0);
         self.panes_by_id.deinit(self.allocator);
         self.clients_by_id.deinit(self.allocator);
         for (self.clients.items) |client| client.deinit(self.allocator);
@@ -688,6 +751,8 @@ pub const Manager = struct {
                 }
             }
         }
+        assert(result.live_panes <= result.panes);
+        assert(result.panes == self.panes_by_id.count());
         return result;
     }
 
@@ -762,6 +827,8 @@ pub const Manager = struct {
         session.next_window_index += 1;
         self.allocator.free(session.active_window_id);
         session.active_window_id = active_window_id;
+        assert(window.panes.items.len == 1);
+        assert(std.mem.eql(u8, session.active_window_id, window.id));
         return handle.adopt(pane.native);
     }
 
@@ -797,12 +864,18 @@ pub const Manager = struct {
 
         // Last fallible step; everything after it commits.
         const pane = try self.createPaneLocked(found.session, found.window, pane_id, opts);
+        assert(leaf.node.* == .leaf);
         first.* = .{ .leaf = leaf.node.leaf };
         leaf.node.* = .{ .split = .{ .id = split_id, .axis = axis, .first = first, .second = second } };
         found.window.panes.appendAssumeCapacity(pane);
-        self.panes_by_id.putAssumeCapacity(pane.id, .{ .session = found.session, .window = found.window, .pane = pane });
+        self.panes_by_id.putAssumeCapacity(pane.id, .{
+            .session = found.session,
+            .window = found.window,
+            .pane = pane,
+        });
         self.allocator.free(found.window.active_pane_id);
         found.window.active_pane_id = active_pane_id;
+        assert(found.window.panes.items.len >= 2);
         return handle.adopt(pane.native);
     }
 
@@ -811,6 +884,7 @@ pub const Manager = struct {
         defer self.mutex.unlock(self.io);
 
         const found = self.findPaneWithParentsLocked(pane_id) orelse return error.PaneNotFound;
+        assert(std.mem.eql(u8, found.pane.window_id, found.window.id));
         const active_pane = try self.allocator.dupe(u8, found.pane.id);
         errdefer self.allocator.free(active_pane);
         const active_window = try self.allocator.dupe(u8, found.window.id);
@@ -825,6 +899,7 @@ pub const Manager = struct {
         defer self.mutex.unlock(self.io);
 
         const found = self.findWindowWithParentLocked(window_id) orelse return error.WindowNotFound;
+        assert(std.mem.eql(u8, found.window.session_id, found.session.id));
         try replaceOwnedString(self.allocator, &found.session.active_window_id, found.window.id);
     }
 
@@ -895,6 +970,7 @@ pub const Manager = struct {
             new_native = try NativeSession.create(self.allocator, self.io, native_opts);
             self.spawn_count += 1;
             old_native = pane.native;
+            assert(old_native != new_native);
             // No old-generation callback starts once the swap is visible.
             // Does not wait, so it is safe under the manager mutex.
             old_native.dropEventSink();
@@ -929,7 +1005,13 @@ pub const Manager = struct {
     /// when `create_opts` is non-null and the target does not resolve. One
     /// critical section covers lookup, creation, and attach. Never fails on an
     /// exited pane; reports `exited` and `exit` instead.
-    pub fn attachOrCreateClient(self: *Manager, target: []const u8, rows: u16, cols: u16, create_opts: ?CreateOptions) !AttachResult {
+    pub fn attachOrCreateClient(
+        self: *Manager,
+        target: []const u8,
+        rows: u16,
+        cols: u16,
+        create_opts: ?CreateOptions,
+    ) !AttachResult {
         // Declared before the lock so a rollback tears down after unlock.
         var rollback: RemovedItems = .{};
         defer rollback.deinit(self.allocator);
@@ -947,6 +1029,7 @@ pub const Manager = struct {
             created = true;
             break :blk self.findPaneWithParentsLocked(handle.pane_id).?;
         };
+        assert(!created or found.window.panes.items.len == 1);
         errdefer if (created) {
             rollback = self.takeSessionLocked(found.session);
         };
@@ -993,6 +1076,7 @@ pub const Manager = struct {
             heap_buf = allocated;
             break :blk allocated;
         };
+        assert(natives.len == live);
         var used: usize = 0;
         for (self.sessions.items) |session| {
             for (session.windows.items) |window| {
@@ -1005,6 +1089,7 @@ pub const Manager = struct {
                 }
             }
         }
+        assert(used <= natives.len);
         self.mutex.unlock(self.io);
 
         for (natives[0..used]) |native| {
@@ -1020,7 +1105,12 @@ pub const Manager = struct {
         return native.scrollbackSnapshot(allocator);
     }
 
-    pub fn paneScrollbackTail(self: *Manager, allocator: Allocator, pane_id: []const u8, max_bytes: usize) !buffer.Tail {
+    pub fn paneScrollbackTail(
+        self: *Manager,
+        allocator: Allocator,
+        pane_id: []const u8,
+        max_bytes: usize,
+    ) !buffer.Tail {
         const native = try self.retainPaneNative(pane_id);
         defer native.release();
         return native.scrollbackTail(allocator, max_bytes);
@@ -1042,6 +1132,7 @@ pub const Manager = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const client = self.clients_by_id.get(client_id) orelse return false;
+        assert(self.clients.items.len == self.clients_by_id.count());
         const index = std.mem.indexOfScalar(*Client, self.clients.items, client).?;
         self.removeClientAtLocked(index, reason);
         return true;
@@ -1062,6 +1153,7 @@ pub const Manager = struct {
             result[filled] = .{ .client_id = try allocator.dupe(u8, item.client_id), .reason = item.reason };
             filled += 1;
         }
+        assert(filled == result.len);
         for (self.detached_clients.items) |item| self.allocator.free(item.client_id);
         self.detached_clients.clearRetainingCapacity();
         return result;
@@ -1125,6 +1217,7 @@ pub const Manager = struct {
             .command = owned_command,
             .repeat = repeat,
         });
+        assert(self.key_bindings.items.len <= self.limits.max_bindings);
     }
 
     /// Returns true when a binding was removed.
@@ -1210,7 +1303,8 @@ pub const Manager = struct {
                     .n, .other => return error.UnsupportedCommand,
                 }
             } else line.len;
-            return .{ .split_window = .{ .axis = axis, .command = try dupeOpt(allocator, CommandScanner.tail(line, tail_start)) } };
+            const command = try dupeOpt(allocator, CommandScanner.tail(line, tail_start));
+            return .{ .split_window = .{ .axis = axis, .command = command } };
         }
         if (std.mem.eql(u8, name.text, "new-window") or std.mem.eql(u8, name.text, "neww")) {
             var title: ?[]u8 = null;
@@ -1282,8 +1376,10 @@ pub const Manager = struct {
         defer self.allocator.free(session_id);
         defer if (cwd) |value| self.allocator.free(value);
 
+        assert(parsed != .noop and parsed != .respawn_pane);
         switch (parsed) {
-            .noop, .respawn_pane => unreachable,
+            // Both returned before the lookup above.
+            .noop, .respawn_pane => {},
             .split_window => |split| discardHandle(try self.splitPane(target_pane_id, split.axis, .{
                 .command = split.command,
                 .cwd = cwd,
@@ -1361,16 +1457,22 @@ pub const Manager = struct {
         }
         if (self.panes_by_id.count() != seen_panes.count()) return error.PaneIndexCountMismatch;
         if (self.clients_by_id.count() != seen_clients.count()) return error.ClientIndexCountMismatch;
+        try self.checkPaneIndexLocked();
+        if (self.detached_clients.capacity < self.detached_clients.items.len + self.clients.items.len) {
+            return error.DetachedCapacityShort;
+        }
+    }
+
+    /// Every pane in the tree has a `panes_by_id` entry pointing back at it.
+    fn checkPaneIndexLocked(self: *Manager) !void {
         for (self.sessions.items) |session| {
             for (session.windows.items) |window| {
                 for (window.panes.items) |pane| {
                     const loc = self.panes_by_id.get(pane.id) orelse return error.PaneIndexMissing;
-                    if (loc.session != session or loc.window != window or loc.pane != pane) return error.PaneIndexMismatch;
+                    const matches = loc.session == session and loc.window == window and loc.pane == pane;
+                    if (!matches) return error.PaneIndexMismatch;
                 }
             }
-        }
-        if (self.detached_clients.capacity < self.detached_clients.items.len + self.clients.items.len) {
-            return error.DetachedCapacityShort;
         }
     }
 
@@ -1517,6 +1619,7 @@ pub const Manager = struct {
         while (self.sink_in_flight > (if (reentrant) self.sink_reentrant_waiters else 0)) {
             self.sink_idle.waitUncancelable(self.io, &self.sink_mutex);
         }
+        assert(self.sink_in_flight <= (if (reentrant) self.sink_reentrant_waiters else 0));
     }
 
     /// The sink natives get: the manager trampoline when a sink is set.
@@ -1554,6 +1657,7 @@ pub const Manager = struct {
     fn finishSinkCall(self: *Manager) void {
         self.sink_mutex.lockUncancelable(self.io);
         defer self.sink_mutex.unlock(self.io);
+        assert(self.sink_in_flight > 0);
         self.sink_in_flight -= 1;
         if (self.sink_in_flight == 0 or self.sink_in_flight <= self.sink_reentrant_waiters) {
             self.sink_idle.broadcast(self.io);
@@ -1578,6 +1682,9 @@ pub const Manager = struct {
     /// Caller holds `mutex`. Allocates before the spawn so a failure changes
     /// nothing.
     fn addRespawnGate(self: *Manager, pane_id: []const u8, generation: u64) !void {
+        // A respawn always targets a generation after the first.
+        assert(generation > 0);
+        assert(pane_id.len > 0);
         const owned = try self.allocator.dupe(u8, pane_id);
         errdefer self.allocator.free(owned);
         self.sink_mutex.lockUncancelable(self.io);
@@ -1658,6 +1765,8 @@ pub const Manager = struct {
         self.sessions = .empty;
         self.panes_by_id.clearRetainingCapacity();
         while (self.clients.items.len > 0) self.removeClientAtLocked(self.clients.items.len - 1, .session_removed);
+        assert(self.clients.items.len == 0);
+        assert(self.clients_by_id.count() == 0);
         self.mutex.unlock(self.io);
 
         // `sessions` is now private to this call.
@@ -1686,7 +1795,8 @@ pub const Manager = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        var out: std.Io.Writer.Allocating = try .initCapacity(allocator, @max(@as(usize, 64), self.panes_by_id.count() * 256));
+        const hint = @max(@as(usize, 64), self.panes_by_id.count() * 256);
+        var out: std.Io.Writer.Allocating = try .initCapacity(allocator, hint);
         errdefer out.deinit();
         try out.writer.writeByte('[');
         var first = true;
@@ -1737,7 +1847,8 @@ pub const Manager = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        var out: std.Io.Writer.Allocating = try .initCapacity(allocator, @max(@as(usize, 64), self.clients.items.len * 160));
+        const hint = @max(@as(usize, 64), self.clients.items.len * 160);
+        var out: std.Io.Writer.Allocating = try .initCapacity(allocator, hint);
         errdefer out.deinit();
         try self.writeClientsJsonLocked(&out.writer);
         return out.toOwnedSlice();
@@ -1747,7 +1858,8 @@ pub const Manager = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        var out: std.Io.Writer.Allocating = try .initCapacity(allocator, @max(@as(usize, 64), self.key_bindings.items.len * 96));
+        const hint = @max(@as(usize, 64), self.key_bindings.items.len * 96);
+        var out: std.Io.Writer.Allocating = try .initCapacity(allocator, hint);
         errdefer out.deinit();
         try self.writeKeyBindingsJsonLocked(&out.writer);
         return out.toOwnedSlice();
@@ -1820,12 +1932,22 @@ pub const Manager = struct {
         session.windows.appendAssumeCapacity(window);
         self.sessions.appendAssumeCapacity(session);
         self.panes_by_id.putAssumeCapacity(pane.id, .{ .session = session, .window = window, .pane = pane });
+        assert(session.windows.items.len == 1);
+        assert(window.panes.items.len == 1);
         return handle.adopt(pane.native);
     }
 
     /// Spawns the native as the final fallible step, so callers commit
     /// infallibly after it and never tear a native down under the mutex.
-    fn createPaneLocked(self: *Manager, session: *Session, window: *Window, pane_id: []const u8, opts: CreateOptions) !*Pane {
+    fn createPaneLocked(
+        self: *Manager,
+        session: *Session,
+        window: *Window,
+        pane_id: []const u8,
+        opts: CreateOptions,
+    ) !*Pane {
+        assert(pane_id.len > 0);
+        assert(std.mem.eql(u8, window.session_id, session.id));
         var spawn = try SpawnSpec.fromOptions(self.allocator, opts);
         errdefer spawn.deinit(self.allocator);
 
@@ -1840,7 +1962,8 @@ pub const Manager = struct {
         const owned_session_id = try self.allocator.dupe(u8, session.id);
         errdefer self.allocator.free(owned_session_id);
 
-        const native = try NativeSession.create(self.allocator, self.io, spawn.nativeOptions(pane_id, self.nativeSinkLocked()));
+        const native_opts = spawn.nativeOptions(pane_id, self.nativeSinkLocked());
+        const native = try NativeSession.create(self.allocator, self.io, native_opts);
         self.spawn_count += 1;
 
         pane.* = .{
@@ -1889,8 +2012,10 @@ pub const Manager = struct {
         errdefer snapshot.deinit(self.allocator);
         try applyPaneSize(found.pane, rows, cols);
 
+        assert(self.detached_clients.capacity >= self.detached_clients.items.len + self.clients.items.len + 1);
         self.clients.appendAssumeCapacity(client);
         self.clients_by_id.putAssumeCapacity(client.id, client);
+        assert(self.clients.items.len == self.clients_by_id.count());
         return snapshot;
     }
 
@@ -1927,6 +2052,7 @@ pub const Manager = struct {
                 }
             }
         }
+        assert(used == natives.len);
         return natives;
     }
 
@@ -1974,8 +2100,10 @@ pub const Manager = struct {
     }
 
     fn nextIdLocked(self: *Manager, prefix: []const u8, next: *usize) ![]u8 {
+        assert(prefix.len > 0);
         next.* += 1;
-        return std.fmt.allocPrint(self.allocator, "{s}-{d}-{x}", .{ prefix, next.*, std.Io.Clock.real.now(self.io).nanoseconds });
+        const stamp = std.Io.Clock.real.now(self.io).nanoseconds;
+        return std.fmt.allocPrint(self.allocator, "{s}-{d}-{x}", .{ prefix, next.*, stamp });
     }
 
     /// Exact id first, then name, so an id always wins.
@@ -2045,6 +2173,7 @@ pub const Manager = struct {
 
     /// Never allocates: `detached_clients` capacity is reserved at attach.
     fn removeClientAtLocked(self: *Manager, index: usize, reason: ?DetachReason) void {
+        assert(index < self.clients.items.len);
         const client = self.clients.orderedRemove(index);
         _ = self.clients_by_id.remove(client.id);
         if (reason) |why| {
@@ -2078,6 +2207,7 @@ pub const Manager = struct {
     /// Never fails. Prunes clients of the session.
     fn takeSessionLocked(self: *Manager, session: *Session) RemovedItems {
         const index = std.mem.indexOfScalar(*Session, self.sessions.items, session) orelse return .{};
+        assert(session.windows.items.len > 0);
         self.detachClientsLocked(.session, session.id, .session_removed);
         for (session.windows.items) |window| {
             for (window.panes.items) |pane| _ = self.panes_by_id.remove(pane.id);
@@ -2100,13 +2230,16 @@ pub const Manager = struct {
         errdefer if (new_active_pane) |value| self.allocator.free(value);
         if (!removes_window and std.mem.eql(u8, window.active_pane_id, found.pane.id)) {
             const successor = window.panes.items[if (index == 0) 1 else 0];
+            assert(successor != found.pane);
             new_active_pane = try self.allocator.dupe(u8, successor.id);
         }
         var new_active_window: ?[]u8 = null;
         if (removes_window and std.mem.eql(u8, session.active_window_id, window.id)) {
-            const successor = for (session.windows.items) |candidate| {
-                if (candidate != window) break candidate;
-            } else unreachable;
+            // `session.windows.items.len > 1` (asserted above) and `window`
+            // is one of them, so the other end of the list is a successor.
+            const first_window = session.windows.items[0];
+            const successor = if (first_window == window) session.windows.items[1] else first_window;
+            assert(successor != window);
             new_active_window = try self.allocator.dupe(u8, successor.id);
         }
 
@@ -2131,9 +2264,14 @@ pub const Manager = struct {
     }
 
     fn writeSessionJsonLocked(self: *Manager, writer: *std.Io.Writer, session: *Session) !void {
+        assert(session.windows.items.len > 0);
         try writer.print(
             "{{\"id\":{f},\"name\":{f},\"activeWindowId\":{f},\"windows\":[",
-            .{ std.json.fmt(session.id, .{}), std.json.fmt(session.name, .{}), std.json.fmt(session.active_window_id, .{}) },
+            .{
+                std.json.fmt(session.id, .{}),
+                std.json.fmt(session.name, .{}),
+                std.json.fmt(session.active_window_id, .{}),
+            },
         );
         for (session.windows.items, 0..) |window, index| {
             if (index > 0) try writer.writeByte(',');
@@ -2144,6 +2282,7 @@ pub const Manager = struct {
 
     fn writeWindowJsonLocked(self: *Manager, writer: *std.Io.Writer, window: *Window) !void {
         _ = self;
+        assert(window.panes.items.len > 0);
         try writer.print(
             "{{\"id\":{f},\"sessionId\":{f},\"index\":{},\"name\":{f},\"activePaneId\":{f},\"layout\":",
             .{
@@ -2168,7 +2307,8 @@ pub const Manager = struct {
         for (self.clients.items, 0..) |client, index| {
             if (index > 0) try writer.writeByte(',');
             try writer.print(
-                "{{\"id\":{f},\"sessionId\":{f},\"windowId\":{f},\"paneId\":{f},\"rows\":{},\"cols\":{},\"active\":true}}",
+                "{{\"id\":{f},\"sessionId\":{f},\"windowId\":{f},\"paneId\":{f}," ++
+                    "\"rows\":{},\"cols\":{},\"active\":true}}",
                 .{
                     std.json.fmt(client.id, .{}),
                     std.json.fmt(client.session_id, .{}),
@@ -2188,7 +2328,12 @@ pub const Manager = struct {
             if (index > 0) try writer.writeByte(',');
             try writer.print(
                 "{{\"table\":{f},\"key\":{f},\"command\":{f},\"repeat\":{}}}",
-                .{ std.json.fmt(binding.table, .{}), std.json.fmt(binding.key, .{}), std.json.fmt(binding.command, .{}), binding.repeat },
+                .{
+                    std.json.fmt(binding.table, .{}),
+                    std.json.fmt(binding.key, .{}),
+                    std.json.fmt(binding.command, .{}),
+                    binding.repeat,
+                },
             );
         }
         try writer.writeByte(']');
@@ -2197,7 +2342,9 @@ pub const Manager = struct {
 
 fn writePaneJson(writer: *std.Io.Writer, pane: *const Pane) !void {
     try writer.print(
-        "{{\"id\":{f},\"windowId\":{f},\"sessionId\":{f},\"index\":{},\"title\":{f},\"hasCustomTitle\":{},\"state\":{f},\"generation\":{},\"pid\":{},\"rows\":{},\"cols\":{},\"cwd\":",
+        "{{\"id\":{f},\"windowId\":{f},\"sessionId\":{f},\"index\":{},\"title\":{f}," ++
+            "\"hasCustomTitle\":{},\"state\":{f},\"generation\":{},\"pid\":{}," ++
+            "\"rows\":{},\"cols\":{},\"cwd\":",
         .{
             std.json.fmt(pane.id, .{}),
             std.json.fmt(pane.window_id, .{}),
@@ -2214,7 +2361,8 @@ fn writePaneJson(writer: *std.Io.Writer, pane: *const Pane) !void {
     );
     if (pane.spawn.cwd) |cwd| try writer.print("{f}", .{std.json.fmt(cwd, .{})}) else try writer.writeAll("null");
     try writer.print(
-        ",\"command\":{f},\"alerts\":{{\"activity\":{},\"bell\":{},\"exited\":{},\"lastActivityMs\":{},\"lastBellMs\":{}}}}}",
+        ",\"command\":{f},\"alerts\":{{\"activity\":{},\"bell\":{},\"exited\":{}," ++
+            "\"lastActivityMs\":{},\"lastBellMs\":{}}}}}",
         .{
             std.json.fmt(pane.spawn.command orelse "", .{}),
             pane.alerts.activity,
@@ -2246,6 +2394,7 @@ fn dupeStringSlice(allocator: Allocator, entries: []const []const u8) ![][]const
         copy[index] = try allocator.dupe(u8, entry);
         filled += 1;
     }
+    assert(filled == copy.len);
     return copy;
 }
 
@@ -2702,16 +2851,23 @@ fn waitForNoLivePanes(manager: *Manager) !void {
     while (std.Io.Clock.awake.now(io).compare(.lt, deadline)) {
         manager.reapExitedPanes();
         if (manager.counts().live_panes == 0) return;
-        io.sleep(.fromMilliseconds(10), .awake) catch {};
+        try io.sleep(.fromMilliseconds(10), .awake);
     }
     return error.PaneStillLive;
 }
 
-fn paneState(manager: *Manager, pane_id: []const u8) !struct { alerts: AlertState, generation: u64, rows: u16, cols: u16 } {
+const PaneStateView = struct { alerts: AlertState, generation: u64, rows: u16, cols: u16 };
+
+fn paneState(manager: *Manager, pane_id: []const u8) !PaneStateView {
     manager.mutex.lockUncancelable(manager.io);
     defer manager.mutex.unlock(manager.io);
     const pane = manager.findPaneLocked(pane_id) orelse return error.PaneNotFound;
-    return .{ .alerts = pane.alerts, .generation = pane.native.generation(), .rows = pane.spawn.rows, .cols = pane.spawn.cols };
+    return .{
+        .alerts = pane.alerts,
+        .generation = pane.native.generation(),
+        .rows = pane.spawn.rows,
+        .cols = pane.spawn.cols,
+    };
 }
 
 /// Records `session_exited` generations and forwards them to `manager`, as
@@ -2759,7 +2915,9 @@ const StressContext = struct {
 
     fn createLoop(self: *StressContext) void {
         for (0..self.iterations) |_| {
-            const native = self.manager.create(.{ .title = "w", .shell = "/bin/sh", .command = "cat", .scrollback_bytes = 4096 }) catch |err| {
+            var opts = cat_opts;
+            opts.title = "w";
+            const native = self.manager.create(opts) catch |err| {
                 if (err != error.DuplicateSessionName) _ = self.failures.fetchAdd(1, .seq_cst);
                 continue;
             };
@@ -3433,7 +3591,11 @@ const HeldSink = struct {
         const self: *HeldSink = @ptrCast(@alignCast(context));
         if (self.cleared.load(.seq_cst)) _ = self.late_calls.fetchAdd(1, .seq_cst);
         if (!self.entered.swap(true, .seq_cst)) {
-            while (!self.release.load(.seq_cst)) std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+            while (!self.release.load(.seq_cst)) {
+                std.testing.io.sleep(.fromMilliseconds(1), .awake) catch |err| {
+                    log.debug("mux_test_held_sink_sleep_failed", .{ .err = err });
+                };
+            }
         }
     }
 
@@ -3513,7 +3675,9 @@ const OrderSink = struct {
         self.announced.store(native.generation(), .seq_cst);
         _ = self.announcements.fetchAdd(1, .seq_cst);
         // Widen the window in which the new reader is already emitting.
-        std.testing.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        std.testing.io.sleep(.fromMilliseconds(20), .awake) catch |err| {
+            log.debug("mux_test_order_sink_sleep_failed", .{ .err = err });
+        };
     }
 };
 

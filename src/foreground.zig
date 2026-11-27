@@ -5,11 +5,15 @@ const protocol = @import("protocol.zig");
 
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
+const assert = std.debug.assert;
 
+/// Interval between foreground process-group polls of a pane's PTY.
 pub const poll_interval_ms: i64 = 500;
 /// Bound on the serialized argv, measured after JSON escaping.
 pub const max_serialized_argv_bytes: usize = 64 * 1024;
 
+/// Name and argv of a foreground process. Owns `comm` and every `argv` entry;
+/// release them with `deinit`.
 pub const ProcessInfo = struct {
     allocator: Allocator,
     pid: posix.pid_t,
@@ -31,6 +35,8 @@ pub const ProcessInfo = struct {
     }
 };
 
+/// Tracks the last reported foreground process group of one PTY, so only
+/// changes are reported.
 pub const Tracker = struct {
     shell_pid: posix.pid_t,
     last_pgid: ?posix.pid_t = null,
@@ -113,6 +119,8 @@ fn jsonEscapedLen(c: u8) usize {
 /// dropped. On error `argv` is unchanged.
 fn boundSerializedArgv(allocator: Allocator, argv: *[][]u8, max_bytes: usize) Allocator.Error!bool {
     const cut = argvCut(argv.*, max_bytes) orelse return false;
+    assert(cut.index < argv.len);
+    assert(cut.keep_bytes <= argv.*[cut.index].len);
     const kept_args = cut.index + @intFromBool(cut.keep_bytes > 0);
 
     const new_argv = try allocator.alloc([]u8, kept_args);
@@ -139,6 +147,7 @@ fn argvCut(argv: []const []const u8, max_bytes: usize) ?ArgvCut {
         for (arg) |c| arg_len += jsonEscapedLen(c);
         if (used + overhead + arg_len <= max_bytes) {
             used += overhead + arg_len;
+            assert(used <= max_bytes);
             continue;
         }
 
@@ -148,6 +157,7 @@ fn argvCut(argv: []const []const u8, max_bytes: usize) ?ArgvCut {
             while (keep < arg.len) {
                 const seq = std.unicode.utf8ByteSequenceLength(arg[keep]) catch 1;
                 const end = @min(keep + seq, arg.len);
+                assert(end > keep);
                 var cost: usize = 0;
                 for (arg[keep..end]) |c| cost += jsonEscapedLen(c);
                 if (cost > budget) break;
@@ -155,6 +165,7 @@ fn argvCut(argv: []const []const u8, max_bytes: usize) ?ArgvCut {
                 keep = end;
             }
         }
+        assert(keep <= arg.len);
         return .{ .index = index, .keep_bytes = keep };
     }
     return null;
@@ -207,11 +218,11 @@ const linux_cmdline_max_bytes: usize = 256 * 1024;
 /// is set when neither file yielded a name, which is the transient case a
 /// caller should retry instead of committing.
 fn resolveLinuxProcessInfo(allocator: Allocator, io: std.Io, pid: posix.pid_t) Allocator.Error!ProcessInfo {
-    var path_buffer: [64]u8 = undefined;
+    var path_buffer: [linux_proc_path_max]u8 = undefined;
 
     var argv_truncated = false;
     const argv = argv: {
-        const path = std.fmt.bufPrint(&path_buffer, "/proc/{d}/cmdline", .{pid}) catch unreachable;
+        const path = linuxProcPath(&path_buffer, pid, "cmdline");
         const raw = try readProcFileBounded(allocator, io, path, linux_cmdline_max_bytes) orelse
             break :argv try allocator.alloc([]u8, 0);
         defer allocator.free(raw.bytes);
@@ -222,7 +233,7 @@ fn resolveLinuxProcessInfo(allocator: Allocator, io: std.Io, pid: posix.pid_t) A
 
     var degraded = false;
     const comm = comm: {
-        const path = std.fmt.bufPrint(&path_buffer, "/proc/{d}/comm", .{pid}) catch unreachable;
+        const path = linuxProcPath(&path_buffer, pid, "comm");
         if (try readProcFileBounded(allocator, io, path, linux_comm_max_bytes)) |raw| {
             defer allocator.free(raw.bytes);
             const name = parseLinuxProcComm(raw.bytes);
@@ -246,6 +257,25 @@ fn resolveLinuxProcessInfo(allocator: Allocator, io: std.Io, pid: posix.pid_t) A
     };
 }
 
+/// Longest `/proc/<pid>/<leaf>` path `linuxProcPath` builds: the widest
+/// `pid_t`, including its sign, plus the longest leaf.
+const linux_proc_path_max = "/proc/".len + std.fmt.count("{d}", .{std.math.minInt(posix.pid_t)}) + "/cmdline".len;
+
+/// Format `/proc/<pid>/<leaf>` into `buffer`. Cannot fail: `buffer` is sized
+/// for the widest `pid_t` and the longest leaf this module reads.
+fn linuxProcPath(buffer: *[linux_proc_path_max]u8, pid: posix.pid_t, comptime leaf: []const u8) []const u8 {
+    const prefix = "/proc/";
+    const tail = "/" ++ leaf;
+    comptime assert(tail.len <= "/cmdline".len);
+    @memcpy(buffer[0..prefix.len], prefix);
+    var pos: usize = prefix.len;
+    pos += std.fmt.printInt(buffer[pos..], pid, 10, .lower, .{});
+    @memcpy(buffer[pos..][0..tail.len], tail);
+    pos += tail.len;
+    assert(pos <= buffer.len);
+    return buffer[0..pos];
+}
+
 const ProcFile = struct { bytes: []u8, truncated: bool };
 
 /// Reads at most `max_bytes` from a /proc file. procfs reports a size of 0,
@@ -264,6 +294,7 @@ fn readProcFileBounded(allocator: Allocator, io: std.Io, path: []const u8, max_b
     // Read one byte past the bound to learn whether anything was cut.
     while (buffer.items.len <= max_bytes) {
         const want = @min(chunk.len, max_bytes + 1 - buffer.items.len);
+        assert(want > 0);
         const n = file.readStreaming(io, &.{chunk[0..want]}) catch |err| switch (err) {
             error.EndOfStream => break,
             else => {
@@ -277,6 +308,7 @@ fn readProcFileBounded(allocator: Allocator, io: std.Io, path: []const u8, max_b
 
     const truncated = buffer.items.len > max_bytes;
     if (truncated) buffer.shrinkRetainingCapacity(max_bytes);
+    assert(buffer.items.len <= max_bytes);
     return .{ .bytes = try buffer.toOwnedSlice(allocator), .truncated = truncated };
 }
 
@@ -346,6 +378,7 @@ fn darwinArgMax() !usize {
     try posix.sysctl(&.{ ctl_kern, kern_argmax }, &argmax, &argmax_len, null, 0);
     if (argmax <= 0) return 0;
     const size: usize = @intCast(argmax);
+    assert(size > 0);
     cached_darwin_argmax.store(size, .release);
     return size;
 }
@@ -391,6 +424,7 @@ pub fn parseProcArgsBuffer(allocator: Allocator, buffer: []const u8, fallback_pa
     return (try parseProcArgs(allocator, buffer, fallback_path)).argv;
 }
 
+/// Owned argv parsed from a process-arguments buffer.
 pub const ParsedArgv = struct {
     argv: [][]u8,
     /// The buffer ended before `argc` arguments were read.
@@ -434,13 +468,17 @@ pub fn parseProcArgs(allocator: Allocator, buffer: []const u8, fallback_path: []
     const nul_run = offset - run_start;
 
     // Terminator plus padding up to the pointer-size boundary.
-    const expected_run = 1 + (procargs_pointer_size - (path_len + 1) % procargs_pointer_size) % procargs_pointer_size;
+    const pad = (procargs_pointer_size - (path_len + 1) % procargs_pointer_size) % procargs_pointer_size;
+    const expected_run = 1 + pad;
+    assert(expected_run <= procargs_pointer_size);
     // The buffer ends inside the NUL run (no argument is visible), or the
     // run is too short for the documented layout: the argv boundary cannot
     // be established, so report the executable alone.
     if (offset >= buffer.len or nul_run < expected_run) {
         return .{ .argv = try fallbackArgv(allocator, fallback_path), .truncated = true };
     }
+    assert(nul_run >= expected_run);
+    assert(offset < buffer.len);
 
     // The list is the single owner of every argument until `toOwnedSlice`.
     var argv = std.ArrayList([]u8).empty;
@@ -478,6 +516,8 @@ pub fn parseProcArgs(allocator: Allocator, buffer: []const u8, fallback_path: []
         }
         offset += 1;
     }
+    assert(argv.items.len + remaining == argc);
+    assert(offset <= buffer.len);
     return .{ .argv = try argv.toOwnedSlice(allocator), .truncated = remaining > 0 or cut };
 }
 
@@ -490,6 +530,7 @@ fn fallbackArgv(allocator: Allocator, fallback_path: []const u8) Allocator.Error
     return argv;
 }
 
+/// Free every argument in `argv` and the slice itself.
 pub fn freeArgv(allocator: Allocator, argv: [][]u8) void {
     for (argv) |arg| allocator.free(arg);
     allocator.free(argv);
@@ -502,6 +543,7 @@ const kern_procargs2: c_int = 49;
 extern "c" fn proc_pidpath(pid: c_int, buffer: [*]u8, buffersize: u32) c_int;
 extern "c" fn tcgetpgrp(fd: c_int) c_int;
 
+/// Errors from reading a PTY's foreground process group.
 pub const ForegroundPgrpError = error{ NotATerminal, Unexpected };
 
 fn terminalForegroundPgrp(fd: posix.fd_t) ForegroundPgrpError!posix.pid_t {

@@ -8,6 +8,7 @@ const socket_path_mod = @import("socket_path.zig");
 const sys = @import("sys.zig");
 
 const posix = std.posix;
+const assert = std.debug.assert;
 
 const default_idle_timeout_seconds: i64 = 60 * 60;
 /// How long a starting daemon waits for another starter to finish.
@@ -65,12 +66,19 @@ fn envGet(name: []const u8) ?[]const u8 {
 const StartLock = struct {
     fd: sys.fd_t,
 
-    fn acquire(dir_fd: sys.fd_t, lock_name: []const u8, timeout_ms: i64, stop: ?*const std.atomic.Value(bool)) !StartLock {
+    fn acquire(
+        dir_fd: sys.fd_t,
+        lock_name: []const u8,
+        timeout_ms: i64,
+        stop: ?*const std.atomic.Value(bool),
+    ) !StartLock {
+        assert(lock_name.len > 0);
         const fd = try sys.openOwnedRegularAt(dir_fd, lock_name, .{ .ACCMODE = .RDWR, .CREAT = true }, 0o600);
         errdefer sys.close(fd);
+        assert(fd >= 0);
         // A restrictive umask must not leave a lock the next starter cannot
         // open. The file is ours (checked above), so this is safe.
-        sys.fchmod(fd, 0o600) catch {};
+        sys.fchmod(fd, 0o600) catch |err| log.debug("start_lock_fchmod_failed", .{ .err = err });
         try sys.flockExclusiveDeadline(fd, sys.monotonicMs() + timeout_ms, stop);
         return .{ .fd = fd };
     }
@@ -90,19 +98,33 @@ const SiblingNames = struct {
     lock_len: usize = 0,
     pid_len: usize = 0,
 
+    /// A base name too long for the buffers (only possible for a path that
+    /// never passed `socket_path.validate`) leaves both lengths 0; check
+    /// `fits` before using the names.
     fn init(socket_path: []const u8) SiblingNames {
         var names: SiblingNames = .{};
         const base = std.fs.path.basename(socket_path);
-        names.lock_len = (std.fmt.bufPrint(&names.lock_buf, "{s}.lock", .{base}) catch unreachable).len;
-        names.pid_len = (std.fmt.bufPrint(&names.pid_buf, "{s}.pid", .{base}) catch unreachable).len;
+        const lock_name = std.fmt.bufPrint(&names.lock_buf, "{s}.lock", .{base}) catch return names;
+        const pid_name = std.fmt.bufPrint(&names.pid_buf, "{s}.pid", .{base}) catch return names;
+        names.lock_len = lock_name.len;
+        names.pid_len = pid_name.len;
+        assert(names.lock_len == base.len + ".lock".len);
+        assert(names.pid_len == base.len + ".pid".len);
         return names;
     }
 
+    /// True when both derived names were formatted.
+    fn fits(self: *const SiblingNames) bool {
+        return self.lock_len > 0 and self.pid_len > 0;
+    }
+
     fn lock(self: *const SiblingNames) []const u8 {
+        assert(self.lock_len <= self.lock_buf.len);
         return self.lock_buf[0..self.lock_len];
     }
 
     pub fn pid(self: *const SiblingNames) []const u8 {
+        assert(self.pid_len <= self.pid_buf.len);
         return self.pid_buf[0..self.pid_len];
     }
 };
@@ -128,13 +150,18 @@ fn openStartContext(
     timeout_ms: i64,
     stop: ?*const std.atomic.Value(bool),
 ) !StartContext {
+    const names = SiblingNames.init(socket_path);
+    if (!names.fits()) return error.NameTooLong;
     const dir_fd = try server_mod.openSocketParent(socket_path, getenv);
     errdefer sys.close(dir_fd);
-    const names = SiblingNames.init(socket_path);
+    assert(dir_fd >= 0);
     const lock = try StartLock.acquire(dir_fd, names.lock(), timeout_ms, stop);
+    assert(lock.fd >= 0);
     return .{ .dir_fd = dir_fd, .lock = lock };
 }
 
+/// Entry point of `zmuxd`: runs the daemon and exits 2 on usage errors and 1
+/// on any other failure, after reporting it on stderr.
 pub fn main(init: std.process.Init) void {
     runMain(init) catch |err| {
         switch (err) {
@@ -142,17 +169,22 @@ pub fn main(init: std.process.Init) void {
             error.InvalidArguments, error.SocketPathTooLong => std.process.exit(2),
             // Already reported with a specific message.
             error.StartupFailed => {},
-            else => {
-                var buf: [1024]u8 = undefined;
-                var w = std.Io.File.stderr().writerStreaming(init.io, &buf);
-                w.interface.print("zmuxd: {s}\n", .{@errorName(err)}) catch {};
-                w.interface.flush() catch {};
-            },
+            else => writeStderr(init.io, "zmuxd: {s}\n", .{@errorName(err)}),
         }
         std.process.exit(1);
     };
 }
 
+/// Write one best-effort message to stderr. A failed write has nowhere better
+/// to go, so it is logged at debug level and otherwise ignored.
+fn writeStderr(io: std.Io, comptime fmt: []const u8, args: anytype) void {
+    var buf: [std.fs.max_path_bytes + 512]u8 = undefined;
+    var w = std.Io.File.stderr().writerStreaming(io, &buf);
+    w.interface.print(fmt, args) catch |err| return log.debug("stderr_write_failed", .{ .err = err });
+    w.interface.flush() catch |err| log.debug("stderr_write_failed", .{ .err = err });
+}
+
+/// Options accepted on the `zmuxd` command line.
 pub const ParsedArgs = struct {
     idle_timeout_seconds: i64 = default_idle_timeout_seconds,
     explicit_socket_path: ?[]const u8 = null,
@@ -161,6 +193,7 @@ pub const ParsedArgs = struct {
     show_help: bool = false,
 };
 
+/// Every way `parseArgs` can reject a command line.
 pub const ParseArgsError = error{
     MissingSocketValue,
     MissingIdleSecondsValue,
@@ -171,12 +204,16 @@ pub const ParseArgsError = error{
     UnknownFlag,
 };
 
+/// Detail for a `parseArgs` failure: the error plus the offending argument
+/// and, for a bad number, the underlying parse error.
 pub const ParseArgsFailure = struct {
     err: ParseArgsError,
     arg: ?[]const u8 = null,
     parse_err: ?anyerror = null,
 };
 
+/// Parse `argv` (including the program name at index 0). On error, `failure`
+/// (when given) receives the details needed for a usage message.
 pub fn parseArgs(argv: []const []const u8, failure: ?*ParseArgsFailure) ParseArgsError!ParsedArgs {
     var parsed: ParsedArgs = .{};
     var i: usize = 1;
@@ -195,7 +232,11 @@ pub fn parseArgs(argv: []const []const u8, failure: ?*ParseArgsFailure) ParseArg
                 return error.MissingIdleSecondsValue;
             }
             parsed.idle_timeout_seconds = std.fmt.parseInt(i64, argv[i], 10) catch |err| {
-                if (failure) |f| f.* = .{ .err = error.InvalidIdleSecondsValue, .arg = argv[i], .parse_err = err };
+                if (failure) |f| f.* = .{
+                    .err = error.InvalidIdleSecondsValue,
+                    .arg = argv[i],
+                    .parse_err = err,
+                };
                 return error.InvalidIdleSecondsValue;
             };
             // A negative timeout used to disable idle cleanup silently; 0 is
@@ -204,6 +245,7 @@ pub fn parseArgs(argv: []const []const u8, failure: ?*ParseArgsFailure) ParseArg
                 if (failure) |f| f.* = .{ .err = error.NegativeIdleSecondsValue, .arg = argv[i] };
                 return error.NegativeIdleSecondsValue;
             }
+            assert(parsed.idle_timeout_seconds >= 0);
         } else if (std.mem.eql(u8, argv[i], "--log-level")) {
             i += 1;
             if (i >= argv.len) {
@@ -236,17 +278,7 @@ fn runMain(init: std.process.Init) !void {
     // Environment first; an explicit --log-level below overrides it.
     log.initFromEnv(init.environ_map);
 
-    var failure: ParseArgsFailure = .{ .err = error.UnknownFlag };
-    const parsed = parseArgs(argv, &failure) catch |err| switch (err) {
-        error.MissingSocketValue => return fail(io, "missing value for --socket", .{}),
-        error.MissingIdleSecondsValue => return fail(io, "missing value for --idle-seconds", .{}),
-        error.InvalidIdleSecondsValue => return fail(io, "invalid idle timeout value: {s}", .{@errorName(failure.parse_err.?)}),
-        error.NegativeIdleSecondsValue => return fail(io, "--idle-seconds must be 0 or greater, got {s} (0 disables the idle timeout)", .{failure.arg.?}),
-        error.MissingLogLevelValue => return fail(io, "missing value for --log-level", .{}),
-        error.InvalidLogLevelValue => return fail(io, "invalid log level: {s} (expected error, warn, info, or debug)", .{failure.arg.?}),
-        error.UnknownFlag => return fail(io, "unknown flag: {s}", .{failure.arg.?}),
-    };
-
+    const parsed = try parseArgsOrFail(io, argv);
     if (parsed.log_level) |level| log.setLevel(level);
     if (parsed.show_help) {
         try printUsage(io);
@@ -257,17 +289,53 @@ fn runMain(init: std.process.Init) !void {
         return;
     }
 
-    const idle_timeout_seconds = parsed.idle_timeout_seconds;
+    env_values = EnvValues.fromMap(init.environ_map);
+    const path = try resolveSocketPathOrFail(allocator, io, parsed.explicit_socket_path);
+    defer allocator.free(path);
+    assert(std.fs.path.isAbsolute(path));
 
+    prepareDaemonProcess();
+    const default_cwd = defaultPaneCwd(envGet("HOME"));
+    try serve(allocator, io, path, parsed.idle_timeout_seconds, default_cwd);
+}
+
+/// `parseArgs`, with every failure reported as a usage message on stderr.
+fn parseArgsOrFail(io: std.Io, argv: []const []const u8) error{InvalidArguments}!ParsedArgs {
+    var failure: ParseArgsFailure = .{ .err = error.UnknownFlag };
+    return parseArgs(argv, &failure) catch |err| switch (err) {
+        error.MissingSocketValue => return fail(io, "missing value for --socket", .{}),
+        error.MissingIdleSecondsValue => return fail(io, "missing value for --idle-seconds", .{}),
+        error.InvalidIdleSecondsValue => return fail(
+            io,
+            "invalid idle timeout value: {s}",
+            .{@errorName(failure.parse_err orelse err)},
+        ),
+        error.NegativeIdleSecondsValue => return fail(
+            io,
+            "--idle-seconds must be 0 or greater, got {s} (0 disables the idle timeout)",
+            .{failure.arg orelse ""},
+        ),
+        error.MissingLogLevelValue => return fail(io, "missing value for --log-level", .{}),
+        error.InvalidLogLevelValue => return fail(
+            io,
+            "invalid log level: {s} (expected error, warn, info, or debug)",
+            .{failure.arg orelse ""},
+        ),
+        error.UnknownFlag => return fail(io, "unknown flag: {s}", .{failure.arg orelse ""}),
+    };
+}
+
+/// Resolve and validate the socket path, reporting a bad path on stderr.
+/// Caller owns the returned absolute path.
+fn resolveSocketPathOrFail(allocator: std.mem.Allocator, io: std.Io, explicit: ?[]const u8) ![]u8 {
     // One resolver for every binary. A relative --socket or $ZMUX_SOCKET is
     // resolved against the current directory here, before anything else
     // touches the path.
-    env_values = EnvValues.fromMap(init.environ_map);
-    const path = socket_path_mod.resolveUnvalidated(allocator, parsed.explicit_socket_path, envGet) catch |err| switch (err) {
+    const path = socket_path_mod.resolveUnvalidated(allocator, explicit, envGet) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return fail(io, "invalid socket path: {s}", .{socketPathProblem(err)}),
     };
-    defer allocator.free(path);
+    errdefer allocator.free(path);
 
     // Before the lock file or parent directory is created: a path bind(2) can
     // never accept must not leave anything behind.
@@ -278,7 +346,13 @@ fn runMain(init: std.process.Init) !void {
         },
         else => return fail(io, "invalid socket path: {s}", .{socketPathProblem(err)}),
     };
+    assert(path.len <= server_mod.max_socket_path_len);
+    return path;
+}
 
+/// Detach from the launcher: new session, default SIGCHLD, shutdown handlers,
+/// and `/` as the working directory.
+fn prepareDaemonProcess() void {
     detachFromControllingTerminal();
     resetSigchldDisposition();
     installShutdownHandlers();
@@ -292,8 +366,17 @@ fn runMain(init: std.process.Init) !void {
     // The umask is deliberately left alone: pane shells inherit it, and every
     // file the daemon creates gets an explicit private mode.
     leaveLauncherDirectory();
-    const default_cwd = defaultPaneCwd(envGet("HOME"));
+}
 
+/// Take the start lock, bind the server, publish the pid file, and run until
+/// shutdown. Returns normally when another daemon already owns `path`.
+fn serve(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    idle_timeout_seconds: i64,
+    default_cwd: ?[]const u8,
+) !void {
     // The socket directory is validated (or created 0700) before the lock,
     // PID file, or socket is touched, and everything below goes through the
     // pinned descriptor.
@@ -312,6 +395,8 @@ fn runMain(init: std.process.Init) !void {
     defer sys.close(start.dir_fd);
     defer start.lock.release();
     const names = SiblingNames.init(path);
+    // openStartContext succeeded on the same path, so the names fit.
+    assert(names.fits());
 
     // Server.init decides what an existing socket means. A daemon that is
     // already listening is not an error. The server binds in the directory
@@ -326,30 +411,45 @@ fn runMain(init: std.process.Init) !void {
 
     // Under the start lock: no other starter can see the socket without its
     // PID file, or remove one while this daemon writes the other.
-    const pid_stat: ?sys.Stat = writePidFile(start.dir_fd, names.pid()) catch |err| blk: {
-        // The pid file is advisory; failing after the socket is bound would
-        // leave a healthy daemon unavailable and a stale socket. Keep
-        // serving, but say so: tools that read the pid file will not find
-        // this daemon.
-        log.warn("pid_file_write_failed", .{ .err = err, .socket_path = path });
-        break :blk null;
-    };
+    const pid_stat = publishPidFile(start.dir_fd, names.pid(), path);
 
     defer {
         // Still under the lifetime start lock: remove the published names
         // only if they are still the ones this daemon created, then tear
         // down. The lock is released after this block.
-        std.debug.assert(start.lock.fd >= 0);
+        assert(start.lock.fd >= 0);
         server.unpublish();
         if (pid_stat) |stat| removePidFile(start.dir_fd, names.pid(), stat);
         server.deinit();
     }
 
+    try runServer(&server, path, idle_timeout_seconds, default_cwd, pid_stat != null);
+}
+
+/// `writePidFile`, downgraded to a warning: the pid file is advisory.
+fn publishPidFile(dir_fd: sys.fd_t, pid_name: []const u8, path: []const u8) ?sys.Stat {
+    return writePidFile(dir_fd, pid_name) catch |err| {
+        // Failing after the socket is bound would leave a healthy daemon
+        // unavailable and a stale socket. Keep serving, but say so: tools
+        // that read the pid file will not find this daemon.
+        log.warn("pid_file_write_failed", .{ .err = err, .socket_path = path });
+        return null;
+    };
+}
+
+/// Log startup, serve until shutdown, and log why the server stopped.
+fn runServer(
+    server: *server_mod.Server,
+    path: []const u8,
+    idle_timeout_seconds: i64,
+    default_cwd: ?[]const u8,
+    pid_file_written: bool,
+) !void {
     log.info("daemon_start", .{
         .version = protocol.version,
         .socket_path = path,
         .idle_timeout_seconds = idle_timeout_seconds,
-        .pid_file_written = pid_stat != null,
+        .pid_file_written = pid_file_written,
         .log_level = log.getLevel(),
     });
 
@@ -367,16 +467,34 @@ fn runMain(init: std.process.Init) !void {
 
 /// `Server.init`, retried while the stale-socket probe cannot decide whether
 /// a daemon is listening (for example during fd exhaustion).
-fn initServer(allocator: std.mem.Allocator, io: std.Io, path: []const u8, idle_timeout_seconds: i64) !server_mod.Server {
+fn initServer(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    idle_timeout_seconds: i64,
+) !server_mod.Server {
     return initServerIn(allocator, io, null, path, idle_timeout_seconds);
 }
 
 /// `initServer` in the pinned directory `dir_fd` (borrowed).
-fn initServerAt(allocator: std.mem.Allocator, io: std.Io, dir_fd: sys.fd_t, path: []const u8, idle_timeout_seconds: i64) !server_mod.Server {
+fn initServerAt(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir_fd: sys.fd_t,
+    path: []const u8,
+    idle_timeout_seconds: i64,
+) !server_mod.Server {
     return initServerIn(allocator, io, dir_fd, path, idle_timeout_seconds);
 }
 
-fn initServerIn(allocator: std.mem.Allocator, io: std.Io, dir_fd: ?sys.fd_t, path: []const u8, idle_timeout_seconds: i64) !server_mod.Server {
+fn initServerIn(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir_fd: ?sys.fd_t,
+    path: []const u8,
+    idle_timeout_seconds: i64,
+) !server_mod.Server {
+    assert(idle_timeout_seconds >= 0);
     const deadline = sys.monotonicMs() + startup_probe_timeout_ms;
     while (true) {
         const attempt = if (dir_fd) |fd|
@@ -405,15 +523,20 @@ fn socketPathProblem(err: socket_path_mod.Error) []const u8 {
 /// One line saying why startup was refused, for the errors a user can act on.
 fn startupFailureMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
-        error.InsecurePermissions => "the socket directory is writable by other users; it must be owned by you with mode 0700",
-        error.InsecureSocketDirectory => "the socket directory is writable by other users; use a directory you own with no group or other write permission, or a sticky directory such as /tmp",
+        error.InsecurePermissions => "the socket directory is writable by other users; " ++
+            "it must be owned by you with mode 0700",
+        error.InsecureSocketDirectory => "the socket directory is writable by other users; " ++
+            "use a directory you own with no group or other write permission, or a sticky directory such as /tmp",
         error.ForeignOwner => "the socket directory or a file in it is owned by another user",
-        error.NotDirectory, error.SymlinkParent => "the socket directory is not a real directory (a symlink or a file is in its place)",
-        error.NotRegularFile, error.SymLinkLoop => "the lock file beside the socket is not a regular file (a symlink, FIFO, or directory is in its place)",
+        error.NotDirectory, error.SymlinkParent => "the socket directory is not a real directory " ++
+            "(a symlink or a file is in its place)",
+        error.NotRegularFile, error.SymLinkLoop => "the lock file beside the socket is not a regular file " ++
+            "(a symlink, FIFO, or directory is in its place)",
         error.Timeout => "timed out waiting for another zmuxd that is starting on this socket",
         error.SocketPathNotSocket => "the socket path exists and is not a socket; zmuxd will not remove it",
         error.AccessDenied => "permission denied for the socket path (it may belong to another user)",
-        error.ProbeInconclusive => "could not tell whether a daemon is already listening on the socket; nothing was removed",
+        error.ProbeInconclusive => "could not tell whether a daemon is already listening on the socket; " ++
+            "nothing was removed",
         else => null,
     };
 }
@@ -421,10 +544,7 @@ fn startupFailureMessage(err: anyerror) ?[]const u8 {
 fn reportStartupFailure(io: std.Io, socket_path: []const u8, err: anyerror) anyerror {
     const message = startupFailureMessage(err) orelse return err;
     log.err("daemon_start_refused", .{ .err = err, .socket_path = socket_path });
-    var buf: [std.fs.max_path_bytes + 512]u8 = undefined;
-    var w = std.Io.File.stderr().writerStreaming(io, &buf);
-    w.interface.print("zmuxd: {s}\nzmuxd: socket: {s}\n", .{ message, socket_path }) catch {};
-    w.interface.flush() catch {};
+    writeStderr(io, "zmuxd: {s}\nzmuxd: socket: {s}\n", .{ message, socket_path });
     return error.StartupFailed;
 }
 
@@ -463,7 +583,8 @@ fn reportSocketPathTooLong(io: std.Io, socket_path: []const u8) void {
         .max_socket_path_len = server_mod.max_socket_path_len,
     });
     var buf: [std.fs.max_path_bytes + 256]u8 = undefined;
-    std.Io.File.stderr().writeStreamingAll(io, socketPathTooLongMessage(&buf, socket_path)) catch {};
+    const message = socketPathTooLongMessage(&buf, socket_path);
+    std.Io.File.stderr().writeStreamingAll(io, message) catch |err| log.debug("stderr_write_failed", .{ .err = err });
 }
 
 /// Default socket path: `$ZMUX_SOCKET`, `$SMITHERS_SESSION_SOCKET`,
@@ -498,6 +619,7 @@ fn pidPath(allocator: std.mem.Allocator, active_socket_path: []const u8) ![]u8 {
 
 fn nameZ(buf: *[posix.PATH_MAX]u8, name: []const u8) error{NameTooLong}![*:0]const u8 {
     if (name.len >= buf.len) return error.NameTooLong;
+    assert(name.len < buf.len);
     @memcpy(buf[0..name.len], name);
     buf[name.len] = 0;
     return buf[0..name.len :0].ptr;
@@ -536,15 +658,20 @@ fn writePidFile(dir_fd: sys.fd_t, pid_name: []const u8) !sys.Stat {
         error.FileNotFound => {},
         else => return err,
     }
-    const fd = try sys.openOwnedRegularAt(dir_fd, tmp_name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o600);
+    const create_flags: posix.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true };
+    const fd = try sys.openOwnedRegularAt(dir_fd, tmp_name, create_flags, 0o600);
+    assert(fd >= 0);
     var renamed = false;
-    defer if (!renamed) sys.unlinkAt(dir_fd, tmp_name) catch {};
+    defer if (!renamed) sys.unlinkAt(dir_fd, tmp_name) catch |err| {
+        log.debug("pid_tmp_unlink_failed", .{ .err = err });
+    };
     defer sys.close(fd);
 
     // Readable by its owner whatever the umask was.
     try sys.fchmod(fd, 0o600);
     var text_buf: [32]u8 = undefined;
     const text = try std.fmt.bufPrint(&text_buf, "{d}\n", .{sys.getpid()});
+    assert(text.len >= 2 and text[text.len - 1] == '\n');
     try sys.writeAll(fd, text);
     if (std.c.fsync(fd) != 0) return error.InputOutput;
     const stat = try sys.fstat(fd);
@@ -557,9 +684,10 @@ fn writePidFile(dir_fd: sys.fd_t, pid_name: []const u8) !sys.Stat {
 /// Remove the pid file only if it is still the file `writePidFile` created.
 /// A successor daemon's pid file has another inode and is left alone.
 fn removePidFile(dir_fd: sys.fd_t, pid_name: []const u8, written: sys.Stat) void {
+    assert(pid_name.len > 0);
     const current = sys.statAt(dir_fd, pid_name, false) catch return;
     if (!current.sameFile(written)) return;
-    sys.unlinkAt(dir_fd, pid_name) catch {};
+    sys.unlinkAt(dir_fd, pid_name) catch |err| log.debug("pid_file_unlink_failed", .{ .err = err });
 }
 
 fn printUsage(io: std.Io) !void {
@@ -592,11 +720,7 @@ fn printVersion(io: std.Io) !void {
 }
 
 fn fail(io: std.Io, comptime fmt: []const u8, args: anytype) error{InvalidArguments} {
-    var buf: [1024]u8 = undefined;
-    var w = std.Io.File.stderr().writerStreaming(io, &buf);
-    w.interface.print("zmuxd: " ++ fmt ++ "\n", args) catch {};
-    w.interface.print("Try 'zmuxd --help' for usage.\n", .{}) catch {};
-    w.interface.flush() catch {};
+    writeStderr(io, "zmuxd: " ++ fmt ++ "\nTry 'zmuxd --help' for usage.\n", args);
     return error.InvalidArguments;
 }
 
@@ -700,7 +824,9 @@ const TempDir = struct {
 
     fn deinit(self: *TempDir) void {
         sys.close(self.fd);
-        std.Io.Dir.cwd().deleteTree(test_io, self.path) catch {};
+        std.Io.Dir.cwd().deleteTree(test_io, self.path) catch |err| {
+            log.debug("test_tempdir_cleanup_failed", .{ .err = err });
+        };
         std.testing.allocator.free(self.path);
     }
 
@@ -845,7 +971,9 @@ const LockContention = struct {
                 _ = self.failures.fetchAdd(1, .seq_cst);
             }
 
-            test_io.sleep(.fromMilliseconds(3), .awake) catch {};
+            test_io.sleep(.fromMilliseconds(3), .awake) catch |err| {
+                log.debug("test_sleep_failed", .{ .err = err });
+            };
             _ = self.inside.fetchSub(1, .seq_cst);
             lock.release();
         }

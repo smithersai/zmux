@@ -4,36 +4,36 @@
 footprint:
   module-prod-lines:
     "*": { target: 600 }
-    src/buffer.zig: { baseline: 185 }
-    src/connect.zig: { baseline: 1966 }
-    src/daemon.zig: { baseline: 797 }
-    src/foreground.zig: { baseline: 628 }
-    src/log.zig: { baseline: 406 }
-    src/main.zig: { baseline: 38 }
-    src/mux.zig: { baseline: 2674 }
-    src/native.zig: { baseline: 1363 }
-    src/protocol.zig: { baseline: 591 }
-    src/pty.zig: { baseline: 1162 }
-    src/rpc_line_reader.zig: { baseline: 349 }
-    src/server.zig: { baseline: 3478 }
-    src/socket_path.zig: { baseline: 159 }
-    src/sys.zig: { baseline: 1582 }
+    src/buffer.zig: { baseline: 217 }
+    src/connect.zig: { baseline: 2235 }
+    src/daemon.zig: { baseline: 925 }
+    src/foreground.zig: { baseline: 670 }
+    src/log.zig: { baseline: 445 }
+    src/main.zig: { baseline: 56 }
+    src/mux.zig: { baseline: 2838 }
+    src/native.zig: { baseline: 1465 }
+    src/protocol.zig: { baseline: 685 }
+    src/pty.zig: { baseline: 1268 }
+    src/rpc_line_reader.zig: { baseline: 365 }
+    src/server.zig: { baseline: 3650 }
+    src/socket_path.zig: { baseline: 191 }
+    src/sys.zig: { baseline: 1700 }
   module-bytes:
     "*": { target: 24kB }
-    src/buffer.zig: { baseline: 21110B }
-    src/connect.zig: { baseline: 103070B }
-    src/daemon.zig: { baseline: 56.9kB }
-    src/foreground.zig: { baseline: 39010B }
-    src/log.zig: { baseline: 23910B }
-    src/main.zig: { baseline: 6790B }
-    src/mux.zig: { baseline: 160260B }
-    src/native.zig: { baseline: 94810B }
-    src/protocol.zig: { baseline: 40870B }
-    src/pty.zig: { baseline: 83750B }
-    src/rpc_line_reader.zig: { baseline: 29880B }
-    src/server.zig: { baseline: 248.6kB }
-    src/socket_path.zig: { baseline: 13.2kB }
-    src/sys.zig: { baseline: 81.1kB }
+    src/buffer.zig: { baseline: 25760B }
+    src/connect.zig: { baseline: 112.2kB }
+    src/daemon.zig: { baseline: 61.1kB }
+    src/foreground.zig: { baseline: 40830B }
+    src/log.zig: { baseline: 27620B }
+    src/main.zig: { baseline: 7690B }
+    src/mux.zig: { baseline: 166130B }
+    src/native.zig: { baseline: 99510B }
+    src/protocol.zig: { baseline: 44440B }
+    src/pty.zig: { baseline: 87860B }
+    src/rpc_line_reader.zig: { baseline: 32840B }
+    src/server.zig: { baseline: 254510B }
+    src/socket_path.zig: { baseline: 18820B }
+    src/sys.zig: { baseline: 85070B }
   zig-dependencies: { baseline: 1 }
 
 style:
@@ -41,108 +41,88 @@ style:
     "*": { baseline: pass }
   max-fn-lines:
     "*": { target: 70 }
-    src/buffer.zig: { baseline: 32 }
-    src/connect.zig: { baseline: 183 }
-    src/daemon.zig: { baseline: 137 }
-    src/foreground.zig: { baseline: 61 }
-    src/log.zig: { baseline: 69 }
+    src/buffer.zig: { baseline: 40 }
+    src/connect.zig: { baseline: 68 }
+    src/daemon.zig: { baseline: 55 }
+    src/foreground.zig: { baseline: 67 }
+    src/log.zig: { baseline: 59 }
     src/main.zig: { baseline: 1 }
-    src/mux.zig: { baseline: 71 }
-    src/native.zig: { baseline: 81 }
-    src/protocol.zig: { baseline: 46 }
-    src/pty.zig: { baseline: 79 }
-    src/rpc_line_reader.zig: { baseline: 47 }
-    src/server.zig: { baseline: 85 }
-    src/socket_path.zig: { baseline: 19 }
-    src/sys.zig: { baseline: 58 }
+    src/mux.zig: { baseline: 67 }
+    src/native.zig: { baseline: 70 }
+    src/protocol.zig: { baseline: 55 }
+    src/pty.zig: { baseline: 69 }
+    src/rpc_line_reader.zig: { baseline: 49 }
+    src/server.zig: { baseline: 70 }
+    src/socket_path.zig: { baseline: 20 }
+    src/sys.zig: { baseline: 63 }
   line-length:
-    "*": { baseline: fail }
-    src/foreground.zig: { baseline: pass }
-    src/log.zig: { baseline: pass }
-    src/main.zig: { baseline: pass }
+    "*": { baseline: pass }
   assert-density:
     "*": { target: 15 }
-    src/buffer.zig: { baseline: 5 }
-    src/connect.zig: { baseline: 0 }
-    src/daemon.zig: { baseline: 3 }
-    src/foreground.zig: { baseline: 2 }
-    src/log.zig: { baseline: 5 }
-    src/main.zig: { baseline: 0 }
-    src/mux.zig: { baseline: 0 }
-    src/native.zig: { baseline: 1 }
-    src/protocol.zig: { baseline: 0 }
-    src/pty.zig: { baseline: 0 }
-    src/rpc_line_reader.zig: { baseline: 0 }
-    src/server.zig: { baseline: 1 }
-    src/socket_path.zig: { baseline: 0 }
-    src/sys.zig: { baseline: 0 }
+    src/buffer.zig: { baseline: 32 }
+    src/connect.zig: { baseline: 18 }
+    src/daemon.zig: { baseline: 21 }
+    src/foreground.zig: { baseline: 24 }
+    src/log.zig: { baseline: 22 }
+    src/main.zig: { baseline: 18 }
+    src/mux.zig: { baseline: 20 }
+    src/native.zig: { baseline: 18 }
+    src/protocol.zig: { baseline: 22 }
+    src/pty.zig: { baseline: 17 }
+    src/rpc_line_reader.zig: { baseline: 22 }
+    src/server.zig: { baseline: 18 }
+    src/socket_path.zig: { baseline: 21 }
+    src/sys.zig: { baseline: 16 }
 
 correctness:
   no-panic:
-    "*": { baseline: fail }
-    src/buffer.zig: { baseline: pass }
-    src/main.zig: { baseline: pass }
-    src/native.zig: { baseline: pass }
-    src/pty.zig: { baseline: pass }
-    src/rpc_line_reader.zig: { baseline: pass }
-    src/socket_path.zig: { baseline: pass }
+    "*": { baseline: pass }
   no-todo:
     "*": { baseline: pass }
   no-debug-print:
     "*": { baseline: pass }
-    src/native.zig: { baseline: fail }
-    src/pty.zig: { baseline: fail }
-    src/server.zig: { baseline: fail }
   no-empty-catch:
-    "*": { baseline: fail }
-    src/buffer.zig: { baseline: pass }
-    src/foreground.zig: { baseline: pass }
-    src/main.zig: { baseline: pass }
-    src/protocol.zig: { baseline: pass }
-    src/socket_path.zig: { baseline: pass }
+    "*": { baseline: pass }
 
 testing:
   unit-tests:
     "*": { target: 20 }
-    src/buffer.zig: { baseline: 16 }
+    src/buffer.zig: { baseline: 22 }
     src/connect.zig: { baseline: 23 }
     src/daemon.zig: { baseline: 25 }
     src/foreground.zig: { baseline: 30 }
-    src/log.zig: { baseline: 17 }
+    src/log.zig: { baseline: 23 }
     src/main.zig: { baseline: 4 }
     src/mux.zig: { baseline: 55 }
     src/native.zig: { baseline: 36 }
     src/protocol.zig: { baseline: 23 }
     src/pty.zig: { baseline: 40 }
-    src/rpc_line_reader.zig: { baseline: 19 }
+    src/rpc_line_reader.zig: { baseline: 23 }
     src/server.zig: { baseline: 71 }
-    src/socket_path.zig: { baseline: 8 }
+    src/socket_path.zig: { baseline: 22 }
     src/sys.zig: { baseline: 31 }
   fuzz-coverage:
     "*": { baseline: pass }
-    src/pty.zig: { baseline: fail }
-    src/socket_path.zig: { baseline: fail }
   bench-coverage:
     "*": { baseline: pass }
-    src/socket_path.zig: { baseline: fail }
 
 documentation:
   pub-doc-coverage:
     "*": { target: 90 }
-    src/buffer.zig: { baseline: 0 }
-    src/connect.zig: { baseline: 9 }
-    src/daemon.zig: { baseline: 29 }
-    src/foreground.zig: { baseline: 50 }
-    src/log.zig: { baseline: 41 }
-    src/main.zig: { baseline: 13 }
-    src/mux.zig: { baseline: 26 }
-    src/native.zig: { baseline: 50 }
-    src/protocol.zig: { baseline: 24 }
-    src/pty.zig: { baseline: 56 }
+    src/buffer.zig: { baseline: 100 }
+    src/connect.zig: { baseline: 100 }
+    src/daemon.zig: { baseline: 100 }
+    src/foreground.zig: { baseline: 100 }
+    src/log.zig: { baseline: 100 }
+    src/main.zig: { baseline: 100 }
+    src/mux.zig: { baseline: 100 }
+    src/native.zig: { baseline: 100 }
+    src/protocol.zig: { baseline: 100 }
+    src/pty.zig: { baseline: 100 }
     src/rpc_line_reader.zig: { baseline: 100 }
-    src/server.zig: { baseline: 83 }
-    src/socket_path.zig: { baseline: 75 }
-    src/sys.zig: { baseline: 47 }
+    src/server.zig: { baseline: 100 }
+    src/socket_path.zig: { baseline: 100 }
+    src/sys.zig: { baseline: 100 }
   markdown-links:
     "*": { baseline: pass }
   repo-docs:

@@ -119,6 +119,7 @@ const testRpcLineReader = unitTest("test-rpc-line-reader", "rpc-line-reader", rp
 const testLog = unitTest("test-log", "log", logSrcs)
 const testForeground = unitTest("test-foreground", "foreground", foregroundSrcs)
 const testSys = unitTest("test-sys", "sys", sysSrcs)
+const testSocketPath = unitTest("test-socket-path", "socket-path", socketPathSrcs)
 const testPty = unitTest("test-pty", "pty", ptySrcs)
 const testNative = unitTest("test-native", "native", nativeSrcs)
 const testMux = unitTest("test-mux", "mux", muxSrcs)
@@ -175,6 +176,7 @@ const benchRpcLineReader = benchTarget("rpc-line-reader", "rpc_line_reader", [..
 const benchLog = benchTarget("log", "log", logSrcs)
 const benchForeground = benchTarget("foreground", "foreground", foregroundSrcs)
 const benchSys = benchTarget("sys", "sys", sysSrcs)
+const benchSocketPath = benchTarget("socket-path", "socket_path", socketPathSrcs)
 const benchPty = benchTarget("pty", "pty", ptySrcs)
 const benchNative = benchTarget("native", "native", [...nativeSrcs, "src/main.zig"])
 const benchMux = benchTarget("mux", "mux", muxSrcs)
@@ -189,6 +191,7 @@ const allBenchTargets = [
   benchLog,
   benchForeground,
   benchSys,
+  benchSocketPath,
   benchPty,
   benchNative,
   benchMux,
@@ -289,6 +292,7 @@ export const Package = S.Package({
     testLog,
     testForeground,
     testSys,
+    testSocketPath,
     testPty,
     testNative,
     testMux,
@@ -306,6 +310,7 @@ export const Package = S.Package({
     benchLog,
     benchForeground,
     benchSys,
+    benchSocketPath,
     benchPty,
     benchNative,
     benchMux,

@@ -11,8 +11,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const Allocator = std.mem.Allocator;
+const assert = std.debug.assert;
 const posix = std.posix;
 const sys = @import("sys.zig");
+const log = @import("log.zig");
 
 const is_linux = builtin.os.tag == .linux;
 const is_darwin = builtin.os.tag.isDarwin();
@@ -42,6 +44,8 @@ pub const EnvMode = enum {
     replace,
 };
 
+/// What `Pty.spawn` runs and how: shell, optional `-c` command, working
+/// directory, environment, and initial window size.
 pub const SpawnOptions = struct {
     shell: ?[]const u8 = null,
     command: ?[]const u8 = null,
@@ -54,6 +58,7 @@ pub const SpawnOptions = struct {
     env_mode: EnvMode = .merge,
 };
 
+/// Callback invoked once, outside the lock, when the child is reaped.
 pub const ExitObserver = struct {
     context: *anyopaque,
     callback: *const fn (context: *anyopaque, pid: posix.pid_t, status: ?u32) void,
@@ -69,6 +74,7 @@ pub const ChildSetupStage = enum(u8) {
     unknown = 255,
 };
 
+/// Why a forked child failed before `exec`; see `last_child_setup_failure`.
 pub const ChildSetupFailure = struct {
     stage: ChildSetupStage,
     errno: posix.E,
@@ -105,6 +111,8 @@ pub const ReapState = union(enum) {
     exited: ?u32,
 };
 
+/// A child process running on the slave end of a pseudo-terminal, owned
+/// through the non-blocking master descriptor.
 pub const Pty = struct {
     /// Used only for `wait_mutex`; PTY reads and writes are non-blocking
     /// syscalls on `master_fd` driven by `poll(2)`, so callers can run them
@@ -142,7 +150,16 @@ pub const Pty = struct {
 
     /// Fork the child onto an already-open PTY pair. Takes ownership of both
     /// descriptors on success and on failure.
-    fn spawnOnFds(allocator: Allocator, io: std.Io, opts: SpawnOptions, master_fd: posix.fd_t, slave_fd: posix.fd_t) !Pty {
+    fn spawnOnFds(
+        allocator: Allocator,
+        io: std.Io,
+        opts: SpawnOptions,
+        master_fd: posix.fd_t,
+        slave_fd: posix.fd_t,
+    ) !Pty {
+        assert(master_fd >= 0);
+        assert(slave_fd >= 0);
+        assert(master_fd != slave_fd);
         var slave_open = true;
         defer if (slave_open) sys.close(slave_fd);
         errdefer sys.close(master_fd);
@@ -162,14 +179,14 @@ pub const Pty = struct {
         var env = try buildEnv(allocator, sys.currentEnviron(), opts.env, opts.env_mode);
         defer env.deinit(allocator);
 
-        const path_env: []const u8 = if (std.c.getenv("PATH")) |value| std.mem.sliceTo(value, 0) else sys.default_exec_path;
-        var candidates = try resolveExecCandidates(allocator, shell_path, path_env);
+        var candidates = try resolveExecCandidates(allocator, shell_path, execPathEnv());
         defer candidates.deinit(allocator);
 
         const argv_shell = [_:null]?[*:0]const u8{ shell_z.ptr, "-l" };
         // The 4th slot is only read when `command_z` is non-null, but the
         // initializer is always evaluated.
-        const argv_command = [_:null]?[*:0]const u8{ shell_z.ptr, "-l", "-c", if (command_z) |command| command.ptr else "" };
+        const command_ptr: [*:0]const u8 = if (command_z) |command| command.ptr else "";
+        const argv_command = [_:null]?[*:0]const u8{ shell_z.ptr, "-l", "-c", command_ptr };
         const argv: [*:null]const ?[*:0]const u8 = if (command_z != null) &argv_command else &argv_shell;
 
         const err_pipe = try sys.pipeCloexec();
@@ -178,6 +195,8 @@ pub const Pty = struct {
         var err_write_open = true;
         defer if (err_write_open) sys.close(err_pipe[1]);
 
+        assert(err_pipe[0] >= 0);
+        assert(err_pipe[1] >= 0);
         const pid = sys.fork() catch return error.ForkFailed;
         if (pid == 0) {
             childExec(slave_fd, err_pipe[1], if (cwd_z) |cwd| cwd.ptr else null, candidates.list(), argv, env.list());
@@ -188,29 +207,8 @@ pub const Pty = struct {
         sys.close(err_pipe[1]);
         err_write_open = false;
 
-        // EOF means `exec` succeeded (the pipe is close-on-exec); a report
-        // means setup failed and the child has already called `_exit`. The
-        // wait is bounded: callers hold locks across `spawn`.
-        switch (readChildReport(err_pipe[0], sys.monotonicMs() + child_setup_timeout_ms)) {
-            .exec_ok => {},
-            .failed => |report| {
-                reapBlocking(pid);
-                last_child_setup_failure = .{ .stage = report.stage, .errno = report.errno, .pid = pid };
-                return error.ChildSetupFailed;
-            },
-            .timed_out => {
-                killAndReap(pid);
-                last_child_setup_failure = .{ .stage = .unknown, .errno = .TIMEDOUT, .pid = pid };
-                return error.ChildSetupFailed;
-            },
-            // Neither a confirmed exec nor a report: the child's state is
-            // unknown, so it is not allowed to run on.
-            .io_error => |errno_value| {
-                killAndReap(pid);
-                last_child_setup_failure = .{ .stage = .unknown, .errno = errno_value, .pid = pid };
-                return error.ChildSetupFailed;
-            },
-        }
+        assert(pid > 0);
+        try awaitChildExec(pid, err_pipe[0]);
         sys.close(err_pipe[0]);
         err_read_open = false;
 
@@ -222,6 +220,34 @@ pub const Pty = struct {
         };
     }
 
+    /// Wait for the forked child's startup receipt on `err_read_fd`.
+    /// EOF means `exec` succeeded (the pipe is close-on-exec); a report
+    /// means setup failed and the child has already called `_exit`. The
+    /// wait is bounded: callers hold locks across `spawn`. On failure the
+    /// child is reaped and `last_child_setup_failure` is set.
+    fn awaitChildExec(pid: posix.pid_t, err_read_fd: posix.fd_t) error{ChildSetupFailed}!void {
+        assert(pid > 0);
+        assert(err_read_fd >= 0);
+        switch (readChildReport(err_read_fd, sys.monotonicMs() + child_setup_timeout_ms)) {
+            .exec_ok => return,
+            .failed => |report| {
+                reapBlocking(pid);
+                last_child_setup_failure = .{ .stage = report.stage, .errno = report.errno, .pid = pid };
+            },
+            .timed_out => {
+                killAndReap(pid);
+                last_child_setup_failure = .{ .stage = .unknown, .errno = .TIMEDOUT, .pid = pid };
+            },
+            // Neither a confirmed exec nor a report: the child's state is
+            // unknown, so it is not allowed to run on.
+            .io_error => |errno_value| {
+                killAndReap(pid);
+                last_child_setup_failure = .{ .stage = .unknown, .errno = errno_value, .pid = pid };
+            },
+        }
+        return error.ChildSetupFailed;
+    }
+
     /// Close the master (hanging up the terminal) and the pidfd. Idempotent.
     pub fn close(self: *Pty) void {
         self.wait_mutex.lockUncancelable(self.io);
@@ -230,6 +256,7 @@ pub const Pty = struct {
         self.master_fd = -1;
         if (self.pid_fd >= 0) sys.close(self.pid_fd);
         self.pid_fd = -1;
+        assert(self.master_fd == -1);
     }
 
     pub fn setExitObserver(self: *Pty, observer: ExitObserver) void {
@@ -317,6 +344,7 @@ pub const Pty = struct {
     }
 
     fn signalShellGroupLocked(self: *Pty, sig: posix.SIG) void {
+        assert(self.child_pid > 0);
         // The child calls `setsid`, so its PID is also its group id.
         if (sys.kill(-self.child_pid, sig)) return;
         // The instant before `setsid` has run there is no such group yet.
@@ -333,6 +361,7 @@ pub const Pty = struct {
     /// foreground group while the shell runs (also remembered), otherwise
     /// the remembered group if it still belongs to this session.
     fn foregroundTargetLocked(self: *Pty) ?posix.pid_t {
+        assert(self.child_pid > 0);
         if (!self.reaped and self.master_fd >= 0) {
             const fg = tcgetpgrp(self.master_fd);
             if (fg == self.child_pid) {
@@ -363,6 +392,7 @@ pub const Pty = struct {
             self.foreground_pgid = 0;
             return null;
         }
+        assert(pgid > 1);
         return pgid;
     }
 
@@ -414,6 +444,7 @@ pub const Pty = struct {
             if (sys.write(fd, bytes[offset..])) |n| {
                 if (n == 0) return error.WriteZero;
                 offset += n;
+                assert(offset <= bytes.len);
             } else |err| switch (err) {
                 // poll said writable but the write still would block: back
                 // off instead of spinning until the deadline.
@@ -479,6 +510,7 @@ pub const Pty = struct {
         switch (waitPidNoHang(self.child_pid)) {
             .running => return null,
             .exited => |status| {
+                assert(!self.reaped);
                 self.reaped = true;
                 self.exit_status = status;
                 const observer = self.exit_observer orelse return null;
@@ -553,15 +585,18 @@ const CStringList = struct {
 
     fn finish(self: *CStringList, allocator: Allocator) !void {
         try self.ptrs.append(allocator, null);
+        assert(self.ptrs.items[self.ptrs.items.len - 1] == null);
     }
 
     /// Valid after `finish`.
     fn list(self: *const CStringList) [*:null]const ?[*:0]const u8 {
+        assert(self.ptrs.items.len > 0);
         return @ptrCast(self.ptrs.items.ptr);
     }
 
     /// Entries without the terminator.
     fn entries(self: *const CStringList) []const ?[*:0]const u8 {
+        assert(self.ptrs.items.len > 0);
         return self.ptrs.items[0 .. self.ptrs.items.len - 1];
     }
 };
@@ -612,6 +647,7 @@ fn buildEnv(
     }
     if (!has_term) try env.appendBorrowed(allocator, default_term_entry.ptr);
     try env.finish(allocator);
+    assert(env.owned.items.len <= supplied.len);
     return env;
 }
 
@@ -631,6 +667,7 @@ fn resolveExecCandidates(allocator: Allocator, file: []const u8, path_env: []con
             const dir = if (component.len == 0) "." else component;
             if (dir.len + 1 + file.len >= posix.PATH_MAX) continue;
             const candidate = try allocator.allocSentinel(u8, dir.len + 1 + file.len, 0);
+            assert(candidate.len < posix.PATH_MAX);
             @memcpy(candidate[0..dir.len], dir);
             candidate[dir.len] = '/';
             @memcpy(candidate[dir.len + 1 ..], file);
@@ -678,6 +715,8 @@ fn openPty(wsz: posix.winsize) !OpenPtyResult {
     errdefer sys.close(master_fd);
     errdefer sys.close(slave_fd);
 
+    assert(master_fd >= 0);
+    assert(slave_fd >= 0);
     try sys.setNonBlocking(master_fd);
     return .{
         .master_fd = master_fd,
@@ -788,14 +827,21 @@ fn readChildReport(fd: posix.fd_t, deadline_ms: i64) ChildReport {
         }
         if (rc == 0) break;
         got += @intCast(rc);
+        assert(got <= report.len);
     }
     if (got == 0) return .exec_ok;
     if (got < report.len) return .{ .failed = .{ .stage = .unknown, .errno = .SUCCESS } };
     const raw_errno = std.mem.readInt(i32, report[1..5], .little);
     return .{ .failed = .{
         .stage = std.enums.fromInt(ChildSetupStage, report[0]) orelse .unknown,
-        .errno = if (raw_errno >= 0 and raw_errno <= std.math.maxInt(u16)) @fromBackingInt(@intCast(@as(u16, @intCast(raw_errno)))) else .SUCCESS,
+        .errno = errnoFromReport(raw_errno),
     } };
+}
+
+/// The errno a child reported, or `.SUCCESS` when it is out of range.
+fn errnoFromReport(raw_errno: i32) posix.E {
+    if (raw_errno < 0 or raw_errno > std.math.maxInt(u16)) return .SUCCESS;
+    return @fromBackingInt(@intCast(@as(u16, @intCast(raw_errno))));
 }
 
 /// Async-signal-safe. Report `stage` and the current `errno` to the parent,
@@ -893,6 +939,12 @@ fn childExec(
     childFail(err_fd, .exec, last_errno);
 }
 
+/// The `PATH` the shell is searched in: the daemon's, or the libc default.
+fn execPathEnv() []const u8 {
+    const value = std.c.getenv("PATH") orelse return sys.default_exec_path;
+    return std.mem.sliceTo(value, 0);
+}
+
 fn defaultShell() []const u8 {
     // The child inherits the libc environment block (see `buildEnv`), so
     // read SHELL from the same place.
@@ -913,6 +965,60 @@ fn defaultShellFor(env_shell: ?[]const u8) []const u8 {
 const tiocswinsz: c_ulong = if (is_darwin) 0x80087467 else posix.T.IOCSWINSZ;
 const tiocgwinsz: c_ulong = if (is_darwin) 0x40087468 else posix.T.IOCGWINSZ;
 const tiocsctty: c_ulong = if (is_darwin) 0x20007461 else posix.T.IOCSCTTY;
+
+/// Internal pure helpers exposed for the repository's own fuzz suites. None
+/// of them fork, open descriptors, or read the process environment.
+pub const fuzz_hooks = struct {
+    pub const validateSpawnOptionsFn = validateSpawnOptions;
+    pub const envKeyFn = envKey;
+    pub const defaultShellForFn = defaultShellFor;
+    pub const procStatStateFn = procStatState;
+    pub const procStatusMaskFn = procStatusMask;
+    pub const errnoFromReportFn = errnoFromReport;
+    pub const default_term_entry_z = default_term_entry;
+
+    /// A built `envp` or candidate list. Release with `deinit`.
+    pub const StringList = struct {
+        inner: CStringList,
+
+        /// Free the owned entries and the pointer array.
+        pub fn deinit(self: *StringList, allocator: Allocator) void {
+            self.inner.deinit(allocator);
+        }
+
+        /// Number of entries, not counting the NULL terminator.
+        pub fn len(self: *const StringList) usize {
+            return self.inner.entries().len;
+        }
+
+        /// Entry `index` as a slice (without its NUL).
+        pub fn at(self: *const StringList, index: usize) []const u8 {
+            return std.mem.sliceTo(self.inner.entries()[index].?, 0);
+        }
+
+        /// True when the pointer array ends in exactly one NULL.
+        pub fn isTerminated(self: *const StringList) bool {
+            const items = self.inner.ptrs.items;
+            for (items[0 .. items.len - 1]) |item| if (item == null) return false;
+            return items[items.len - 1] == null;
+        }
+    };
+
+    /// `buildEnv` over an explicit `base` environment block.
+    pub fn buildEnvList(
+        allocator: Allocator,
+        base: [*:null]const ?[*:0]const u8,
+        supplied: ?[]const []const u8,
+        mode: EnvMode,
+    ) !StringList {
+        return .{ .inner = try buildEnv(allocator, base, supplied, mode) };
+    }
+
+    /// `resolveExecCandidates` for `file` over an explicit `PATH` value.
+    pub fn execCandidates(allocator: Allocator, file: []const u8, path_env: []const u8) !StringList {
+        return .{ .inner = try resolveExecCandidates(allocator, file, path_env) };
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -961,14 +1067,14 @@ fn runAndCollect(allocator: Allocator, opts: SpawnOptions) ![]u8 {
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
     if (std.mem.indexOf(u8, haystack, needle) == null) {
-        std.debug.print("expected output to contain \"{s}\"; got:\n{s}\n", .{ needle, haystack });
+        log.err("pty_test_output_missing", .{ .needle = needle, .output = haystack });
         return error.TestExpectedContains;
     }
 }
 
 fn expectNotContains(haystack: []const u8, needle: []const u8) !void {
     if (std.mem.indexOf(u8, haystack, needle) != null) {
-        std.debug.print("expected output not to contain \"{s}\"; got:\n{s}\n", .{ needle, haystack });
+        log.err("pty_test_output_unexpected", .{ .needle = needle, .output = haystack });
         return error.TestExpectedNotContains;
     }
 }
@@ -1410,7 +1516,8 @@ test "a missing shell reports ChildSetupFailed at the exec stage" {
         const failure = last_child_setup_failure.?;
         try std.testing.expectEqual(ChildSetupStage.exec, failure.stage);
         try std.testing.expectEqual(posix.E.NOENT, failure.errno);
-        try std.testing.expectEqual(posix.E.CHILD, posix.errno(std.c.waitpid(failure.pid, null, @intCast(posix.W.NOHANG))));
+        const wait_rc = std.c.waitpid(failure.pid, null, @intCast(posix.W.NOHANG));
+        try std.testing.expectEqual(posix.E.CHILD, posix.errno(wait_rc));
     }
 
     // A file that exists but is not executable surfaces EACCES, not ENOENT.
@@ -1484,7 +1591,7 @@ const ConcurrentSpawn = struct {
                 if (!std.mem.startsWith(u8, line, "fd:")) continue;
                 const number = std.fmt.parseInt(u32, std.mem.trim(u8, line[3..], ":"), 10) catch continue;
                 if (number > 3 and number != 10 and number != 255) {
-                    std.debug.print("foreign descriptor {d} in child:\n{s}\n", .{ number, output });
+                    log.err("pty_test_foreign_descriptor", .{ .fd = number, .output = output });
                     return error.ForeignDescriptor;
                 }
             }
@@ -1602,7 +1709,10 @@ test "terminate, kill and hangupForeground never signal a reaped child" {
     try std.testing.expectEqual(kills_before, sys.kill_call_count.load(.seq_cst));
 
     // A live child, by contrast, is signalled and dies.
-    var live = try Pty.spawn(std.testing.allocator, std.testing.io, .{ .shell = "/bin/sh", .command = "exec sleep 100" });
+    var live = try Pty.spawn(std.testing.allocator, std.testing.io, .{
+        .shell = "/bin/sh",
+        .command = "exec sleep 100",
+    });
     defer live.close();
     const live_before = sys.kill_call_count.load(.seq_cst);
     live.kill();
@@ -1817,7 +1927,10 @@ test "a remembered foreground group outside the session is never signalled" {
 test "reap reports a tagged state with the cached wait status" {
     if (!supported_os) return error.SkipZigTest;
 
-    var child = try Pty.spawn(std.testing.allocator, std.testing.io, .{ .shell = "/bin/sh", .command = "sleep 0.2; exit 7" });
+    var child = try Pty.spawn(std.testing.allocator, std.testing.io, .{
+        .shell = "/bin/sh",
+        .command = "sleep 0.2; exit 7",
+    });
     defer child.close();
     try std.testing.expect(child.reap() == .running);
     try std.testing.expect(child.waitBlocking(5000));
@@ -1831,7 +1944,10 @@ test "reap reports a tagged state with the cached wait status" {
 test "write checks the deadline before every attempt, even when writable" {
     if (!supported_os) return error.SkipZigTest;
 
-    var child = try Pty.spawn(std.testing.allocator, std.testing.io, .{ .shell = "/bin/sh", .command = "exec sleep 100" });
+    var child = try Pty.spawn(std.testing.allocator, std.testing.io, .{
+        .shell = "/bin/sh",
+        .command = "exec sleep 100",
+    });
     defer cleanupPtyForTest(&child);
     // The terminal is writable, but the deadline has passed.
     try std.testing.expectError(error.InputTimeout, child.write("x\n", sys.monotonicMs() - 1, -1));
@@ -1881,7 +1997,7 @@ const StopWriter = struct {
 
     fn run(self: *StopWriter) void {
         sys.sleepMs(self.delay_ms);
-        _ = sys.write(self.fd, "x") catch {};
+        _ = sys.write(self.fd, "x") catch |err| log.warn("pty_test_stop_write_failed", .{ .err = err });
     }
 };
 
@@ -1912,7 +2028,10 @@ test "write delivers input to a reading child and fails after close" {
     if (!supported_os) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
-    var child = try Pty.spawn(allocator, std.testing.io, .{ .shell = "/bin/sh", .command = "read line; echo echoed=[$line]" });
+    var child = try Pty.spawn(allocator, std.testing.io, .{
+        .shell = "/bin/sh",
+        .command = "read line; echo echoed=[$line]",
+    });
     defer cleanupPtyForTest(&child);
     try child.write("", sys.monotonicMs() + 1000, -1);
     try child.write("hello\n", sys.monotonicMs() + 2000, -1);

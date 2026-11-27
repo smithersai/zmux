@@ -13,17 +13,24 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const log = @import("log.zig");
 
+const assert = std.debug.assert;
 const c = std.c;
 const posix = std.posix;
 
+/// Platform file descriptor type.
 pub const fd_t = posix.fd_t;
+/// Platform process id type.
 pub const pid_t = posix.pid_t;
+/// Platform user id type.
 pub const uid_t = c.uid_t;
+/// Platform file mode type.
 pub const mode_t = c.mode_t;
 
 const is_darwin = builtin.os.tag.isDarwin();
 
+/// An errno this layer does not map to a named error.
 pub const UnexpectedError = error{Unexpected};
 
 /// Async-signal-safe: unlike `std.posix.unexpectedErrno` this never prints or
@@ -59,11 +66,13 @@ pub const ForkLock = struct {
     }
 
     pub fn unlockShared(self: *ForkLock) void {
-        _ = self.state.fetchSub(1, .seq_cst);
+        const previous = self.state.fetchSub(1, .seq_cst);
+        assert(previous > 0);
     }
 
     /// Returns false when shared holders did not drain within `budget_ms`.
     pub fn lockExclusiveBounded(self: *ForkLock, budget_ms: i64) bool {
+        assert(budget_ms >= 0);
         const deadline = monotonicMs() + budget_ms;
         while (true) {
             if (self.state.cmpxchgStrong(0, -1, .seq_cst, .seq_cst) == null) return true;
@@ -73,6 +82,7 @@ pub const ForkLock = struct {
     }
 
     pub fn unlockExclusive(self: *ForkLock) void {
+        assert(self.state.load(.seq_cst) == -1);
         self.state.store(0, .seq_cst);
     }
 };
@@ -94,6 +104,7 @@ pub fn close(fd: fd_t) void {
     _ = c.close(fd);
 }
 
+/// Errors from `write` and `send`.
 pub const WriteError = error{
     WouldBlock,
     BrokenPipe,
@@ -103,6 +114,8 @@ pub const WriteError = error{
     AccessDenied,
 } || UnexpectedError;
 
+/// `write(2)`, retrying `EINTR`. Returns the bytes written, which may be
+/// fewer than `bytes.len`. Writes nothing and returns 0 for an empty slice.
 pub fn write(fd: fd_t, bytes: []const u8) WriteError!usize {
     if (bytes.len == 0) return 0;
     const max_count: usize = if (is_darwin) std.math.maxInt(i32) else 0x7ffff000;
@@ -180,10 +193,14 @@ pub fn dup2(old_fd: fd_t, new_fd: fd_t) UnexpectedError!void {
     }
 }
 
+/// `read(2)` with the `std.posix` error vocabulary.
 pub const read = posix.read;
+/// Errors from `read`.
 pub const ReadError = posix.ReadError;
+/// `poll(2)` with the `std.posix` error vocabulary.
 pub const poll = posix.poll;
 
+/// Errors from `pipe` and `pipeCloexec`.
 pub const PipeError = error{ ProcessFdQuotaExceeded, SystemFdQuotaExceeded } || UnexpectedError;
 
 /// Create a pipe. Both ends are blocking and inherited across exec, like the
@@ -198,6 +215,7 @@ pub fn pipe() PipeError![2]fd_t {
     }
 }
 
+/// Errors from `setCloseOnExec`.
 pub const SetCloexecError = UnexpectedError;
 
 /// Create a pipe whose ends are both close-on-exec, with no window in which a
@@ -224,6 +242,7 @@ pub fn pipeCloexec() PipeError![2]fd_t {
     return fds;
 }
 
+/// Set `FD_CLOEXEC` on `fd`.
 pub fn setCloseOnExec(fd: fd_t) SetCloexecError!void {
     const flags = c.fcntl(fd, c.F.GETFD);
     if (flags < 0) return unexpected(posix.errno(flags));
@@ -237,6 +256,7 @@ pub fn clearCloseOnExec(fd: fd_t) UnexpectedError!void {
     if (c.fcntl(fd, c.F.SETFD, flags & ~@as(c_int, c.FD_CLOEXEC)) < 0) return unexpected(posix.errno(@as(c_int, -1)));
 }
 
+/// Set `O_NONBLOCK` on `fd`.
 pub fn setNonBlocking(fd: fd_t) UnexpectedError!void {
     const flags = c.fcntl(fd, c.F.GETFL);
     if (flags < 0) return unexpected(posix.errno(flags));
@@ -244,6 +264,7 @@ pub fn setNonBlocking(fd: fd_t) UnexpectedError!void {
     if (c.fcntl(fd, c.F.SETFL, flags | nonblock) < 0) return unexpected(posix.errno(@as(c_int, -1)));
 }
 
+/// Clear `O_NONBLOCK` on `fd`.
 pub fn clearNonBlocking(fd: fd_t) UnexpectedError!void {
     const flags = c.fcntl(fd, c.F.GETFL);
     if (flags < 0) return unexpected(posix.errno(flags));
@@ -251,26 +272,31 @@ pub fn clearNonBlocking(fd: fd_t) UnexpectedError!void {
     if (c.fcntl(fd, c.F.SETFL, flags & ~nonblock) < 0) return unexpected(posix.errno(@as(c_int, -1)));
 }
 
+/// True when `fd` has `O_NONBLOCK`; false also when `fcntl` fails.
 pub fn isNonBlocking(fd: fd_t) bool {
     const flags = c.fcntl(fd, c.F.GETFL);
     const nonblock: c_int = @bitCast(c.O{ .NONBLOCK = true });
     return flags >= 0 and (flags & nonblock) != 0;
 }
 
+/// True when `fd` has `FD_CLOEXEC`.
 pub fn isCloseOnExec(fd: fd_t) UnexpectedError!bool {
     const flags = c.fcntl(fd, c.F.GETFD);
     if (flags < 0) return unexpected(posix.errno(flags));
     return (flags & c.FD_CLOEXEC) != 0;
 }
 
+/// True when `fd` refers to a terminal.
 pub fn isatty(fd: fd_t) bool {
     return c.isatty(fd) == 1;
 }
 
+/// Effective user id of the calling process.
 pub fn geteuid() uid_t {
     return c.geteuid();
 }
 
+/// Process id of the calling process.
 pub fn getpid() pid_t {
     return c.getpid();
 }
@@ -307,6 +333,7 @@ pub fn ioctl(fd: fd_t, request: c_ulong, arg: usize) c_int {
 /// Byte capacity of `sockaddr_un.sun_path`, excluding the NUL terminator.
 pub const max_unix_path_len: usize = @field(@as(c.sockaddr.un, undefined), "path").len - 1;
 
+/// A `sockaddr_un` for a filesystem `AF_UNIX` socket path.
 pub const UnixAddress = struct {
     sockaddr: c.sockaddr.un,
     len: c.socklen_t,
@@ -316,6 +343,8 @@ pub const UnixAddress = struct {
         var addr: c.sockaddr.un = .{ .family = c.AF.UNIX, .path = undefined };
         @memset(&addr.path, 0);
         @memcpy(addr.path[0..path.len], path);
+        assert(path.len < addr.path.len);
+        assert(addr.path[path.len] == 0);
         return .{ .sockaddr = addr, .len = @intCast(@sizeOf(c.sockaddr.un)) };
     }
 
@@ -324,6 +353,7 @@ pub const UnixAddress = struct {
     }
 };
 
+/// Errors from creating a socket or socket pair.
 pub const SocketError = error{
     ProcessFdQuotaExceeded,
     SystemFdQuotaExceeded,
@@ -349,6 +379,7 @@ pub fn unixStreamSocket() SocketError!fd_t {
         else => |err| return unexpected(err),
     }
     const fd: fd_t = @intCast(rc);
+    assert(fd >= 0);
     if (is_darwin) {
         setCloseOnExec(fd) catch |err| {
             close(fd);
@@ -377,6 +408,7 @@ pub fn tuneUnixSocketBuffers(fd: fd_t) void {
     _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.RCVBUF, &size, @sizeOf(c_int));
 }
 
+/// Errors from `bind`.
 pub const BindError = error{
     AccessDenied,
     AddressInUse,
@@ -389,6 +421,7 @@ pub const BindError = error{
     SystemResources,
 } || UnexpectedError;
 
+/// `bind(2)` `fd` to the UNIX socket `address`.
 pub fn bind(fd: fd_t, address: *const UnixAddress) BindError!void {
     switch (posix.errno(c.bind(fd, address.any(), address.len))) {
         .SUCCESS => {},
@@ -405,8 +438,10 @@ pub fn bind(fd: fd_t, address: *const UnixAddress) BindError!void {
     }
 }
 
+/// Errors from `listen`.
 pub const ListenError = error{ AddressInUse, OperationNotSupported } || UnexpectedError;
 
+/// `listen(2)` on `fd` with at most `backlog` pending connections.
 pub fn listen(fd: fd_t, backlog: u31) ListenError!void {
     switch (posix.errno(c.listen(fd, backlog))) {
         .SUCCESS => {},
@@ -416,6 +451,7 @@ pub fn listen(fd: fd_t, backlog: u31) ListenError!void {
     }
 }
 
+/// Errors from `accept`.
 pub const AcceptError = error{
     WouldBlock,
     ConnectionAborted,
@@ -450,6 +486,7 @@ pub fn accept(fd: fd_t) AcceptError!fd_t {
         switch (accept_errno) {
             .SUCCESS => {
                 const client: fd_t = @intCast(rc);
+                assert(client >= 0);
                 if (!cloexec_ok) {
                     close(client);
                     return error.Unexpected;
@@ -471,6 +508,7 @@ pub fn accept(fd: fd_t) AcceptError!fd_t {
     }
 }
 
+/// Errors from `connect` and the `connectUnix*` helpers.
 pub const ConnectError = error{
     AccessDenied,
     AddressInUse,
@@ -498,6 +536,7 @@ fn connectErr(err: posix.E) ConnectError {
     };
 }
 
+/// `connect(2)` `fd` to the UNIX socket `address`, retrying `EINTR`.
 pub fn connect(fd: fd_t, address: *const UnixAddress) ConnectError!void {
     while (true) {
         switch (posix.errno(c.connect(fd, address.any(), address.len))) {
@@ -518,6 +557,8 @@ pub fn connectUnix(path: []const u8) (SocketError || ConnectError || error{NameT
     return fd;
 }
 
+/// A connected pair of `AF_UNIX` stream sockets. Both ends are inherited
+/// across exec.
 pub fn socketPair() (SocketError)![2]fd_t {
     var fds: [2]fd_t = undefined;
     switch (posix.errno(c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &fds))) {
@@ -532,6 +573,7 @@ pub fn socketPair() (SocketError)![2]fd_t {
 // ---------------------------------------------------------------------------
 // Filesystem metadata that `std.Io.File.Stat` does not carry (owner, device).
 
+/// The file metadata zmux checks: device, inode, mode and owner.
 pub const Stat = struct {
     dev: u64,
     ino: u64,
@@ -560,6 +602,7 @@ pub const Stat = struct {
     }
 };
 
+/// Errors from `statAt` and `fstat`.
 pub const StatError = error{
     AccessDenied,
     FileNotFound,
@@ -570,6 +613,7 @@ pub const StatError = error{
     StatFieldsUnavailable,
 } || UnexpectedError;
 
+/// `AT_FDCWD`: resolve relative paths against the current directory.
 pub const cwd_fd: fd_t = c.AT.FDCWD;
 
 /// `fstatat(2)`. `follow_symlinks = false` maps to `AT_SYMLINK_NOFOLLOW`.
@@ -669,6 +713,8 @@ fn statAtFallback(dir_fd: fd_t, path: [*:0]const u8, flags: u32) StatError!Stat 
     // (major << 32) | minor form the statx path produces.
     const major: u64 = (st.dev >> 8) & 0xfff;
     const minor: u64 = (st.dev & 0xff) | ((st.dev >> 12) & 0xfff00);
+    assert(major <= 0xfff);
+    assert(minor <= 0xfffff);
     return .{
         .dev = (major << 32) | minor,
         .ino = st.ino,
@@ -732,6 +778,8 @@ fn toPathZ(buf: *[posix.PATH_MAX]u8, path: []const u8) error{NameTooLong}![*:0]c
     if (path.len >= buf.len) return error.NameTooLong;
     @memcpy(buf[0..path.len], path);
     buf[path.len] = 0;
+    assert(path.len < buf.len);
+    assert(buf[path.len] == 0);
     return buf[0..path.len :0].ptr;
 }
 
@@ -740,6 +788,7 @@ fn toPathZ(buf: *[posix.PATH_MAX]u8, path: []const u8) error{NameTooLong}![*:0]c
 // binding protocol needs fd-relative operations (`fchmodat`, `unlinkat`) and
 // `fchmod` on a socket, none of which `std.Io.Dir` exposes.
 
+/// Errors from `fchmod` and `fchmodat`.
 pub const ChmodError = error{
     AccessDenied,
     FileNotFound,
@@ -764,6 +813,7 @@ fn chmodErr(err: posix.E) ChmodError {
     };
 }
 
+/// `fchmod(2)`, retrying `EINTR`.
 pub fn fchmod(fd: fd_t, mode: mode_t) ChmodError!void {
     while (true) switch (posix.errno(c.fchmod(fd, mode))) {
         .SUCCESS => return,
@@ -772,6 +822,7 @@ pub fn fchmod(fd: fd_t, mode: mode_t) ChmodError!void {
     };
 }
 
+/// `fchmodat(2)` relative to `dir_fd`, following symlinks; retries `EINTR`.
 pub fn fchmodat(dir_fd: fd_t, path: []const u8, mode: mode_t) ChmodError!void {
     var path_buf: [posix.PATH_MAX]u8 = undefined;
     const path_z = try toPathZ(&path_buf, path);
@@ -782,6 +833,7 @@ pub fn fchmodat(dir_fd: fd_t, path: []const u8, mode: mode_t) ChmodError!void {
     };
 }
 
+/// Errors from `mkdir`.
 pub const MkdirError = error{
     AccessDenied,
     PathAlreadyExists,
@@ -813,6 +865,7 @@ pub fn mkdir(path: []const u8, mode: mode_t) MkdirError!void {
     }
 }
 
+/// `rmdir(2)`. `EEXIST` is reported as `DirNotEmpty`.
 pub fn rmdir(path: []const u8) (error{ NameTooLong, DirNotEmpty, FileNotFound, AccessDenied } || UnexpectedError)!void {
     var path_buf: [posix.PATH_MAX]u8 = undefined;
     const path_z = try toPathZ(&path_buf, path);
@@ -825,7 +878,11 @@ pub fn rmdir(path: []const u8) (error{ NameTooLong, DirNotEmpty, FileNotFound, A
     }
 }
 
-pub fn unlinkAt(dir_fd: fd_t, path: []const u8) (error{ NameTooLong, FileNotFound, AccessDenied } || UnexpectedError)!void {
+/// `unlinkat(2)` of a non-directory `path` relative to `dir_fd`.
+pub fn unlinkAt(
+    dir_fd: fd_t,
+    path: []const u8,
+) (error{ NameTooLong, FileNotFound, AccessDenied } || UnexpectedError)!void {
     var path_buf: [posix.PATH_MAX]u8 = undefined;
     const path_z = try toPathZ(&path_buf, path);
     switch (posix.errno(c.unlinkat(dir_fd, path_z, 0))) {
@@ -836,7 +893,11 @@ pub fn unlinkAt(dir_fd: fd_t, path: []const u8) (error{ NameTooLong, FileNotFoun
     }
 }
 
-pub fn rename(old_path: []const u8, new_path: []const u8) (error{ NameTooLong, FileNotFound, AccessDenied, NotDir, IsDir } || UnexpectedError)!void {
+/// `rename(2)`: atomically replace `new_path` with `old_path`.
+pub fn rename(
+    old_path: []const u8,
+    new_path: []const u8,
+) (error{ NameTooLong, FileNotFound, AccessDenied, NotDir, IsDir } || UnexpectedError)!void {
     var old_buf: [posix.PATH_MAX]u8 = undefined;
     var new_buf: [posix.PATH_MAX]u8 = undefined;
     const old_z = try toPathZ(&old_buf, old_path);
@@ -851,6 +912,7 @@ pub fn rename(old_path: []const u8, new_path: []const u8) (error{ NameTooLong, F
     }
 }
 
+/// Errors from `open`, `openZ` and the open helpers.
 pub const OpenError = error{
     AccessDenied,
     FileNotFound,
@@ -876,7 +938,11 @@ pub fn openZ(path: [*:0]const u8, flags: c.O, mode: mode_t) OpenError!fd_t {
     while (true) {
         const rc = c.open(path, flags, @as(c_uint, mode));
         switch (posix.errno(rc)) {
-            .SUCCESS => return @intCast(rc),
+            .SUCCESS => {
+                const fd: fd_t = @intCast(rc);
+                assert(fd >= 0);
+                return fd;
+            },
             .INTR => continue,
             .ACCES, .PERM => return error.AccessDenied,
             .NOENT => return error.FileNotFound,
@@ -905,6 +971,7 @@ pub fn openDirNoFollow(path: []const u8) OpenError!fd_t {
 // ---------------------------------------------------------------------------
 // Processes
 
+/// Errors from `fork`.
 pub const ForkError = error{ SystemResources, ProcessLimitReached } || UnexpectedError;
 
 /// `fork(2)`. On Darwin the fork lock is held exclusively across the call so
@@ -926,6 +993,7 @@ pub fn fork() ForkError!pid_t {
 /// `PATH` used for bare program names when the environment has none.
 pub const default_exec_path = "/usr/local/bin:/bin:/usr/bin";
 
+/// Errors from `execvpeZ`.
 pub const ExecError = error{
     AccessDenied,
     FileNotFound,
@@ -961,6 +1029,8 @@ pub fn execvpeZ(
             last = error.NameTooLong;
             continue;
         }
+        assert(dir.len > 0);
+        assert(dir.len + 1 + file_slice.len < path_buf.len);
         @memcpy(path_buf[0..dir.len], dir);
         path_buf[dir.len] = '/';
         @memcpy(path_buf[dir.len + 1 ..][0..file_slice.len], file_slice);
@@ -998,7 +1068,17 @@ pub fn currentEnviron() [*:null]const ?[*:0]const u8 {
 // Private directories, owned files, peer credentials, deadlines, and the
 // async-signal-safe child helpers (review round-1 contract §1.7).
 
-pub const PrivateDirError = error{ NotDirectory, ForeignOwner, InsecurePermissions, SymlinkParent, NameTooLong, AccessDenied, FileNotFound, Unexpected };
+/// Errors from `ensurePrivateDir`.
+pub const PrivateDirError = error{
+    NotDirectory,
+    ForeignOwner,
+    InsecurePermissions,
+    SymlinkParent,
+    NameTooLong,
+    AccessDenied,
+    FileNotFound,
+    Unexpected,
+};
 
 const MkdirOutcome = union(enum) { created, exists, failed: posix.E };
 
@@ -1023,6 +1103,7 @@ fn chmodCreatedDir(path_z: [*:0]const u8, path: []const u8, mode: mode_t) void {
 /// `fchmod` when openable, falling back to `chmodCreatedDir` only when
 /// `openDirNoFollow` fails with `AccessDenied`.
 fn mkdirPrivateZ(path_z: [*:0]const u8, path: []const u8, repair_mode: bool) MkdirOutcome {
+    assert(path.len > 0);
     switch (posix.errno(c.mkdir(path_z, 0o700))) {
         .SUCCESS => {
             if (repair_mode) {
@@ -1030,7 +1111,9 @@ fn mkdirPrivateZ(path_z: [*:0]const u8, path: []const u8, repair_mode: bool) Mkd
                     defer close(fd);
                     if (fstat(fd)) |st| {
                         if (st.isDir() and st.uid == geteuid() and st.permissions() != 0o700) {
-                            fchmod(fd, 0o700) catch {};
+                            fchmod(fd, 0o700) catch |err| {
+                                log.debug("private_dir_fchmod_failed", .{ .err = err });
+                            };
                         }
                     } else |_| {}
                 } else |err| switch (err) {
@@ -1069,6 +1152,8 @@ pub fn ensurePrivateDir(path: []const u8) PrivateDirError!fd_t {
 
     var buf: [posix.PATH_MAX]u8 = undefined;
     if (trimmed.len >= buf.len) return error.NameTooLong;
+    assert(trimmed.len > 0);
+    assert(trimmed.len < buf.len);
     @memcpy(buf[0..trimmed.len], trimmed);
     buf[trimmed.len] = 0;
     const path_z: [*:0]const u8 = buf[0..trimmed.len :0].ptr;
@@ -1108,6 +1193,7 @@ pub fn ensurePrivateDir(path: []const u8) PrivateDirError!fd_t {
         },
         else => return error.Unexpected,
     };
+    assert(fd >= 0);
     errdefer close(fd);
 
     var st = fstat(fd) catch return error.Unexpected;
@@ -1118,6 +1204,8 @@ pub fn ensurePrivateDir(path: []const u8) PrivateDirError!fd_t {
         st = fstat(fd) catch return error.Unexpected;
     }
     if (st.permissions() & 0o077 != 0) return error.InsecurePermissions;
+    assert(st.isDir());
+    assert(st.uid == geteuid());
     return fd;
 }
 
@@ -1125,7 +1213,12 @@ pub fn ensurePrivateDir(path: []const u8) PrivateDirError!fd_t {
 /// require a regular file owned by euid and clear `O_NONBLOCK`. `O_NONBLOCK`
 /// keeps a planted FIFO from hanging the open; `O_NOFOLLOW` rejects a symlink
 /// with `SymLinkLoop`.
-pub fn openOwnedRegularAt(dir_fd: fd_t, name: []const u8, flags: c.O, mode: mode_t) (OpenError || error{ NotRegularFile, ForeignOwner })!fd_t {
+pub fn openOwnedRegularAt(
+    dir_fd: fd_t,
+    name: []const u8,
+    flags: c.O,
+    mode: mode_t,
+) (OpenError || error{ NotRegularFile, ForeignOwner })!fd_t {
     var path_buf: [posix.PATH_MAX]u8 = undefined;
     const name_z = try toPathZ(&path_buf, name);
     var open_flags = flags;
@@ -1161,10 +1254,12 @@ pub fn openOwnedRegularAt(dir_fd: fd_t, name: []const u8, flags: c.O, mode: mode
             else => |err| return unexpected(err),
         }
     };
+    assert(fd >= 0);
     errdefer close(fd);
     const st = fstat(fd) catch return error.Unexpected;
     if (st.kind() != posix.S.IFREG) return error.NotRegularFile;
     if (st.uid != geteuid()) return error.ForeignOwner;
+    assert(st.kind() == posix.S.IFREG);
     try clearNonBlocking(fd);
     return fd;
 }
@@ -1194,7 +1289,10 @@ pub fn peerEuid(fd: fd_t) error{ PeerCredentialsUnavailable, Unexpected }!uid_t 
 /// `deadline_ms` (see `monotonicMs`). A listener with a full backlog makes a
 /// non-blocking AF_UNIX connect fail with `EAGAIN` on Linux; that is retried
 /// until the deadline. The returned socket is blocking.
-pub fn connectUnixDeadline(path: []const u8, deadline_ms: i64) (SocketError || ConnectError || error{ NameTooLong, Timeout })!fd_t {
+pub fn connectUnixDeadline(
+    path: []const u8,
+    deadline_ms: i64,
+) (SocketError || ConnectError || error{ NameTooLong, Timeout })!fd_t {
     const address = try UnixAddress.init(path);
     if (monotonicMs() >= deadline_ms) return error.Timeout;
     const fd = try unixStreamSocket();
@@ -1230,12 +1328,17 @@ pub fn connectUnixDeadline(path: []const u8, deadline_ms: i64) (SocketError || C
     }
 
     try clearNonBlocking(fd);
+    assert(fd >= 0);
     return fd;
 }
 
 /// `flock(LOCK_EX)` polled with `LOCK_NB` until the monotonic `deadline_ms`
 /// or until `stop` becomes true, so a contended lock never blocks shutdown.
-pub fn flockExclusiveDeadline(fd: fd_t, deadline_ms: i64, stop: ?*const std.atomic.Value(bool)) error{ Timeout, Interrupted, Unexpected }!void {
+pub fn flockExclusiveDeadline(
+    fd: fd_t,
+    deadline_ms: i64,
+    stop: ?*const std.atomic.Value(bool),
+) error{ Timeout, Interrupted, Unexpected }!void {
     while (true) {
         if (stop) |flag| if (flag.load(.seq_cst)) return error.Interrupted;
         switch (posix.errno(c.flock(fd, posix.LOCK.EX | posix.LOCK.NB))) {
@@ -1271,6 +1374,7 @@ const close_from_scan_cap: fd_t = 65536;
 /// fall back to a numeric scan, bounded by the larger of the soft and hard
 /// limits and capped so an unlimited rlimit cannot stall the child.
 pub fn closeFrom(low_fd: fd_t) void {
+    assert(low_fd >= 0);
     if (builtin.os.tag == .linux) {
         if (!force_close_from_fallback) {
             const rc = std.os.linux.close_range(low_fd, std.math.maxInt(fd_t), .{ .UNSHARE = false, .CLOEXEC = false });
@@ -1327,7 +1431,8 @@ fn closeFromDarwinFdList(low_fd: fd_t) bool {
 fn closeFromProcSelfFd(low_fd: fd_t) bool {
     if (builtin.os.tag != .linux) return false;
     const linux = std.os.linux;
-    const dir_fd = c.open("/proc/self/fd", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, @as(c.mode_t, 0));
+    const dir_flags: c.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true };
+    const dir_fd = c.open("/proc/self/fd", dir_flags, @as(c.mode_t, 0));
     if (dir_fd < 0) return false;
     defer _ = c.close(dir_fd);
 
@@ -1371,6 +1476,8 @@ fn parseFdName(name: [*:0]const u8) ?fd_t {
         value = value * 10 + (digit - '0');
     }
     if (index == 0) return null;
+    assert(index <= 9);
+    assert(value <= 999_999_999);
     return @intCast(value);
 }
 
@@ -1431,6 +1538,7 @@ const TestDir = struct {
             tag, getpid(), monotonicMs(), counter.fetchAdd(1, .seq_cst),
         });
         dir.len = created.len;
+        assert(dir.len <= dir.buf.len);
         try mkdir(created, 0o700);
         try fchmodat(cwd_fd, created, 0o700);
         return dir;
@@ -1440,18 +1548,28 @@ const TestDir = struct {
         return self.buf[0..self.len];
     }
 
+    /// `<dir>/<name>` in `buf`. Test callers pass a buffer sized for the
+    /// fixed-length test directory plus their short names.
     fn join(self: *const TestDir, buf: []u8, name: []const u8) []const u8 {
-        return std.fmt.bufPrint(buf, "{s}/{s}", .{ self.path(), name }) catch unreachable;
+        const base = self.path();
+        const len = base.len + 1 + name.len;
+        assert(len <= buf.len);
+        @memcpy(buf[0..base.len], base);
+        buf[base.len] = '/';
+        @memcpy(buf[base.len + 1 ..][0..name.len], name);
+        return buf[0..len];
     }
 
     fn remove(self: *const TestDir, names: []const []const u8) void {
         var buf: [256]u8 = undefined;
         for (names) |name| {
             const child = self.join(&buf, name);
-            unlinkAt(cwd_fd, child) catch {};
-            rmdir(child) catch {};
+            // Each child is either a file or a directory, so one of these two
+            // calls is expected to fail.
+            unlinkAt(cwd_fd, child) catch |err| log.debug("test_dir_unlink_failed", .{ .err = err });
+            rmdir(child) catch |err| log.debug("test_dir_rmdir_failed", .{ .err = err });
         }
-        rmdir(self.path()) catch {};
+        rmdir(self.path()) catch |err| log.debug("test_dir_rmdir_failed", .{ .err = err });
     }
 };
 

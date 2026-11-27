@@ -19,4 +19,6 @@ comptime {
     _ = @import("server.zig");
     _ = @import("connect.zig");
     _ = @import("daemon_sys.zig");
+    _ = @import("socket_path.zig");
+    _ = @import("pty.zig");
 }

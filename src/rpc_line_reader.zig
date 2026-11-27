@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
+const assert = std.debug.assert;
 const posix = std.posix;
 
 const sys = @import("sys.zig");
@@ -61,6 +62,7 @@ pub const LineReader = struct {
         const ns = deadline_ns -| now_ns;
         if (ns <= 0) return 0;
         const ms = @divFloor(ns, std.time.ns_per_ms) + @intFromBool(@mod(ns, std.time.ns_per_ms) != 0);
+        assert(ms > 0);
         return @intCast(@min(ms, std.math.maxInt(i64)));
     }
 
@@ -68,6 +70,7 @@ pub const LineReader = struct {
     /// at `maxInt(i32)`; the caller re-checks the deadline when a capped poll
     /// returns 0 instead of reporting a timeout early.
     fn pollTimeoutMs(remaining_ms: i64) i32 {
+        assert(remaining_ms > 0);
         return @intCast(@min(remaining_ms, std.math.maxInt(i32)));
     }
 
@@ -87,7 +90,8 @@ pub const LineReader = struct {
         max_len: usize,
         timeout: std.Io.Timeout,
     ) ![]u8 {
-        return requireNewline(allocator, try self.readLineAllocMaybeDeadline(allocator, fd, max_len, .init(io, timeout)));
+        const deadline: ?Deadline = .init(io, timeout);
+        return requireNewline(allocator, try self.readLineAllocMaybeDeadline(allocator, fd, max_len, deadline));
     }
 
     /// Read one line, returning `null` on EOF with nothing buffered and the
@@ -170,6 +174,7 @@ pub const LineReader = struct {
         if (self.pending.items.len == 0 and buffered.len == 0) return null;
 
         const line = try allocator.alloc(u8, self.pending.items.len + buffered.len);
+        assert(line.len > 0);
         @memcpy(line[0..self.pending.items.len], self.pending.items);
         @memcpy(line[self.pending.items.len..], buffered);
         self.start = 0;
@@ -232,6 +237,7 @@ pub const LineReader = struct {
             self.start = 0;
             self.end = len;
         }
+        assert(self.start == 0);
         if (self.end == self.buffer.len) return .data;
         const n = posix.read(fd, self.buffer[self.end..]) catch |err| switch (err) {
             error.WouldBlock => return .would_block,
@@ -239,6 +245,7 @@ pub const LineReader = struct {
         };
         if (n == 0) return .eof;
         self.end += n;
+        assert(self.end <= self.buffer.len);
         return .data;
     }
 
@@ -248,6 +255,7 @@ pub const LineReader = struct {
     /// once the current frame exceeds `max_len` bytes (newline included);
     /// the rest of that frame is then discarded.
     pub fn nextBufferedLineAlloc(self: *LineReader, allocator: Allocator, max_len: usize) !?[]u8 {
+        assert(self.start <= self.end);
         if (self.discarding) {
             const buffered = self.buffer[self.start..self.end];
             if (std.mem.indexOfScalar(u8, buffered, '\n')) |index| {
@@ -274,6 +282,7 @@ pub const LineReader = struct {
             const line = try allocator.alloc(u8, pending_len + line_len);
             @memcpy(line[0..pending_len], self.pending.items);
             @memcpy(line[pending_len..], buffered[0..line_len]);
+            assert(line.len <= max_len);
             self.start += line_len;
             self.compact();
             self.dropPending();
@@ -302,6 +311,7 @@ pub const LineReader = struct {
     }
 
     fn bufferedLen(self: *const LineReader) usize {
+        assert(self.start <= self.end);
         return self.end - self.start;
     }
 
@@ -349,9 +359,11 @@ const DelayedWrite = struct {
     bytes: []const u8,
     delay_ms: i64,
 
-    fn run(self: DelayedWrite) void {
-        std.testing.io.sleep(.fromMilliseconds(self.delay_ms), .awake) catch {};
-        _ = sys.write(self.fd, self.bytes) catch {};
+    /// `std.Thread` reports a returned error on stderr; the reading test
+    /// then fails on its own expectation.
+    fn run(self: DelayedWrite) !void {
+        try std.testing.io.sleep(.fromMilliseconds(self.delay_ms), .awake);
+        _ = try sys.write(self.fd, self.bytes);
     }
 };
 
@@ -766,4 +778,62 @@ test "fillOnce with drained lines handles frames larger than the buffer" {
         got = try reader.nextBufferedLineAlloc(std.testing.allocator, 256 * 1024);
     }
     try std.testing.expectEqual(big.len, got.?.len);
+}
+
+test "deinit frees a partial frame held in pending" {
+    const fds = try sys.pipe();
+    defer sys.close(fds[0]);
+    defer sys.close(fds[1]);
+    _ = try sys.write(fds[1], "abc");
+
+    var reader: LineReader = .{};
+    defer reader.deinit();
+    try std.testing.expectError(
+        error.ReadTimeout,
+        reader.readLineAllocMaybeTimeout(std.testing.allocator, std.testing.io, fds[0], 64, .{
+            .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake },
+        }),
+    );
+    try std.testing.expectEqualStrings("abc", reader.pending.items);
+}
+
+test "readLineAlloc reports ConnectionClosed on clean EOF" {
+    const fds = try sys.pipe();
+    defer sys.close(fds[0]);
+    sys.close(fds[1]);
+
+    var reader: LineReader = .{};
+    defer reader.deinit();
+    try std.testing.expectError(error.ConnectionClosed, reader.readLineAlloc(std.testing.allocator, fds[0], 64));
+    try std.testing.expectEqual(@as(?[]u8, null), try reader.readLineAllocMaybe(std.testing.allocator, fds[0], 64));
+}
+
+test "nextBufferedLineAlloc with max_len 0 rejects each line then accepts under a larger limit" {
+    var reader: LineReader = .{};
+    defer reader.deinit();
+    const input = "a\nbc\nd\n";
+    @memcpy(reader.buffer[0..input.len], input);
+    reader.end = input.len;
+
+    try std.testing.expectError(error.MessageTooLarge, reader.nextBufferedLineAlloc(std.testing.allocator, 0));
+    try std.testing.expectError(error.MessageTooLarge, reader.nextBufferedLineAlloc(std.testing.allocator, 2));
+    const line = (try reader.nextBufferedLineAlloc(std.testing.allocator, 2)).?;
+    defer std.testing.allocator.free(line);
+    try std.testing.expectEqualStrings("d\n", line);
+    try std.testing.expectEqual(@as(?[]u8, null), try reader.nextBufferedLineAlloc(std.testing.allocator, 2));
+    try std.testing.expectEqual(@as(usize, 0), reader.end);
+}
+
+test "nextBufferedLineAlloc propagates allocation failure without losing the line" {
+    var reader: LineReader = .{};
+    defer reader.deinit();
+    const input = "ok\n";
+    @memcpy(reader.buffer[0..input.len], input);
+    reader.end = input.len;
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, reader.nextBufferedLineAlloc(failing.allocator(), 64));
+    const line = (try reader.nextBufferedLineAlloc(std.testing.allocator, 64)).?;
+    defer std.testing.allocator.free(line);
+    try std.testing.expectEqualStrings("ok\n", line);
 }

@@ -5,9 +5,12 @@ const buffer = @import("buffer.zig");
 const foreground = @import("foreground.zig");
 const pty = @import("pty.zig");
 
+/// How `NativeSessionOptions.env` combines with the daemon environment.
 pub const EnvMode = pty.EnvMode;
 const protocol = @import("protocol.zig");
 const sys = @import("sys.zig");
+const log = @import("log.zig");
+const assert = std.debug.assert;
 
 /// Decoded child exit: exactly one of the fields is set for a reaped child,
 /// both null when the status was unavailable.
@@ -62,6 +65,8 @@ pub var spawn_reader_hook: ?*const fn (child_pid: std.posix.pid_t) std.Thread.Sp
 /// on a detached reader thread.
 pub var teardown_count: std.atomic.Value(usize) = .init(0);
 
+/// Session lifecycle: `creating` -> `running` -> `terminated`, or straight
+/// from `creating` to `terminated` when startup fails.
 pub const NativeSessionState = enum(u8) {
     creating,
     running,
@@ -80,6 +85,8 @@ pub const NativeSessionState = enum(u8) {
     }
 };
 
+/// What `NativeSession.create` spawns and how its scrollback and events are
+/// configured.
 pub const NativeSessionOptions = struct {
     id: []const u8,
     title: ?[]const u8 = null,
@@ -98,6 +105,7 @@ pub const NativeSessionOptions = struct {
     generation: u64 = 0,
 };
 
+/// One notification delivered to an `EventSink` from the reader thread.
 pub const Event = union(enum) {
     foreground_changed: protocol.ForegroundChangedParams,
     session_exited: protocol.SessionExitedParams,
@@ -106,6 +114,7 @@ pub const Event = union(enum) {
     pane_bell: PaneBellEvent,
 };
 
+/// A chunk of PTY output, borrowed for the duration of the callback.
 pub const PaneOutputEvent = struct {
     pane_id: []const u8,
     data: []const u8,
@@ -114,18 +123,21 @@ pub const PaneOutputEvent = struct {
     generation: u64,
 };
 
+/// Output resumed after at least `activity_idle_ms` of silence.
 pub const PaneActivityEvent = struct {
     pane_id: []const u8,
     last_activity_ms: i64,
     generation: u64,
 };
 
+/// The pane's output contained a BEL byte.
 pub const PaneBellEvent = struct {
     pane_id: []const u8,
     last_bell_ms: i64,
     generation: u64,
 };
 
+/// Callback receiving every `Event`; called from the reader thread.
 pub const EventSink = struct {
     context: *anyopaque,
     emit: *const fn (context: *anyopaque, event: Event) void,
@@ -232,12 +244,11 @@ pub const NativeSession = struct {
         var scrollback = try buffer.ScrollbackBuffer.init(allocator, opts.scrollback_bytes);
         errdefer scrollback.deinit();
 
-        const stop_pipe = try sys.pipeCloexec();
+        const stop_pipe = try openStopPipe();
         errdefer {
             sys.close(stop_pipe[0]);
             sys.close(stop_pipe[1]);
         }
-        try sys.setNonBlocking(stop_pipe[1]);
 
         const handle = try pty.Pty.spawn(allocator, io, .{
             .shell = opts.shell,
@@ -248,6 +259,8 @@ pub const NativeSession = struct {
             .rows = opts.rows,
             .cols = opts.cols,
         });
+        assert(handle.child_pid > 0);
+        assert(handle.master_fd >= 0);
 
         native.* = .{
             .allocator = allocator,
@@ -283,12 +296,29 @@ pub const NativeSession = struct {
         return native;
     }
 
+    /// The `stopInput` wake-up pipe: close-on-exec, non-blocking write end.
+    fn openStopPipe() ![2]sys.fd_t {
+        const stop_pipe = try sys.pipeCloexec();
+        assert(stop_pipe[0] >= 0);
+        assert(stop_pipe[1] >= 0);
+        errdefer {
+            sys.close(stop_pipe[0]);
+            sys.close(stop_pipe[1]);
+        }
+        try sys.setNonBlocking(stop_pipe[1]);
+        return stop_pipe;
+    }
+
     pub fn retain(self: *NativeSession) void {
-        _ = self.ref_count.fetchAdd(1, .seq_cst);
+        const previous = self.ref_count.fetchAdd(1, .seq_cst);
+        // Retaining a session whose last reference is gone is a use after free.
+        assert(previous > 0);
     }
 
     pub fn release(self: *NativeSession) void {
-        if (self.ref_count.fetchSub(1, .seq_cst) != 1) return;
+        const previous = self.ref_count.fetchSub(1, .seq_cst);
+        assert(previous > 0);
+        if (previous != 1) return;
         if (self.onReaderThread()) {
             // Dropped from inside a sink callback. Joining here would be a
             // self-join; the reader finishes the teardown once the callback
@@ -313,6 +343,8 @@ pub const NativeSession = struct {
 
     /// Final teardown. No other thread may reference the session.
     fn freeResources(self: *NativeSession) void {
+        assert(self.reader_finished.load(.seq_cst));
+        assert(self.ref_count.load(.seq_cst) == 0);
         self.handle.close();
         sys.close(self.stop_pipe[0]);
         sys.close(self.stop_pipe[1]);
@@ -362,10 +394,12 @@ pub const NativeSession = struct {
     fn exitInfoLocked(self: *NativeSession) ?ExitInfo {
         if (self.state_value.load(.monotonic) != .terminated) return null;
         const status = self.raw_exit_status orelse return .{ .exit_code = null, .signal = null };
-        return .{
+        const info: ExitInfo = .{
             .exit_code = exitCodeOf(status),
             .signal = termSignalOf(status),
         };
+        assert(info.exit_code == null or info.signal == null);
+        return info;
     }
 
     pub fn setTitle(self: *NativeSession, title: []const u8) !void {
@@ -422,15 +456,18 @@ pub const NativeSession = struct {
     /// output.
     pub fn beginTerminate(self: *NativeSession) void {
         self.stopInput();
-        if (self.term_at_ms.cmpxchgStrong(0, sys.monotonicMs() + hangup_grace_ms, .seq_cst, .seq_cst) != null) return;
+        assert(self.input_stopped.load(.seq_cst));
+        const term_at = sys.monotonicMs() + hangup_grace_ms;
+        if (self.term_at_ms.cmpxchgStrong(0, term_at, .seq_cst, .seq_cst) != null) return;
         _ = self.reapExited();
         self.handle.hangupForeground();
     }
 
     /// Reap until the monotonic `deadline_ms` (`sys.monotonicMs`). After a
     /// `beginTerminate`, SIGTERM follows the SIGHUP once `hangup_grace_ms`
-    /// passed. At the deadline, and only if the child is still not reaped, escalate to
-    /// SIGKILL for the foreground and shell groups and keep reaping until
+    /// passed. At the deadline, and only if the child is still not reaped,
+    /// escalate to SIGKILL for the foreground and shell groups and keep
+    /// reaping until
     /// `waitpid` collects the child (bounded by `kill_reap_budget_ms`).
     ///
     /// The ladder does not stop when the shell is reaped while a foreground
@@ -458,7 +495,10 @@ pub const NativeSession = struct {
             }
             if (kill_give_up_ms) |give_up| {
                 if (now >= give_up) {
-                    std.log.warn("zmux-native: child {d} not reaped {d} ms after SIGKILL", .{ self.handle.child_pid, kill_reap_budget_ms });
+                    std.log.warn(
+                        "zmux-native: child {d} not reaped {d} ms after SIGKILL",
+                        .{ self.handle.child_pid, kill_reap_budget_ms },
+                    );
                     return;
                 }
             } else if (now >= deadline_ms) {
@@ -509,6 +549,7 @@ pub const NativeSession = struct {
         defer self.mutex.unlock(self.io);
         if (self.state_value.load(.monotonic) == .terminated) return;
         self.setStateLocked(.terminated);
+        assert(self.state_value.load(.monotonic) == .terminated);
         self.exit_status = if (status) |value| decodedExitStatus(value) else null;
         self.raw_exit_status = status;
     }
@@ -529,6 +570,7 @@ pub const NativeSession = struct {
 
     pub fn sendKey(self: *NativeSession, key: []const u8) !void {
         const sequence = keySequence(key) orelse return error.UnknownKey;
+        assert(sequence.len > 0);
         try self.writeInput(sequence);
     }
 
@@ -563,7 +605,8 @@ pub const NativeSession = struct {
     /// non-blocking.
     pub fn stopInput(self: *NativeSession) void {
         if (self.input_stopped.swap(true, .seq_cst)) return;
-        _ = sys.write(self.stop_pipe[1], "x") catch {};
+        // A full pipe (WouldBlock) already holds a wake-up byte.
+        _ = sys.write(self.stop_pipe[1], "x") catch |err| log.debug("native_stop_input_write_failed", .{ .err = err });
     }
 
     pub fn resize(self: *NativeSession, cols: u16, rows: u16) !void {
@@ -664,6 +707,7 @@ pub const NativeSession = struct {
     }
 
     fn readerLoop(self: *NativeSession) void {
+        assert(!self.reader_finished.load(.seq_cst));
         self.reader_tid.store(currentThreadTag(), .seq_cst);
 
         var read_buf: [32 * 1024]u8 = undefined;
@@ -684,35 +728,21 @@ pub const NativeSession = struct {
 
             if (exit_seen_ms == null and self.reapIsDone()) exit_seen_ms = self.monotonicMs();
 
-            // With a pidfd the exit wakes the poll; without one (Darwin) a
-            // short timeout bounds how late the exit is noticed.
-            var timeout_ms: i32 = if (self.handle.pid_fd >= 0) 100 else 25;
-            // Overtime: no more waiting, only draining what is already there.
-            var overtime = false;
-            if (stopping) {
-                if (pty_eof) break;
-                overtime = true;
-            } else if (exit_seen_ms) |seen| {
-                if (pty_eof) break;
-                // A descendant still holds the slave open: stop waiting for
-                // an EOF that may never come.
-                const remaining = exit_drain_grace_ms - (self.monotonicMs() - seen);
-                if (remaining <= 0) overtime = true else timeout_ms = @intCast(remaining);
-            } else if (!pty_eof) {
-                self.pollForegroundChange() catch {};
-            }
-            if (overtime) {
-                if (overtime_bytes >= exit_drain_max_bytes) break;
-                timeout_ms = 0;
-            }
+            const wait = switch (self.readerWait(stopping, pty_eof, exit_seen_ms, overtime_bytes)) {
+                .done => break,
+                .wait => |wait| wait,
+            };
+            const overtime = wait.overtime;
 
             // Negative descriptors are ignored by poll(2). After PTY EOF with
             // a live child (it closed its terminal) only the exit is awaited.
+            const master_fd = if (pty_eof) -1 else self.handle.master_fd;
+            const pid_fd = if (exit_seen_ms == null) self.handle.pid_fd else -1;
             var fds = [_]std.posix.pollfd{
-                .{ .fd = if (pty_eof) -1 else self.handle.master_fd, .events = std.posix.POLL.IN, .revents = 0 },
-                .{ .fd = if (exit_seen_ms == null) self.handle.pid_fd else -1, .events = std.posix.POLL.IN, .revents = 0 },
+                .{ .fd = master_fd, .events = std.posix.POLL.IN, .revents = 0 },
+                .{ .fd = pid_fd, .events = std.posix.POLL.IN, .revents = 0 },
             };
-            const ready = std.posix.poll(&fds, timeout_ms) catch {
+            const ready = std.posix.poll(&fds, wait.timeout_ms) catch {
                 if (overtime) break;
                 self.sleepMs(10);
                 continue;
@@ -738,6 +768,7 @@ pub const NativeSession = struct {
                 pty_eof = true;
                 continue;
             }
+            assert(n <= read_buf.len);
             if (overtime) overtime_bytes += n;
             self.handleOutput(read_buf[0..n]);
         }
@@ -745,12 +776,58 @@ pub const NativeSession = struct {
         self.finishReader();
     }
 
+    const ReaderWait = union(enum) {
+        /// The child is reaped and the stream is drained (or abandoned).
+        done,
+        wait: struct {
+            timeout_ms: i32,
+            /// No more waiting, only draining what is already readable.
+            overtime: bool,
+        },
+    };
+
+    /// Decide how long the reader's next poll may block. Also runs the
+    /// periodic foreground-process check while the child is alive.
+    fn readerWait(
+        self: *NativeSession,
+        stopping: bool,
+        pty_eof: bool,
+        exit_seen_ms: ?i64,
+        overtime_bytes: usize,
+    ) ReaderWait {
+        // With a pidfd the exit wakes the poll; without one (Darwin) a
+        // short timeout bounds how late the exit is noticed.
+        var timeout_ms: i32 = if (self.handle.pid_fd >= 0) 100 else 25;
+        var overtime = false;
+        if (stopping) {
+            if (pty_eof) return .done;
+            overtime = true;
+        } else if (exit_seen_ms) |seen| {
+            if (pty_eof) return .done;
+            // A descendant still holds the slave open: stop waiting for
+            // an EOF that may never come.
+            const remaining = exit_drain_grace_ms - (self.monotonicMs() - seen);
+            if (remaining <= 0) overtime = true else timeout_ms = @intCast(remaining);
+        } else if (!pty_eof) {
+            // A failed lookup is retried on the next poll interval.
+            self.pollForegroundChange() catch |err| log.debug("native_foreground_poll_failed", .{ .err = err });
+        }
+        if (overtime) {
+            if (overtime_bytes >= exit_drain_max_bytes) return .done;
+            timeout_ms = 0;
+        }
+        assert(timeout_ms >= 0);
+        return .{ .wait = .{ .timeout_ms = timeout_ms, .overtime = overtime } };
+    }
+
     fn handleOutput(self: *NativeSession, data: []const u8) void {
+        assert(data.len > 0);
         // The offset is taken under the same lock as the append, so
         // consecutive events carry contiguous offsets.
         self.mutex.lockUncancelable(self.io);
         const offset = self.scrollback.endOffset();
         self.scrollback.append(data);
+        assert(self.scrollback.endOffset() == offset + data.len);
         self.mutex.unlock(self.io);
 
         _ = self.emitEvent(.{ .pane_output = .{
@@ -783,6 +860,7 @@ pub const NativeSession = struct {
     /// Reader epilogue: emit `session_exited` once (after every
     /// `pane_output`), release the master, and hand off or finish teardown.
     fn finishReader(self: *NativeSession) void {
+        assert(self.onReaderThread());
         if (self.handle.isReaped()) {
             // Re-verify any remembered foreground group right at reap time so
             // a short-lived job that already exited is cleared immediately and
@@ -837,7 +915,8 @@ pub const NativeSession = struct {
         // Without a sink nothing can be delivered: skip the lookup and leave
         // the change uncommitted for whoever subscribes later.
         if (!self.hasEventSink()) return;
-        var process = (try self.foreground_tracker.poll(self.allocator, self.io, self.handle.master_fd)) orelse return;
+        const polled = try self.foreground_tracker.poll(self.allocator, self.io, self.handle.master_fd);
+        var process = polled orelse return;
         defer process.deinit();
 
         if (process.degraded) {
@@ -855,6 +934,8 @@ pub const NativeSession = struct {
                 self.foreground_degraded_pgid = null;
                 return;
             }
+            assert(self.foreground_degraded_polls >= 1);
+            assert(self.foreground_degraded_polls <= foreground_degraded_retries);
             const shift: u6 = @intCast(self.foreground_degraded_polls - 1);
             self.next_foreground_check_ms = now_ms + (foreground.poll_interval_ms << shift);
             if (!first) return;
@@ -897,6 +978,7 @@ pub const NativeSession = struct {
         sink.emit(sink.context, event);
 
         self.mutex.lockUncancelable(self.io);
+        assert(self.in_flight > 0);
         self.in_flight -= 1;
         if (self.in_flight == 0) self.emit_idle.broadcast(self.io);
         self.mutex.unlock(self.io);
@@ -913,6 +995,7 @@ pub const NativeSession = struct {
         self.event_sink = sink;
         if (wait_for_idle) {
             while (self.in_flight != 0) self.emit_idle.waitUncancelable(self.io, &self.mutex);
+            assert(self.in_flight == 0);
         }
     }
 
@@ -926,6 +1009,7 @@ pub const NativeSession = struct {
         defer self.mutex.unlock(self.io);
         self.event_sink = null;
         while (self.in_flight != 0) self.emit_idle.waitUncancelable(self.io, &self.mutex);
+        assert(self.in_flight == 0);
     }
 
     /// Remove the sink without waiting: no new callback starts, but one that
@@ -946,8 +1030,10 @@ pub const NativeSession = struct {
     }
 
     fn sleepMs(self: *NativeSession, ms: i64) void {
-        // Plain threads are never canceled; ignoring error.Canceled is safe.
-        self.io.sleep(.fromMilliseconds(ms), .awake) catch {};
+        // Plain threads are never canceled; a canceled sleep just ends early.
+        self.io.sleep(.fromMilliseconds(ms), .awake) catch |err| switch (err) {
+            error.Canceled => return,
+        };
     }
 };
 
@@ -968,6 +1054,7 @@ pub fn termSignalOf(status: u32) ?u32 {
     return status & 0x7f;
 }
 
+/// Exit code, else terminating signal, else the raw status word.
 pub fn decodedExitStatus(status: u32) u32 {
     if (exitCodeOf(status)) |code| return code;
     if (termSignalOf(status)) |signal| return signal;
@@ -996,9 +1083,12 @@ fn ctrlKeySequence(key: []const u8) ?[]const u8 {
     const c = key[2];
     if (!std.ascii.isAlphabetic(c)) return null;
     const index = std.ascii.toUpper(c) - 'A';
+    assert(index < ctrl_key_sequences.len);
     return &ctrl_key_sequences[index];
 }
 
+/// Terminal byte sequence for a tmux-style key name (case-insensitive), such
+/// as `Enter`, `C-a`, `ArrowUp`, or `F5`; null for an unknown name.
 pub fn keySequence(key: []const u8) ?[]const u8 {
     if (ctrlKeySequence(key)) |sequence| return sequence;
 
@@ -1137,12 +1227,16 @@ const Recorder = struct {
         defer _ = self.completed.fetchAdd(1, .seq_cst);
 
         self.mutex.lockUncancelable(io);
-        self.kinds.append(allocator, std.meta.activeTag(event)) catch {};
+        self.kinds.append(allocator, std.meta.activeTag(event)) catch |err| {
+            log.err("native_test_recorder_append_failed", .{ .err = err });
+        };
         var delay_ms: i64 = 0;
         switch (event) {
             .pane_output => |out| {
                 self.outputs += 1;
-                self.output.appendSlice(allocator, out.data) catch {};
+                self.output.appendSlice(allocator, out.data) catch |err| {
+                    log.err("native_test_recorder_append_failed", .{ .err = err });
+                };
                 if (out.generation != self.expected_generation) self.generation_mismatch = true;
                 if (self.next_offset) |expected| {
                     if (out.offset != expected) self.offsets_contiguous = false;
@@ -1241,7 +1335,7 @@ fn waitUntilGone(pid: std.posix.pid_t, timeout_ms: i64) bool {
 
 fn expectJsonContains(json: []const u8, needle: []const u8) !void {
     if (std.mem.indexOf(u8, json, needle) == null) {
-        std.debug.print("expected {s}\n to contain {s}\n", .{ json, needle });
+        log.err("native_test_json_missing", .{ .needle = needle, .json = json });
         return error.TestExpectedContains;
     }
 }
@@ -1538,7 +1632,8 @@ test "releasing the last reference inside a callback tears down without deadlock
     // The child was terminated and reaped by the detached reader; the
     // testing allocator verifies every allocation was freed.
     try std.testing.expect(waitUntilGone(pid, 2_000));
-    try std.testing.expectEqual(std.posix.E.CHILD, std.posix.errno(std.c.waitpid(pid, null, @intCast(std.posix.W.NOHANG))));
+    const wait_rc = std.c.waitpid(pid, null, @intCast(std.posix.W.NOHANG));
+    try std.testing.expectEqual(std.posix.E.CHILD, std.posix.errno(wait_rc));
 }
 
 fn lineBlock(allocator: std.mem.Allocator, total: usize) ![]u8 {
@@ -1933,7 +2028,8 @@ test "terminate lets a HUP trap finish before SIGTERM follows" {
     // trap until that child exits, and a SIGHUP that lands between its fork
     // and exec misses it, so the trap would run up to a second late and lose
     // to the SIGTERM this test is about.
-    const native = try testCreate(&rec, "trap 'echo TRAPPED; exit 3' HUP; echo ready; while :; do sleep 1 & wait $!; done", .{});
+    const script = "trap 'echo TRAPPED; exit 3' HUP; echo ready; while :; do sleep 1 & wait $!; done";
+    const native = try testCreate(&rec, script, .{});
     defer native.destroy();
     try rec.waitForOutput("ready", 10_000);
     // Let the shell get past the fork and park in `wait`.
@@ -1979,7 +2075,8 @@ test "destroy terminates a running child and joins the reader" {
     try std.testing.expect(native.isRunning());
     native.destroy();
 
-    try std.testing.expectEqual(std.posix.E.CHILD, std.posix.errno(std.c.waitpid(pid, null, @intCast(std.posix.W.NOHANG))));
+    const wait_rc = std.c.waitpid(pid, null, @intCast(std.posix.W.NOHANG));
+    try std.testing.expectEqual(std.posix.E.CHILD, std.posix.errno(wait_rc));
     // The exit was delivered before destroy returned, with the hangup signal.
     try std.testing.expectEqual(@as(usize, 1), rec.exits);
     try std.testing.expectEqual(@as(?u32, @backingInt(std.posix.SIG.HUP)), rec.exit_signal);
@@ -2099,7 +2196,11 @@ test "destroy delivers output that is still buffered when the reader is stopped"
     defer allocator.free(tmp_path);
     const marker = try std.fs.path.join(allocator, &.{ tmp_path, "wrote-mark-last" });
     defer allocator.free(marker);
-    const cmd = try std.fmt.allocPrint(allocator, "echo first; sleep 0.1; echo MARK-LAST; : > '{s}'; exec sleep 100", .{marker});
+    const cmd = try std.fmt.allocPrint(
+        allocator,
+        "echo first; sleep 0.1; echo MARK-LAST; : > '{s}'; exec sleep 100",
+        .{marker},
+    );
     defer allocator.free(cmd);
 
     var rec: Recorder = .{};
@@ -2130,7 +2231,9 @@ test "a descendant that never stops writing cannot postpone session_exited forev
     defer rec.deinit();
     // `yes` ignores the hangup and floods the terminal after the leader
     // exits. It stops by itself once the master is closed (EIO).
-    const native = try testCreate(&rec, "(trap '' HUP; exec yes spam) & sleep 0.3; exit 6", .{ .scrollback_bytes = 64 * 1024 });
+    const native = try testCreate(&rec, "(trap '' HUP; exec yes spam) & sleep 0.3; exit 6", .{
+        .scrollback_bytes = 64 * 1024,
+    });
     defer native.destroy();
 
     try rec.waitForExit(20_000);
@@ -2209,7 +2312,11 @@ test "time queued behind another writer counts against the input deadline" {
     // The first writer holds the input lock for its whole deadline. The
     // second arrives halfway through and must fail at its own deadline, not
     // a full deadline after it finally gets the lock.
-    var queued = QueuedWriter{ .native = native, .data = data, .start_delay_ms = @divTrunc(default_input_deadline_ms, 2) };
+    var queued = QueuedWriter{
+        .native = native,
+        .data = data,
+        .start_delay_ms = @divTrunc(default_input_deadline_ms, 2),
+    };
     const thread = try std.Thread.spawn(.{}, QueuedWriter.run, .{&queued});
     try std.testing.expectError(error.InputTimeout, native.send(data, true));
     thread.join();
@@ -2223,7 +2330,8 @@ const BlockedWriter = struct {
     finished_at_ms: std.atomic.Value(i64) = .init(0),
 
     fn run(self: *BlockedWriter) void {
-        self.native.writeInput(self.data) catch {};
+        // The writer is expected to fail (InputClosed); only its timing matters.
+        self.native.writeInput(self.data) catch |err| log.debug("native_test_blocked_write_ended", .{ .err = err });
         self.finished_at_ms.store(sys.monotonicMs(), .seq_cst);
     }
 };

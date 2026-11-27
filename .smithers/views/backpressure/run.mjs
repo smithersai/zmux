@@ -70,9 +70,11 @@ function detectTrustProvenance(policy) {
         : isTrustedMaintainer
           ? "maintainer-signed-execution"
           : "untrusted-local-or-pr",
-    note: trusted
-      ? "Verified inside a Smithers-controlled sandbox or maintainer gate. Eligible to publish cache and satisfy merge gates."
-      : "Untrusted execution is encouraged for fast feedback. Reads the shared object store read-only and never poisons cache or skips gates."
+    note: trusted && hasWriteToken
+      ? "Verified inside a Smithers-controlled sandbox with write credentials. Eligible to publish cache and satisfy merge gates."
+      : trusted
+        ? "Verified on a controlled main-branch runner. Satisfies merge gates while remote object store writes remain scoped to the protected CI cache step."
+        : "Untrusted execution is encouraged for fast feedback. Reads the shared object store read-only and never poisons cache or skips gates."
   }
 }
 

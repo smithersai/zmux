@@ -5,14 +5,23 @@
 //! detach over a UNIX socket, and server-owned PTYs keep running with
 //! bounded scrollback capture for replay on reattach.
 
+/// Fixed-capacity scrollback ring that keeps each pane's newest output.
 pub const buffer = @import("buffer.zig");
+/// `zmux-connect` client: attaches a terminal to a daemon session.
 pub const connect = @import("connect.zig");
+/// `zmuxd` entry point: argument parsing and daemon startup.
 pub const daemon = @import("daemon.zig");
+/// Foreground process tracking for a PTY's controlling terminal.
 pub const foreground = @import("foreground.zig");
+/// Session and pane manager shared by the daemon and native embedders.
 pub const mux = @import("mux.zig");
+/// In-process sessions for embedders that do not run a daemon.
 pub const native = @import("native.zig");
+/// JSON-RPC wire types and framing for the daemon protocol.
 pub const protocol = @import("protocol.zig");
+/// PTY allocation and child process spawning.
 pub const pty = @import("pty.zig");
+/// UNIX-socket daemon server that owns sessions and serves clients.
 pub const server = @import("server.zig");
 /// POSIX plumbing `std.Io` does not model (raw descriptors, `AF_UNIX`
 /// sockets, signals). Exported for the bundled executables and tests; it is
@@ -27,10 +36,19 @@ pub const internal = struct {
     pub const socket_path = @import("socket_path.zig");
 };
 
+/// An in-process PTY session; see `native`.
 pub const NativeSession = native.NativeSession;
+/// Options for `NativeSession.create`.
 pub const NativeSessionOptions = native.NativeSessionOptions;
+/// The daemon server; see `server`.
 pub const Server = server.Server;
+/// The session manager; see `mux`.
 pub const SessionManager = mux.Manager;
+
+comptime {
+    // A default-sized pane must fit the ring without being clamped.
+    @import("std").debug.assert(buffer.default_capacity <= buffer.max_capacity);
+}
 
 test {
     const std = @import("std");

@@ -10,9 +10,20 @@ const builtin = @import("builtin");
 const sys = @import("sys.zig");
 
 const Allocator = std.mem.Allocator;
+const assert = std.debug.assert;
 
-pub const Error = error{ EmptySocketPath, SocketPathContainsNul, SocketPathTooLong, NoSocketDirectory, CurrentDirUnavailable, OutOfMemory };
+/// Every way resolving or validating a socket path can fail.
+pub const Error = error{
+    EmptySocketPath,
+    SocketPathContainsNul,
+    SocketPathTooLong,
+    NoSocketDirectory,
+    CurrentDirUnavailable,
+    OutOfMemory,
+};
 
+/// Environment lookup: the value of `name`, or null when unset. A plain
+/// function pointer, so tests and fuzzers swap in thread-local fakes.
 pub const GetEnv = *const fn (name: []const u8) ?[]const u8;
 
 /// Precedence: `override` > `$ZMUX_SOCKET` > `$SMITHERS_SESSION_SOCKET` >
@@ -22,6 +33,7 @@ pub fn resolve(allocator: Allocator, override: ?[]const u8, getenv: GetEnv) Erro
     const path = try resolveUnvalidated(allocator, override, getenv);
     errdefer allocator.free(path);
     try validate(path);
+    assert(path.len <= sys.max_unix_path_len);
     return path;
 }
 
@@ -31,7 +43,9 @@ pub fn resolve(allocator: Allocator, override: ?[]const u8, getenv: GetEnv) Erro
 pub fn resolveUnvalidated(allocator: Allocator, override: ?[]const u8, getenv: GetEnv) Error![]u8 {
     const raw = try resolveRaw(allocator, override, getenv);
     defer allocator.free(raw);
-    return absolutize(allocator, raw);
+    const path = try absolutize(allocator, raw);
+    assert(std.fs.path.isAbsolute(path));
+    return path;
 }
 
 fn resolveRaw(allocator: Allocator, override: ?[]const u8, getenv: GetEnv) Error![]u8 {
@@ -41,7 +55,9 @@ fn resolveRaw(allocator: Allocator, override: ?[]const u8, getenv: GetEnv) Error
     }
     if (nonEmpty(getenv("ZMUX_SOCKET"))) |value| return allocator.dupe(u8, value);
     if (nonEmpty(getenv("SMITHERS_SESSION_SOCKET"))) |value| return allocator.dupe(u8, value);
-    if (nonEmpty(getenv("XDG_RUNTIME_DIR"))) |xdg| return std.fs.path.join(allocator, &.{ xdg, "smithers-sessions.sock" });
+    if (nonEmpty(getenv("XDG_RUNTIME_DIR"))) |xdg| {
+        return std.fs.path.join(allocator, &.{ xdg, "smithers-sessions.sock" });
+    }
     if (nonEmpty(getenv("HOME"))) |home| return std.fs.path.join(allocator, &.{ home, ".smithers", "sessions.sock" });
     return std.fmt.allocPrint(allocator, "/tmp/zmux-{d}/sessions.sock", .{sys.geteuid()});
 }
@@ -67,6 +83,7 @@ pub fn absolutize(allocator: Allocator, path: []const u8) Error![]u8 {
     }
     // "." or "./" names the directory itself, which can never be a socket.
     if (relative.len == 0 or std.mem.eql(u8, relative, ".")) return error.EmptySocketPath;
+    assert(!std.mem.startsWith(u8, relative, "./"));
 
     var cwd_buf: [std.posix.PATH_MAX]u8 = undefined;
     const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.CurrentDirUnavailable;
@@ -112,6 +129,7 @@ fn trimTrailingSlashes(path: []const u8) []const u8 {
 pub fn processEnv(name: []const u8) ?[]const u8 {
     var buf: [128]u8 = undefined;
     if (name.len >= buf.len) return null;
+    assert(name.len < buf.len);
     @memcpy(buf[0..name.len], name);
     buf[name.len] = 0;
     const value = std.c.getenv(buf[0..name.len :0].ptr) orelse return null;
@@ -290,4 +308,121 @@ test "processEnv reads the process environment" {
     if (std.c.getenv("PATH")) |raw| {
         try std.testing.expectEqualStrings(std.mem.sliceTo(raw, 0), processEnv("PATH").?);
     }
+}
+
+test "resolve rejects an override that names only the current directory" {
+    try std.testing.expectError(error.EmptySocketPath, resolve(std.testing.allocator, "./", TestEnv.get));
+    try std.testing.expectError(error.EmptySocketPath, resolve(std.testing.allocator, ".//.", TestEnv.get));
+}
+
+test "resolve rejects NUL bytes in an override and in the environment" {
+    defer TestEnv.reset();
+    TestEnv.reset();
+    try std.testing.expectError(error.SocketPathContainsNul, resolve(std.testing.allocator, "/a\x00b", TestEnv.get));
+    TestEnv.zmux_socket = "/tmp/a\x00.sock";
+    try std.testing.expectError(error.SocketPathContainsNul, resolve(std.testing.allocator, null, TestEnv.get));
+}
+
+test "resolve rejects an override that ends in a slash" {
+    try std.testing.expectError(error.NoSocketDirectory, resolve(std.testing.allocator, "/tmp/dir/", TestEnv.get));
+}
+
+test "resolve joins XDG_RUNTIME_DIR with a trailing slash without doubling it" {
+    defer TestEnv.reset();
+    TestEnv.reset();
+    TestEnv.xdg_runtime_dir = "/run/user/7/";
+    try expectResolved("/run/user/7/smithers-sessions.sock", null);
+}
+
+test "resolve prefers SMITHERS_SESSION_SOCKET over XDG when ZMUX_SOCKET is empty" {
+    defer TestEnv.reset();
+    TestEnv.reset();
+    TestEnv.zmux_socket = "";
+    TestEnv.smithers_socket = "/s/smithers.sock";
+    TestEnv.xdg_runtime_dir = "/run/user/7";
+    TestEnv.home = "/home/u";
+    try expectResolved("/s/smithers.sock", null);
+}
+
+test "resolve rejects a derived XDG path past sun_path" {
+    defer TestEnv.reset();
+    TestEnv.reset();
+    var dir: [sys.max_unix_path_len]u8 = @splat('d');
+    dir[0] = '/';
+    TestEnv.xdg_runtime_dir = &dir;
+    try std.testing.expectError(error.SocketPathTooLong, resolve(std.testing.allocator, null, TestEnv.get));
+}
+
+test "resolve accepts an override exactly at the sun_path limit" {
+    var at_limit: [sys.max_unix_path_len]u8 = @splat('s');
+    at_limit[0] = '/';
+    try expectResolved(&at_limit, &at_limit);
+}
+
+test "resolve propagates allocation failure at every allocation without leaking" {
+    defer TestEnv.reset();
+    TestEnv.reset();
+    TestEnv.home = "/home/u";
+    var fail_index: usize = 0;
+    while (fail_index < 2) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        try std.testing.expectError(error.OutOfMemory, resolve(failing.allocator(), null, TestEnv.get));
+    }
+    var enough = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    const path = try resolve(enough.allocator(), null, TestEnv.get);
+    defer enough.allocator().free(path);
+    try std.testing.expectEqualStrings("/home/u/.smithers/sessions.sock", path);
+}
+
+test "absolutize drops only leading ./ segments and keeps inner ones" {
+    const allocator = std.testing.allocator;
+    const inner = try absolutize(allocator, "a/./b.sock");
+    defer allocator.free(inner);
+    try std.testing.expect(std.mem.endsWith(u8, inner, "/a/./b.sock"));
+
+    const repeated = try absolutize(allocator, "./././c.sock");
+    defer allocator.free(repeated);
+    try std.testing.expect(std.mem.endsWith(u8, repeated, "/c.sock"));
+    try std.testing.expect(std.mem.indexOf(u8, repeated, "/./") == null);
+
+    try std.testing.expectError(error.EmptySocketPath, absolutize(allocator, ".///"));
+    try std.testing.expectError(error.EmptySocketPath, absolutize(allocator, "././."));
+}
+
+test "absolutize checks NUL before treating a path as absolute" {
+    try std.testing.expectError(error.SocketPathContainsNul, absolutize(std.testing.allocator, "/abs\x00"));
+    try std.testing.expectError(error.SocketPathContainsNul, absolutize(std.testing.allocator, "\x00"));
+}
+
+test "validate reports errors in a fixed precedence order" {
+    try std.testing.expectError(error.SocketPathContainsNul, validate("rel\x00/"));
+    try std.testing.expectError(error.NoSocketDirectory, validate("/"));
+    try std.testing.expectError(error.NoSocketDirectory, validate("/a//"));
+
+    var long_dir: [sys.max_unix_path_len + 8]u8 = @splat('s');
+    long_dir[0] = '/';
+    long_dir[long_dir.len - 1] = '/';
+    try std.testing.expectError(error.NoSocketDirectory, validate(&long_dir));
+}
+
+test "isDefaultManaged ignores an empty HOME and paths with no parent" {
+    defer TestEnv.reset();
+    TestEnv.reset();
+    TestEnv.home = "";
+    try std.testing.expect(!isDefaultManaged("/.smithers/sessions.sock", TestEnv.get));
+    try std.testing.expect(!isDefaultManaged("/", TestEnv.get));
+    try std.testing.expect(!isDefaultManaged("sessions.sock", TestEnv.get));
+}
+
+test "isDefaultManaged matches a HOME/.smithers parent with a trailing slash" {
+    defer TestEnv.reset();
+    TestEnv.reset();
+    TestEnv.home = "/home/u";
+    try std.testing.expect(isDefaultManaged("/home/u/.smithers//sessions.sock", TestEnv.get));
+    try std.testing.expect(!isDefaultManaged("/home/u/.smithersx/sessions.sock", TestEnv.get));
+}
+
+test "processEnv returns null for a name that does not fit its buffer" {
+    const long_name: [128]u8 = @splat('P');
+    try std.testing.expect(processEnv(&long_name) == null);
 }
