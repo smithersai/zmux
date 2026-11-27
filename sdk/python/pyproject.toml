@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zmux"
+version = "0.4.0"
+description = "Official zero-dependency Python SDK for the zmux terminal session multiplexer"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+  { name = "Smithers AI" }
+]
+keywords = ["zmux", "tmux", "pty", "terminal", "multiplexer", "json-rpc"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Terminals",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/smithersai/zmux"
+Repository = "https://github.com/smithersai/zmux"
+Documentation = "https://smithersai.github.io/zmux/"
+Issues = "https://github.com/smithersai/zmux/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["zmux*"]
+
+[tool.setuptools.package-data]
+zmux = ["py.typed"]

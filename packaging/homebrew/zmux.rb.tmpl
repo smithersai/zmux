@@ -1,0 +1,47 @@
+# typed: false
+# frozen_string_literal: true
+
+class Zmux < Formula
+  desc "Terminal session multiplexer with JSON-RPC over UNIX sockets"
+  homepage "https://github.com/{{REPO}}"
+  version "{{VERSION}}"
+  license "MIT"
+
+  on_macos do
+    on_arm do
+      url "{{URL_MACOS_ARM64}}"
+      sha256 "{{SHA256_MACOS_ARM64}}"
+    end
+
+    on_intel do
+      url "{{URL_MACOS_X64}}"
+      sha256 "{{SHA256_MACOS_X64}}"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "{{URL_LINUX_ARM64}}"
+      sha256 "{{SHA256_LINUX_ARM64}}"
+    end
+
+    on_intel do
+      url "{{URL_LINUX_X64}}"
+      sha256 "{{SHA256_LINUX_X64}}"
+    end
+  end
+
+  def install
+    bin.install "zmux" if File.exist?("zmux")
+    bin.install "zmuxd" if File.exist?("zmuxd")
+    bin.install "zmux-connect" if File.exist?("zmux-connect")
+  end
+
+  test do
+    if (bin/"zmux").exist?
+      assert_match version.to_s, shell_output("#{bin}/zmux --version")
+    end
+    assert_match version.to_s, shell_output("#{bin}/zmuxd --version")
+    assert_match version.to_s, shell_output("#{bin}/zmux-connect --version")
+  end
+end

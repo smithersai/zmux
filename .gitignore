@@ -8,3 +8,6 @@ zig-out/
 .smithers/reports/
 .uphill/
 dist/
+__pycache__/
+*.pyc
+.pytest_cache/

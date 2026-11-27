@@ -1,0 +1,38 @@
+{
+  "name": "@smithers/zmux-cli",
+  "version": "0.4.0",
+  "description": "Zero-dependency npm and bunx CLI launcher for zmux with SHA-256 verified binary caching",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "zmux": "./bin/zmux.mjs"
+  },
+  "exports": {
+    ".": "./lib/launcher.mjs"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "test": "node --test test/launcher.test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/smithersai/zmux.git",
+    "directory": "sdk/cli-npm"
+  },
+  "homepage": "https://github.com/smithersai/zmux",
+  "keywords": [
+    "zmux",
+    "tmux",
+    "pty",
+    "terminal",
+    "multiplexer",
+    "cli"
+  ]
+}
