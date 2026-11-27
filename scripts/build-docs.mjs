@@ -444,6 +444,38 @@ ${renderMarkdown(mythicalMd)}
   )
   writeFileSync(join(OUT, "audit", "index.html"), auditHtml)
   writeFileSync(join(OUT, "audit", "report.json"), `${JSON.stringify(auditJson, null, 2)}\n`)
+  const mdLines = [
+    "# zmux Lighthouse Backpressure Audit Report",
+    "",
+    `- Overall score: **${auditJson.overallScore}/100**`,
+    `- Trust level: **${auditJson.trust?.trust || "untrusted"}** (${auditJson.trust?.cacheMode || "read-only"} cache on \`build.smithers.sh\`)`,
+    `- Generated at: \`${auditJson.generatedAt || ""}\``,
+    "",
+    "## Category Scores",
+    "",
+    "| Category | Score | Band | Passing Metrics |",
+    "| --- | ---: | --- | ---: |"
+  ]
+  for (const cat of auditJson.categories ?? []) {
+    const metrics = Array.isArray(cat.metrics) ? cat.metrics : []
+    const passing = metrics.filter((m) => typeof m.score === "number" && m.score >= 90).length
+    mdLines.push(`| ${cat.title} | ${cat.score}/100 | ${cat.band} | ${passing}/${metrics.length} |`)
+  }
+  if (Array.isArray(auditJson.opportunities) && auditJson.opportunities.length > 0) {
+    mdLines.push(
+      "",
+      "## Top Opportunities",
+      "",
+      "| Est. Gain | Category | Metric | Target | Current | Goal |",
+      "| ---: | --- | --- | --- | --- | --- |"
+    )
+    for (const opp of auditJson.opportunities.slice(0, 12)) {
+      mdLines.push(
+        `| +${opp.gain} | ${opp.category} | \`${opp.metric}\` | \`${opp.item}\` | ${opp.value} | ${opp.target} |`
+      )
+    }
+  }
+  writeFileSync(join(OUT, "audit", "report.md"), `${mdLines.join("\n")}\n`)
   if (existsSync(join(ROOT, ".uphill", "report.html"))) {
     copyFileSync(join(ROOT, ".uphill", "report.html"), join(OUT, "audit", "uphill.html"))
   }
@@ -481,8 +513,16 @@ ${ARCHITECTURE_SVG}
     <p>Eight source-cited architecture pages covering PTY lifecycle, D1 to D6 protocol rules, daemon security, and mythical history.</p>
   </div>
   <div class="card">
+    <h3><a href="history/index.html">Mythical History Chronicle</a></h3>
+    <p>Five architectural eras from PR #1 to Smithers Cloud, plus the live commit timeline and stacked changeset pipeline.</p>
+  </div>
+  <div class="card">
     <h3><a href="playground/index.html">JSON-RPC Protocol Inspector</a></h3>
     <p>Validate UNIX-socket frames, atomic client.attach replay, scoped subscriptions, and scrollback ring offsets interactively.</p>
+  </div>
+  <div class="card">
+    <h3><a href="llms.txt">Cloud MCP &amp; llms.txt Index</a></h3>
+    <p>Machine-readable documentation index served to coding agents over OAuth 2.1 + PKCE at smithers.sh/smithersai/zmux/mcp.</p>
   </div>
 </div>
 

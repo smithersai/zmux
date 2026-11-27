@@ -4,12 +4,18 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-IzFZBsR5Qu82fQSTkTZR+2Ks25YYI8Myg9lfP4DzrMY='; style-src 'sha256-txs/4a3I+B59uPjeCcgMudIWMK+q7bXFA4vAJ6Y9n3k='; base-uri 'none'; form-action 'none'; connect-src 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-155tCVbAKr7/iwbD3cGrZ8QtBeso34np4tt7/anQU3o='; style-src 'sha256-/YDHkAGIYvTqm2dGlcd2zbL8GKsQed9AjsEWa0Uq6Cs='; base-uri 'none'; form-action 'none'; connect-src 'none'">
 <title>zmux Protocol &amp; Ring-Buffer Playground</title>
 <style>
 :root { color-scheme: light dark; font: 14.5px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-body { margin: 0; padding: clamp(16px, 3vw, 32px); background: Canvas; color: CanvasText; }
-main { max-width: 920px; margin: 0 auto; display: grid; gap: 18px; }
+body { margin: 0; padding: 0; background: Canvas; color: CanvasText; }
+.site-nav { position: sticky; top: 0; z-index: 10; background: Canvas; border-bottom: 1px solid GrayText; }
+.site-nav-inner { max-width: 1040px; margin: 0 auto; padding: 12px 20px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+.brand { font-weight: 800; font-size: 16px; text-decoration: none; color: CanvasText; letter-spacing: -0.02em; }
+.site-nav-links { display: flex; gap: 16px; flex-wrap: wrap; font-size: 14px; }
+.site-nav-links a { color: GrayText; text-decoration: none; font-weight: 500; }
+.site-nav-links a:hover, .site-nav-links a.active { color: LinkText; }
+main { max-width: 920px; margin: 0 auto; padding: clamp(16px, 3vw, 32px); display: grid; gap: 18px; }
 header { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 10px; }
 h1 { margin: 0; font-size: clamp(22px, 4vw, 32px); letter-spacing: -0.02em; }
 .badge { font-family: ui-monospace, monospace; font-size: 12px; padding: 3px 9px; border: 1px solid GrayText; border-radius: 999px; }
@@ -18,8 +24,10 @@ h1 { margin: 0; font-size: clamp(22px, 4vw, 32px); letter-spacing: -0.02em; }
 .preset-btn { font: 12.5px ui-monospace, monospace; padding: 5px 10px; border-radius: 8px; border: 1px solid GrayText; background: ButtonFace; color: ButtonText; cursor: pointer; }
 .preset-btn:hover { opacity: 0.88; }
 label { display: grid; gap: 6px; font-weight: 600; }
+.field-gap { margin-top: 10px; }
 textarea, select, input { font: 13px/1.45 ui-monospace, monospace; padding: 9px 10px; border: 1px solid GrayText; border-radius: 8px; background: Field; color: FieldText; width: 100%; box-sizing: border-box; }
 textarea { min-height: 92px; resize: vertical; }
+textarea#chunks { min-height: 132px; }
 .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
 .actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 button.primary { font: inherit; font-weight: 700; padding: 8px 18px; border-radius: 8px; border: 1px solid GrayText; background: ButtonFace; color: ButtonText; cursor: pointer; }
@@ -30,6 +38,21 @@ ul.notes { margin: 0; padding-left: 18px; display: grid; gap: 4px; font-size: 13
 </style>
 </head>
 <body>
+<nav class="site-nav" id="site-nav" aria-label="zmux documentation">
+  <div class="site-nav-inner">
+    <a class="brand" href="../index.html">zmux</a>
+    <div class="site-nav-links">
+      <a href="../index.html">Overview</a>
+      <a href="../wiki/index.html">Engineering wiki</a>
+      <a href="../history/index.html">Mythical history</a>
+      <a href="../audit/index.html">Lighthouse audit</a>
+      <a class="active" href="./index.html">Protocol inspector</a>
+      <a href="../llms.txt">llms.txt</a>
+      <a href="https://smithers.sh/smithersai/zmux" target="_blank" rel="noopener">Smithers Cloud</a>
+      <a href="https://github.com/smithersai/zmux" target="_blank" rel="noopener">GitHub</a>
+    </div>
+  </div>
+</nav>
 <main>
   <header>
     <div>
@@ -62,7 +85,7 @@ ul.notes { margin: 0; padding-left: 18px; display: grid; gap: 4px; font-size: 13
         <button type="button" class="preset-btn" data-preset="dup">DuplicateSessionName</button>
         <button type="button" class="preset-btn" data-preset="badjson">Malformed JSON (-32700)</button>
       </div>
-      <label style="margin-top:10px">Single-line JSON-RPC Frame
+      <label class="field-gap">Single-line JSON-RPC Frame
         <textarea id="frame" spellcheck="false" autocomplete="off">{"jsonrpc":"2.0","id":1,"method":"client.attach","params":{"target":"work","createIfMissing":true,"rows":40,"cols":120}}</textarea>
       </label>
     </div>
@@ -224,7 +247,17 @@ modeEl.addEventListener("change", () => {
   rpcPanel.hidden = isRing;
   ringPanel.hidden = !isRing;
   capWrap.hidden = !isRing;
+  runBtn.textContent = isRing ? "Simulate Replay" : "Run Frame";
+  resultCard.hidden = true;
+  statusEl.textContent = isRing
+    ? "Ready (scrollback ring-buffer replay simulator)"
+    : "Ready (local deterministic wire verifier)";
 });
+
+const siteNav = document.getElementById("site-nav");
+if (parent !== window && siteNav) {
+  siteNav.hidden = true;
+}
 
 for (const btn of document.querySelectorAll(".preset-btn")) {
   btn.addEventListener("click", () => {

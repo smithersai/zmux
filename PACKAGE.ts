@@ -262,6 +262,7 @@ const docsSite = S.Shell.Build({
     S.file("AGENTS.md"),
     S.file(".agents/uphill/rules.md"),
     S.file(".smithers/coding-project.json"),
+    S.file(".smithers/home.json"),
     S.file(".smithers/trust-policy.json"),
     S.file(".smithers/views/backpressure/run.mjs"),
     S.file(".smithers/views/backpressure/index.html"),

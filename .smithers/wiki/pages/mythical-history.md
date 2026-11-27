@@ -5,18 +5,18 @@
 ## Five Eras of zmux
 
 ```text
-  Jun 2026                 Jul 2026                  Nov 22, 2026              Nov 23-24, 2026            Nov 26, 2026
-  ========                 ========                  ============              ===============            ============
-  [v0.1.0]                 [Audit A-G]               [v0.2.0 -> v0.3.0]        [v0.4.0 Hardening]         [Cloud Factory]
-  Genesis & PR #1          7 Security &              Zig 0.17.1 std.Io         Decisions D1-D6            Uphill Lighthouse
-  350 ms -> 1.6 ms         Concurrency Batches       Linux /proc & O_PATH      32+ Fuzzers & 85+ Bench    Wiki, MCP & Trust
+  Jun 2026      Jul 2026       Nov 22, 2026    Nov 23-24     Nov 26, 2026
+  ========      ========       ============    =========     ============
+  v0.1.0        Audit A-G      v0.2 -> v0.3    v0.4.0        Cloud Factory
+  Genesis       7 Security     Zig 0.17.1      D1-D6 Wire    Lighthouse
+  350->1.6 ms   Batches        std.Io & /proc  Fuzz + Bench  Wiki & MCP
 ```
 
-### Era I: Genesis & The 218x Latency Drop (`v0.1.0`, June 2026)
+### Era I: Genesis and the 218x Latency Drop (v0.1.0, June 2026)
 
 `zmux` started with a direct architectural goal: keep `tmux(1)`'s long-lived server-owns-the-PTY model (`server.c`, `client.c`, `proc.c`, `spawn.c`) while replacing opaque format strings and CLI screen-scraping with a structured JSON-RPC 2.0 protocol over a UNIX domain socket. Community PR #1 by `@patcito` replaced coarse polling in `zmux-connect` and fixed the open-or-create attach path, dropping interactive keystroke latency from **~350 ms down to ~1.6 ms**.
 
-### Era II: The Seven Audit Batches (`v0.2.0` & `v0.2.1`, July to Nov 2026)
+### Era II: The Seven Audit Batches (v0.2.0 and v0.2.1, July to Nov 2026)
 
 Seven systematic audit sweeps (`90e0b5d0` through `4e7071e6`) plus November hardening (`9e435dcb`, `d088ddb0`, `8fc26861`, `6f48be5a`, `97cce865`) locked down OS-level safety:
 - Advisory `flock(2)` startup locking so concurrent daemons never unlink a live socket.
@@ -24,11 +24,11 @@ Seven systematic audit sweeps (`90e0b5d0` through `4e7071e6`) plus November hard
 - Same-UID peer credential verification via `SO_PEERCRED` (Linux) and `getpeereid(3)` (macOS).
 - Linux `/proc` foreground inspection, `POLL.HUP` EOF line draining, and replacing `O_PATH` with `O_RDONLY | O_DIRECTORY | O_NOFOLLOW` so `fchmod(2)` succeeds reliably under `umask 0022`.
 
-### Era III: The Zig 0.17 `std.Io` Crossing (`v0.3.0`, Nov 22, 2026)
+### Era III: The Zig 0.17 std.Io Crossing (v0.3.0, Nov 22, 2026)
 
 In commit `335234ec`, `zmux` migrated to **Zig 0.17.1** and explicit `std.Io` injection across `Server.init`, `NativeSession.create`, and `SessionManager.init`. All raw POSIX syscalls moved into `src/sys.zig`, heap allocations between `fork(2)` and `exec` were eliminated, `MSG_NOSIGNAL` / `SO_NOSIGPIPE` removed `SIGPIPE` crash hazards for embedders, and idle timeouts moved to the monotonic clock.
 
-### Era IV: Wire Contract D1-D6, Coverage-Guided Fuzzing & Incremental Benchmarks (`v0.4.0`, Nov 22-24, 2026)
+### Era IV: Wire Contract D1-D6, Fuzzing, and Benchmarks (v0.4.0, Nov 22-24, 2026)
 
 Three multi-track review rounds (`bb5bc114` through `693d92a0`) formalized the `v0.4.0` wire contract (Decisions D1 through D6), added a 32-target LLVM SanitizerCoverage fuzz suite (`test/fuzz/`) plus live-PTY chaos fuzzers, built 85+ ReleaseFast benchmarks (`bench/baseline.json`, with 64-byte ring-buffer appends at ~5.9 ns median and 58 GB/s throughput), added privileged Ubuntu foreign-UID CI tests, and wired the first incremental `PACKAGE.ts` build graph to `https://build.smithers.sh`.
 

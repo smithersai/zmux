@@ -125,7 +125,7 @@
           "title": "zmux",
           "tagline": "tmux-style PTY session multiplexer in Zig with a structured JSON-RPC UNIX socket protocol.",
           "text": "A long-lived daemon owns sessions, windows, panes, and PTYs so desktop apps, web terminals, and agents attach and replay scrollback without shelling out to tmux.",
-          "install": "zig fetch --save=zmux git+https://github.com/smithersai/zmux",
+          "install": "gh repo clone smithersai/zmux",
           "actions": [
             {
               "label": "Documentation",

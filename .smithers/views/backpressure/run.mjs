@@ -188,7 +188,7 @@ function evaluateFactoryTrustCategory() {
 
 function readUphillReport(allowRefresh) {
   const reportPath = join(ROOT, ".uphill", "report.json")
-  if (allowRefresh) {
+  if (allowRefresh || !existsSync(reportPath)) {
     const candidates = [
       process.env.UPHILL_BIN,
       join(process.env.HOME ?? "", ".uphill", "bin", "uphill"),

@@ -68,4 +68,5 @@ test("index.html CSP script-src and style-src SHA-256 hashes match inline blocks
 
   assert.ok(html.includes(`style-src 'sha256-${styleHash}'`), `CSP style-src hash mismatch; expected sha256-${styleHash}`)
   assert.ok(html.includes(`script-src 'sha256-${scriptHash}'`), `CSP script-src hash mismatch; expected sha256-${scriptHash}`)
+  assert.ok(!/\sstyle=/.test(html), "inline style= attributes violate strict style-src hash CSP")
 })
