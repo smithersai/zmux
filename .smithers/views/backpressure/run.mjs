@@ -234,7 +234,7 @@ function deriveOpportunities(categories) {
           value: formatMetricVal(worst.value, m.unit),
           target: formatMetricVal(worst.target ?? m.target ?? "pass", m.unit)
         })
-      } else {
+      } else if (m.score < 90) {
         derived.push({
           gain,
           category: cat.title,

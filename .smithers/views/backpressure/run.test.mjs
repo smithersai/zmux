@@ -62,3 +62,11 @@ test("telemetry includes full benchmark list from bench/baseline.json", () => {
   assert.ok(report.telemetry.benchmarks.length >= 90)
   assert.ok(report.telemetry.benchmarkSuiteCount >= 13)
 })
+
+test("all-green Lighthouse categories do not emit backwards passing opportunities", () => {
+  const report = runAudit({})
+  const allGreen = report.categories.every((c) => c.score >= 90)
+  if (allGreen) {
+    assert.equal(report.opportunities.length, 0)
+  }
+})
