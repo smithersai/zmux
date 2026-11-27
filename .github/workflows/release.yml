@@ -207,19 +207,14 @@ jobs:
             dist/SHA256SUMS
           fail_on_unmatched_files: true
 
-  docs:
-    name: Publish Docs, Wiki, llms.txt, and Lighthouse Audit
+  docs-build:
+    name: Build Docs, Wiki, llms.txt, and Lighthouse Audit
     needs: [plan]
     if: needs.plan.outputs.should_publish_docs == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -266,6 +261,18 @@ jobs:
         with:
           path: dist/site
 
+  docs-deploy:
+    name: Deploy Docs to GitHub Pages
+    needs: [docs-build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
