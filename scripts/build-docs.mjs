@@ -456,6 +456,7 @@ input?.addEventListener("input", () => {
     )
     .join("\n")
   const mythicalMd = readFileSync(join(ROOT, ".smithers/wiki/pages/mythical-history.md"), "utf8")
+    .replace(/^#\s+[^\n]+\n+/, "")
   writeFileSync(
     join(OUT, "history", "index.html"),
     pageShell({
@@ -464,7 +465,6 @@ input?.addEventListener("input", () => {
       active: "history",
       prefix: "..",
       body: `<h1>zmux Mythical History</h1>
-<p>How TODOs become stacked Changes on Smithers Cloud, land through trusted gates, and mirror to GitHub for automated releases and docs publishing.</p>
 ${renderMarkdown(mythicalMd)}
 <h2>Commit chronicle</h2>
 <ul class="timeline">${timelineItems || "<li>No recorded commits yet.</li>"}</ul>`
@@ -489,25 +489,25 @@ ${renderMarkdown(mythicalMd)}
     "",
     "## Category Scores",
     "",
-    "| Category | Score | Band | Passing Metrics |",
-    "| --- | ---: | --- | ---: |"
+    "| Category | Score | Passing |",
+    "| --- | ---: | ---: |"
   ]
   for (const cat of auditJson.categories ?? []) {
     const metrics = Array.isArray(cat.metrics) ? cat.metrics : []
     const passing = metrics.filter((m) => typeof m.score === "number" && m.score >= 90).length
-    mdLines.push(`| ${cat.title} | ${cat.score}/100 | ${cat.band} | ${passing}/${metrics.length} |`)
+    mdLines.push(`| ${cat.title} | ${cat.score}/100 | ${passing}/${metrics.length} |`)
   }
   if (Array.isArray(auditJson.opportunities) && auditJson.opportunities.length > 0) {
     mdLines.push(
       "",
       "## Top Opportunities",
       "",
-      "| Est. Gain | Category | Metric | Target | Current | Goal |",
-      "| ---: | --- | --- | --- | --- | --- |"
+      "| Gain | Metric | Target | Value |",
+      "| ---: | --- | --- | --- |"
     )
     for (const opp of auditJson.opportunities.slice(0, 12)) {
       mdLines.push(
-        `| +${opp.gain} | ${opp.category} | \`${opp.metric}\` | \`${opp.item}\` | ${opp.value} | ${opp.target} |`
+        `| +${opp.gain} | \`${opp.metric}\` | \`${opp.item}\` | ${opp.value} -> ${opp.target} |`
       )
     }
   }
