@@ -1,0 +1,45 @@
+{
+  "name": "@smithers/zmux",
+  "version": "0.5.0",
+  "description": "Zero-dependency TypeScript SDK, xterm.js adapter, and authenticated WebSocket/HTTP/SSE bridge for zmux",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./xterm": "./src/xterm.ts",
+    "./bridge": "./src/bridge.ts"
+  },
+  "bin": {
+    "zmux-ws": "./src/bridge-cli.ts"
+  },
+  "files": [
+    "src",
+    "demo",
+    "README.md",
+    "package.json",
+    "tsconfig.json"
+  ],
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "scripts": {
+    "test": "bun test test/",
+    "bridge": "bun src/bridge-cli.ts"
+  },
+  "keywords": [
+    "zmux",
+    "terminal",
+    "pty",
+    "multiplexer",
+    "tmux",
+    "json-rpc",
+    "openrpc",
+    "xterm",
+    "websocket"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/smithersai/zmux",
+    "directory": "sdk/ts"
+  }
+}

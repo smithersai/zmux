@@ -1,0 +1,662 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>zmux Web Terminal Demo</title>
+    <style>
+      :root {
+        --bg: #0b0e14;
+        --panel: #111622;
+        --panel-alt: #161d2d;
+        --border: #243046;
+        --text: #e6edf7;
+        --muted: #8b9bb4;
+        --accent: #3b82f6;
+        --accent-hover: #60a5fa;
+        --ok: #22c55e;
+        --warn: #f59e0b;
+        --err: #ef4444;
+        --mono: ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+        --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: var(--bg);
+        color: var(--text);
+        font-family: var(--sans);
+        font-size: 13px;
+      }
+      .app {
+        display: grid;
+        grid-template-rows: auto 1fr;
+        height: 100%;
+      }
+      header {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 14px;
+        background: var(--panel);
+        border-bottom: 1px solid var(--border);
+      }
+      .brand {
+        font-weight: 700;
+        font-size: 15px;
+        letter-spacing: 0.02em;
+        margin-right: 6px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 3px 9px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 600;
+        background: var(--panel-alt);
+        border: 1px solid var(--border);
+        color: var(--muted);
+      }
+      .pill .dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--muted);
+      }
+      .pill.connected { color: #bbf7d0; border-color: #166534; }
+      .pill.connected .dot { background: var(--ok); }
+      .pill.reconnecting { color: #fde68a; border-color: #92400e; }
+      .pill.reconnecting .dot { background: var(--warn); }
+      .pill.error { color: #fecaca; border-color: #991b1b; }
+      .pill.error .dot { background: var(--err); }
+      .connect-form {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+        flex: 1;
+      }
+      input, button, select {
+        font-family: inherit;
+        font-size: 12px;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        background: var(--bg);
+        color: var(--text);
+        padding: 6px 9px;
+      }
+      input:focus, button:focus {
+        outline: none;
+        border-color: var(--accent);
+      }
+      input.url { width: 220px; font-family: var(--mono); }
+      input.token { width: 200px; font-family: var(--mono); }
+      input.target { width: 120px; font-family: var(--mono); }
+      button {
+        cursor: pointer;
+        background: var(--panel-alt);
+        font-weight: 600;
+      }
+      button:hover { border-color: var(--accent); }
+      button.primary {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: #fff;
+      }
+      button.primary:hover { background: var(--accent-hover); }
+      button.danger {
+        border-color: #7f1d1d;
+        color: #fca5a5;
+      }
+      main {
+        display: grid;
+        grid-template-columns: 240px 1fr 340px;
+        min-height: 0;
+      }
+      @media (max-width: 1080px) {
+        main { grid-template-columns: 200px 1fr; }
+        .inspector { display: none; }
+      }
+      .sidebar, .inspector {
+        background: var(--panel);
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+      }
+      .sidebar { border-right: 1px solid var(--border); }
+      .inspector { border-left: 1px solid var(--border); }
+      .pane-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 8px 12px;
+        font-weight: 600;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+        border-bottom: 1px solid var(--border);
+      }
+      .session-list {
+        overflow-y: auto;
+        padding: 8px;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        flex: 1;
+      }
+      .session-item {
+        padding: 8px 10px;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        background: var(--panel-alt);
+        cursor: pointer;
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+      }
+      .session-item:hover { border-color: var(--accent); }
+      .session-item.active {
+        border-color: var(--accent);
+        background: rgba(59, 130, 246, 0.14);
+      }
+      .session-title { font-weight: 600; color: var(--text); }
+      .session-meta { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+      .terminal-stage {
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        background: #06080d;
+      }
+      .terminal-toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px;
+        padding: 7px 12px;
+        background: var(--panel-alt);
+        border-bottom: 1px solid var(--border);
+      }
+      .terminal-toolbar .meta {
+        margin-left: auto;
+        font-family: var(--mono);
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .terminal-view {
+        flex: 1;
+        margin: 0;
+        padding: 12px 14px;
+        overflow-y: auto;
+        font-family: var(--mono);
+        font-size: 13px;
+        line-height: 1.42;
+        color: #dbe7ff;
+        white-space: pre-wrap;
+        word-break: break-word;
+        outline: none;
+      }
+      .terminal-view:focus {
+        box-shadow: inset 0 0 0 1px rgba(59, 130, 246, 0.45);
+      }
+      .input-bar {
+        display: flex;
+        gap: 8px;
+        padding: 8px 12px;
+        background: var(--panel);
+        border-top: 1px solid var(--border);
+      }
+      .input-bar input {
+        flex: 1;
+        font-family: var(--mono);
+      }
+      .rpc-log {
+        flex: 1;
+        overflow-y: auto;
+        padding: 8px;
+        font-family: var(--mono);
+        font-size: 11px;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .rpc-entry {
+        padding: 6px 8px;
+        border-radius: 6px;
+        background: var(--bg);
+        border: 1px solid var(--border);
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+      .rpc-entry.tx { border-left: 3px solid var(--accent); }
+      .rpc-entry.rx { border-left: 3px solid var(--ok); }
+      .rpc-entry.ev { border-left: 3px solid var(--warn); }
+      .rpc-entry.err { border-left: 3px solid var(--err); }
+      .rpc-tag {
+        font-weight: 700;
+        font-size: 10px;
+        text-transform: uppercase;
+        color: var(--muted);
+        margin-bottom: 3px;
+      }
+      .rpc-composer {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        padding: 8px;
+        border-top: 1px solid var(--border);
+      }
+      .rpc-composer textarea {
+        font-family: var(--mono);
+        font-size: 11px;
+        background: var(--bg);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 6px;
+        resize: vertical;
+        min-height: 54px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <header>
+        <div class="brand">
+          <span>zmux</span>
+          <span id="status-pill" class="pill"><span class="dot"></span><span id="status-text">disconnected</span></span>
+        </div>
+        <form id="connect-form" class="connect-form">
+          <input id="ws-url" class="url" type="text" placeholder="ws://127.0.0.1:7681/ws" value="ws://127.0.0.1:7681/ws" />
+          <input id="ws-token" class="token" type="password" placeholder="Bearer token" autocomplete="off" />
+          <input id="ws-target" class="target" type="text" placeholder="Session name" value="demo" />
+          <button type="submit" class="primary" id="btn-connect">Connect</button>
+          <button type="button" id="btn-disconnect">Disconnect</button>
+        </form>
+      </header>
+
+      <main>
+        <aside class="sidebar">
+          <div class="pane-header">
+            <span>Sessions &amp; Panes</span>
+            <button type="button" id="btn-refresh">Refresh</button>
+          </div>
+          <div id="session-list" class="session-list">
+            <div class="session-meta">Connect to zmux-ws to browse live sessions.</div>
+          </div>
+          <div class="rpc-composer">
+            <button type="button" id="btn-new-session">New Session</button>
+          </div>
+        </aside>
+
+        <section class="terminal-stage">
+          <div class="terminal-toolbar">
+            <button type="button" data-key="C-c">Ctrl-C</button>
+            <button type="button" data-key="C-d">Ctrl-D</button>
+            <button type="button" data-key="C-l">Ctrl-L</button>
+            <button type="button" id="btn-split-h">Split H</button>
+            <button type="button" id="btn-split-v">Split V</button>
+            <button type="button" id="btn-respawn">Respawn</button>
+            <button type="button" id="btn-clear">Clear View</button>
+            <span id="pane-meta" class="meta">no pane attached</span>
+          </div>
+          <pre id="terminal-view" class="terminal-view" tabindex="0">Connect to a running zmux-ws bridge to attach to a live PTY session.</pre>
+          <form id="cmd-form" class="input-bar">
+            <input id="cmd-input" type="text" placeholder="Type a command and press Enter (or click the terminal above for raw keystrokes)" />
+            <button type="submit" class="primary">Send</button>
+          </form>
+        </section>
+
+        <aside class="inspector">
+          <div class="pane-header">
+            <span>JSON-RPC Inspector</span>
+            <button type="button" id="btn-clear-log">Clear</button>
+          </div>
+          <div id="rpc-log" class="rpc-log"></div>
+          <form id="rpc-form" class="rpc-composer">
+            <input id="rpc-method" type="text" value="daemon.ping" placeholder="RPC method" />
+            <textarea id="rpc-params">{}</textarea>
+            <button type="submit">Send RPC</button>
+          </form>
+        </aside>
+      </main>
+    </div>
+
+    <script type="module">
+      const statusPill = document.getElementById("status-pill");
+      const statusText = document.getElementById("status-text");
+      const urlInput = document.getElementById("ws-url");
+      const tokenInput = document.getElementById("ws-token");
+      const targetInput = document.getElementById("ws-target");
+      const sessionListEl = document.getElementById("session-list");
+      const termEl = document.getElementById("terminal-view");
+      const paneMetaEl = document.getElementById("pane-meta");
+      const rpcLogEl = document.getElementById("rpc-log");
+
+      if (location.protocol === "http:" || location.protocol === "https:") {
+        const wsProto = location.protocol === "https:" ? "wss:" : "ws:";
+        urlInput.value = `${wsProto}//${location.host}/ws`;
+      }
+
+      const paramsFromHash = new URLSearchParams(location.hash.replace(/^#/, ""));
+      if (paramsFromHash.get("token")) tokenInput.value = paramsFromHash.get("token");
+      if (paramsFromHash.get("target")) targetInput.value = paramsFromHash.get("target");
+
+      let ws = null;
+      let nextRpcId = 1;
+      const pending = new Map();
+      let attached = { clientId: "", paneId: "", sessionId: "", generation: 0, nextOffset: null };
+      const decoder = new TextDecoder("utf-8", { fatal: false });
+      const encoder = new TextEncoder();
+
+      function setStatus(state, label) {
+        statusPill.className = `pill ${state}`;
+        statusText.textContent = label || state;
+      }
+
+      function stripAnsi(text) {
+        return text
+          .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+          .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "");
+      }
+
+      function decodeB64(b64) {
+        if (!b64) return new Uint8Array(0);
+        const bin = atob(b64);
+        const out = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i += 1) out[i] = bin.charCodeAt(i);
+        return out;
+      }
+
+      function encodeB64(bytes) {
+        let bin = "";
+        for (let i = 0; i < bytes.length; i += 1) bin += String.fromCharCode(bytes[i]);
+        return btoa(bin);
+      }
+
+      function appendTerminal(bytes) {
+        if (!bytes || bytes.length === 0) return;
+        const text = stripAnsi(decoder.decode(bytes, { stream: true }));
+        termEl.textContent += text;
+        if (termEl.textContent.length > 200000) {
+          termEl.textContent = termEl.textContent.slice(-150000);
+        }
+        termEl.scrollTop = termEl.scrollHeight;
+      }
+
+      function logRpc(kind, label, payload) {
+        const entry = document.createElement("div");
+        entry.className = `rpc-entry ${kind}`;
+        const tag = document.createElement("div");
+        tag.className = "rpc-tag";
+        tag.textContent = `${label} · ${new Date().toLocaleTimeString()}`;
+        const body = document.createElement("div");
+        const raw = typeof payload === "string" ? payload : JSON.stringify(payload);
+        body.textContent = raw.length > 420 ? `${raw.slice(0, 420)}...` : raw;
+        entry.append(tag, body);
+        rpcLogEl.appendChild(entry);
+        while (rpcLogEl.children.length > 80) rpcLogEl.removeChild(rpcLogEl.firstChild);
+        rpcLogEl.scrollTop = rpcLogEl.scrollHeight;
+      }
+
+      function rpc(method, params = {}) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          return Promise.reject(new Error("WebSocket is not connected"));
+        }
+        const id = nextRpcId++;
+        const frame = { jsonrpc: "2.0", id, method, params };
+        logRpc("tx", `TX #${id} ${method}`, params);
+        return new Promise((resolve, reject) => {
+          pending.set(id, { method, resolve, reject });
+          ws.send(JSON.stringify(frame));
+        });
+      }
+
+      function updatePaneMeta() {
+        if (!attached.paneId) {
+          paneMetaEl.textContent = "no pane attached";
+          return;
+        }
+        paneMetaEl.textContent =
+          `pane=${attached.paneId} gen=${attached.generation} off=${attached.nextOffset ?? 0}`;
+      }
+
+      async function refreshSnapshot() {
+        try {
+          const snap = await rpc("mux.snapshot", {});
+          renderSessions(snap);
+        } catch (err) {
+          logRpc("err", "snapshot error", err.message);
+        }
+      }
+
+      function renderSessions(snap) {
+        sessionListEl.innerHTML = "";
+        if (!snap.sessions || snap.sessions.length === 0) {
+          sessionListEl.innerHTML = `<div class="session-meta">No active sessions.</div>`;
+          return;
+        }
+        for (const sess of snap.sessions) {
+          for (const win of sess.windows) {
+            for (const pane of win.panes) {
+              const card = document.createElement("div");
+              card.className = `session-item ${pane.id === attached.paneId ? "active" : ""}`;
+              card.innerHTML = `
+                <div class="session-title">${sess.name} / ${pane.title}</div>
+                <div class="session-meta">${pane.id} · ${pane.state} · ${pane.cols}x${pane.rows}</div>
+              `;
+              card.addEventListener("click", () => attachTarget(pane.id, false));
+              sessionListEl.appendChild(card);
+            }
+          }
+        }
+      }
+
+      async function attachTarget(target, createIfMissing) {
+        if (attached.clientId) {
+          await rpc("client.detach", { clientId: attached.clientId }).catch(() => {});
+          attached = { clientId: "", paneId: "", sessionId: "", generation: 0, nextOffset: null };
+        }
+        const params = { paneId: target, rows: 32, cols: 100 };
+        if (createIfMissing) {
+          params.createIfMissing = { id: target, rows: 32, cols: 100 };
+        }
+        const res = await rpc("client.attach", params);
+        attached = {
+          clientId: res.clientId,
+          paneId: res.paneId,
+          sessionId: res.sessionId,
+          generation: res.generation,
+          nextOffset: res.replayEndOffset,
+        };
+        termEl.textContent = "";
+        appendTerminal(decodeB64(res.replayBase64));
+        updatePaneMeta();
+        await refreshSnapshot();
+      }
+
+      function disconnect() {
+        if (ws) {
+          ws.close(1000, "user disconnect");
+          ws = null;
+        }
+        attached = { clientId: "", paneId: "", sessionId: "", generation: 0, nextOffset: null };
+        updatePaneMeta();
+        setStatus("", "disconnected");
+      }
+
+      function connect() {
+        disconnect();
+        const url = urlInput.value.trim();
+        const token = tokenInput.value.trim();
+        const target = targetInput.value.trim() || "demo";
+        if (!url || !token) {
+          setStatus("error", "URL and token required");
+          return;
+        }
+        setStatus("reconnecting", "connecting");
+        ws = new WebSocket(url, ["zmux-v1", `zmux-token.${token}`]);
+
+        ws.onopen = async () => {
+          setStatus("connected", "connected");
+          try {
+            await rpc("daemon.ping", {});
+            await attachTarget(target, true);
+          } catch (err) {
+            logRpc("err", "attach failed", err.message);
+            setStatus("error", err.message);
+          }
+        };
+
+        ws.onmessage = (ev) => {
+          let msg;
+          try {
+            msg = JSON.parse(ev.data);
+          } catch {
+            return;
+          }
+          if ("id" in msg && ("result" in msg || "error" in msg)) {
+            const entry = pending.get(msg.id);
+            if (!entry) return;
+            pending.delete(msg.id);
+            if (msg.error) {
+              logRpc("err", `ERR #${msg.id} ${entry.method}`, msg.error);
+              entry.reject(new Error(`${msg.error.message} (${msg.error.data?.kind ?? msg.error.code})`));
+            } else {
+              logRpc("rx", `RX #${msg.id} ${entry.method}`, msg.result);
+              entry.resolve(msg.result);
+            }
+            return;
+          }
+          if (msg.method === "pane_output") {
+            const p = msg.params;
+            if (p.pane_id !== attached.paneId || p.generation < attached.generation) return;
+            if (p.generation > attached.generation) {
+              attached.generation = p.generation;
+              attached.nextOffset = null;
+            }
+            const raw = decodeB64(p.data_base64);
+            const prev = attached.nextOffset ?? p.offset;
+            const skip = Math.min(Math.max(0, prev - p.offset), raw.byteLength);
+            attached.nextOffset = Math.max(prev, p.offset + raw.byteLength);
+            if (skip < raw.byteLength) appendTerminal(raw.subarray(skip));
+            updatePaneMeta();
+            return;
+          }
+          if (msg.method) {
+            logRpc("ev", `EVENT ${msg.method}`, msg.params);
+            if (msg.method === "session_exited" || msg.method === "pane_respawned") {
+              void refreshSnapshot();
+            }
+          }
+        };
+
+        ws.onerror = () => setStatus("error", "transport error");
+        ws.onclose = (ev) => {
+          for (const [, entry] of pending) entry.reject(new Error("WebSocket closed"));
+          pending.clear();
+          if (statusText.textContent !== "disconnected") {
+            setStatus("error", `closed (${ev.code})`);
+          }
+        };
+      }
+
+      document.getElementById("connect-form").addEventListener("submit", (e) => {
+        e.preventDefault();
+        connect();
+      });
+      document.getElementById("btn-disconnect").addEventListener("click", disconnect);
+      document.getElementById("btn-refresh").addEventListener("click", refreshSnapshot);
+      document.getElementById("btn-clear").addEventListener("click", () => {
+        termEl.textContent = "";
+      });
+      document.getElementById("btn-clear-log").addEventListener("click", () => {
+        rpcLogEl.innerHTML = "";
+      });
+      document.getElementById("btn-new-session").addEventListener("click", async () => {
+        const name = `web-${Date.now().toString(36).slice(-4)}`;
+        await attachTarget(name, true).catch((err) => logRpc("err", "new session", err.message));
+      });
+      document.getElementById("btn-split-h").addEventListener("click", async () => {
+        if (!attached.paneId) return;
+        const h = await rpc("pane.split", { paneId: attached.paneId, axis: "horizontal" });
+        await attachTarget(h.paneId, false);
+      });
+      document.getElementById("btn-split-v").addEventListener("click", async () => {
+        if (!attached.paneId) return;
+        const h = await rpc("pane.split", { paneId: attached.paneId, axis: "vertical" });
+        await attachTarget(h.paneId, false);
+      });
+      document.getElementById("btn-respawn").addEventListener("click", async () => {
+        if (!attached.paneId) return;
+        await rpc("pane.respawn", { paneId: attached.paneId, kill: true });
+      });
+
+      for (const btn of document.querySelectorAll("[data-key]")) {
+        btn.addEventListener("click", () => {
+          if (!attached.paneId) return;
+          void rpc("session.sendKey", { sessionId: attached.paneId, key: btn.dataset.key });
+        });
+      }
+
+      document.getElementById("cmd-form").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const input = document.getElementById("cmd-input");
+        if (!attached.paneId) return;
+        const text = input.value;
+        input.value = "";
+        await rpc("session.send", { sessionId: attached.paneId, text, enter: true });
+      });
+
+      termEl.addEventListener("keydown", (e) => {
+        if (!attached.paneId || e.metaKey) return;
+        if (e.ctrlKey && e.key.length === 1 && /^[a-z]$/i.test(e.key)) {
+          e.preventDefault();
+          void rpc("session.sendKey", { sessionId: attached.paneId, key: `C-${e.key.toLowerCase()}` });
+          return;
+        }
+        const keyMap = {
+          Enter: "Enter",
+          Backspace: "Backspace",
+          Tab: "Tab",
+          Escape: "Escape",
+          ArrowUp: "ArrowUp",
+          ArrowDown: "ArrowDown",
+          ArrowLeft: "ArrowLeft",
+          ArrowRight: "ArrowRight",
+        };
+        if (keyMap[e.key]) {
+          e.preventDefault();
+          void rpc("session.sendKey", { sessionId: attached.paneId, key: keyMap[e.key] });
+          return;
+        }
+        if (e.key.length === 1) {
+          e.preventDefault();
+          void rpc("session.send", {
+            sessionId: attached.paneId,
+            dataBase64: encodeB64(encoder.encode(e.key)),
+          });
+        }
+      });
+
+      document.getElementById("rpc-form").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const method = document.getElementById("rpc-method").value.trim();
+        const raw = document.getElementById("rpc-params").value.trim() || "{}";
+        try {
+          const parsed = JSON.parse(raw);
+          await rpc(method, parsed);
+        } catch (err) {
+          logRpc("err", "custom rpc", err.message);
+        }
+      });
+    </script>
+  </body>
+</html>

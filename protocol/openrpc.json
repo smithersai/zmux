@@ -1,0 +1,2514 @@
+{
+  "openrpc": "1.3.2",
+  "info": {
+    "title": "zmux JSON-RPC Protocol",
+    "version": "0.4.0",
+    "description": "Canonical OpenRPC 1.3.2 specification for zmux. Covers all 28 v0.4.0 D1-D6 JSON-RPC methods, 9 server-to-client notifications, 6 error codes, 11 error kinds, and additive v0.5.0 and v0.6.0 extensions.",
+    "license": {
+      "name": "MIT",
+      "url": "https://github.com/smithersai/zmux/blob/main/LICENSE"
+    },
+    "contact": {
+      "name": "Smithers AI",
+      "url": "https://github.com/smithersai/zmux"
+    }
+  },
+  "x-zmux-protocol-version": "0.4.0",
+  "x-zmux-extensions-through": "0.6.0",
+  "x-zmux-framing": {
+    "transport": "ndjson-unix-socket",
+    "maxRequestBytes": 1048576,
+    "maxResponseBytes": 16777216,
+    "maxJsonDepth": 64,
+    "maxJsonNodes": 100000,
+    "attachReplayMaxBytes": 262144,
+    "captureMaxBytes": 4194304,
+    "broadcastQueueMaxBytes": 1048576,
+    "controlQueueMaxBytes": 4194304,
+    "defaultScrollbackBytes": 10485760,
+    "maxScrollbackBytes": 67108864
+  },
+  "servers": [
+    {
+      "name": "local-unix-socket",
+      "url": "unix://{socketPath}",
+      "summary": "Local UNIX domain socket served by zmuxd using newline-delimited JSON-RPC 2.0",
+      "variables": {
+        "socketPath": {
+          "default": "$HOME/.smithers/sessions.sock",
+          "description": "Resolved via override > ZMUX_SOCKET > SMITHERS_SESSION_SOCKET > XDG_RUNTIME_DIR/smithers-sessions.sock > HOME/.smithers/sessions.sock > /tmp/zmux-<uid>/sessions.sock"
+        }
+      }
+    },
+    {
+      "name": "zmux-ws-bridge",
+      "url": "ws://{host}:{port}/ws",
+      "summary": "Authenticated WebSocket bridge exposed by zmux-ws",
+      "variables": {
+        "host": {
+          "default": "127.0.0.1"
+        },
+        "port": {
+          "default": "7681"
+        }
+      }
+    }
+  ],
+  "methods": [
+    {
+      "name": "daemon.ping",
+      "summary": "Inspect daemon health, version, socket path, and live counters",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/daemon" }],
+      "x-zmux-since": "0.4.0",
+      "params": [],
+      "result": {
+        "name": "ping",
+        "description": "Daemon identity and runtime telemetry counters",
+        "schema": { "$ref": "#/components/schemas/PingResult" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "daemon.shutdown",
+      "summary": "Request graceful daemon shutdown after acknowledging the caller",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/daemon" }],
+      "x-zmux-since": "0.4.0",
+      "params": [],
+      "result": {
+        "name": "ok",
+        "schema": { "$ref": "#/components/schemas/OkResult" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "mux.snapshot",
+      "summary": "Return the full server-owned multiplexer state tree",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/mux" }],
+      "x-zmux-since": "0.4.0",
+      "params": [],
+      "result": {
+        "name": "snapshot",
+        "description": "Complete snapshot of sessions, windows, layout trees, panes, clients, and key bindings",
+        "schema": { "$ref": "#/components/schemas/MuxSnapshot" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/LimitExceeded" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "session.create",
+      "summary": "Create a new session with an initial window and PTY pane",
+      "description": "Spawns a PTY child inside a new session. Accepts id, name, or title as the human-readable session name while allocating fresh sessionId, windowId, and paneId identifiers.",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/session" }],
+      "x-zmux-since": "0.4.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/Title" },
+        { "$ref": "#/components/contentDescriptors/Name" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        { "$ref": "#/components/contentDescriptors/Shell" },
+        { "$ref": "#/components/contentDescriptors/Command" },
+        { "$ref": "#/components/contentDescriptors/Cwd" },
+        { "$ref": "#/components/contentDescriptors/WorkingDirectory" },
+        { "$ref": "#/components/contentDescriptors/Env" },
+        { "$ref": "#/components/contentDescriptors/Environment" },
+        { "$ref": "#/components/contentDescriptors/ClearEnv" },
+        { "$ref": "#/components/contentDescriptors/Rows" },
+        { "$ref": "#/components/contentDescriptors/Cols" },
+        { "$ref": "#/components/contentDescriptors/ScrollbackBytes" },
+        { "$ref": "#/components/contentDescriptors/Metadata" }
+      ],
+      "result": {
+        "name": "session",
+        "description": "Session info merged with sessionId, windowId, paneId, and generation",
+        "schema": { "$ref": "#/components/schemas/SessionCreateResult" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/Conflict" },
+        { "$ref": "#/components/errors/LimitExceeded" },
+        { "$ref": "#/components/errors/SpawnFailed" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "session.terminate",
+      "summary": "Terminate a session or pane and clean up its PTY process",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/session" }],
+      "x-zmux-since": "0.4.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" }
+      ],
+      "result": {
+        "name": "ok",
+        "schema": { "$ref": "#/components/schemas/OkResult" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "session.list",
+      "summary": "List all panes across all sessions with summary metadata",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/session" }],
+      "x-zmux-since": "0.4.0",
+      "params": [],
+      "result": {
+        "name": "sessions",
+        "schema": {
+          "type": "array",
+          "items": { "$ref": "#/components/schemas/SessionListItem" }
+        }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/LimitExceeded" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "session.info",
+      "summary": "Fetch detailed native PTY state for a single session or pane",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/session" }],
+      "x-zmux-since": "0.4.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" }
+      ],
+      "result": {
+        "name": "info",
+        "schema": { "$ref": "#/components/schemas/SessionInfo" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "session.resize",
+      "summary": "Resize a running session or pane PTY and persist its geometry for respawns",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/session" }],
+      "x-zmux-since": "0.4.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        { "$ref": "#/components/contentDescriptors/Rows" },
+        { "$ref": "#/components/contentDescriptors/Cols" }
+      ],
+      "result": {
+        "name": "ok",
+        "schema": { "$ref": "#/components/schemas/OkResult" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/Terminated" },
+        { "$ref": "#/components/errors/IoError" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "session.capture",
+      "summary": "Capture recent scrollback lines as lossy UTF-8 text and exact base64 bytes",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/session" }],
+      "x-zmux-since": "0.4.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        {
+          "name": "lines",
+          "description": "Maximum trailing lines to capture from scrollback (default 200)",
+          "required": false,
+          "schema": { "type": "integer", "minimum": 0, "default": 200 }
+        }
+      ],
+      "result": {
+        "name": "capture",
+        "schema": { "$ref": "#/components/schemas/CaptureResult" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/LimitExceeded" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "session.send",
+      "summary": "Write text or raw base64-encoded bytes to a running pane PTY",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/session" }],
+      "x-zmux-since": "0.4.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        {
+          "name": "text",
+          "description": "UTF-8 text to write when dataBase64 is omitted",
+          "required": false,
+          "schema": { "type": "string" }
+        },
+        {
+          "name": "enter",
+          "description": "Append a carriage return after text when dataBase64 is omitted",
+          "required": false,
+          "schema": { "type": "boolean", "default": false }
+        },
+        {
+          "name": "dataBase64",
+          "description": "Standard base64-encoded raw bytes to write directly to the PTY",
+          "required": false,
+          "schema": { "type": "string", "contentEncoding": "base64" }
+        },
+        {
+          "name": "data_base64",
+          "description": "Snake-case alias for dataBase64",
+          "required": false,
+          "schema": { "type": "string", "contentEncoding": "base64" }
+        }
+      ],
+      "result": {
+        "name": "ok",
+        "schema": { "$ref": "#/components/schemas/OkResult" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/Terminated" },
+        { "$ref": "#/components/errors/IoError" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "session.sendKey",
+      "summary": "Send a named tmux-style key sequence (Enter, C-c, ArrowUp, F1-F12) to a pane",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/session" }],
+      "x-zmux-since": "0.4.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        {
+          "name": "key",
+          "description": "Case-insensitive tmux-style key name such as Enter, C-c, Escape, ArrowUp, or F5",
+          "required": true,
+          "schema": { "type": "string", "minLength": 1 }
+        }
+      ],
+      "result": {
+        "name": "ok",
+        "schema": { "$ref": "#/components/schemas/OkResult" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/Terminated" },
+        { "$ref": "#/components/errors/IoError" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "session.rename",
+      "summary": "Rename an existing session and return the updated multiplexer snapshot",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/session" }],
+      "x-zmux-since": "0.4.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        { "$ref": "#/components/contentDescriptors/Name" },
+        { "$ref": "#/components/contentDescriptors/Title" }
+      ],
+      "result": {
+        "name": "snapshot",
+        "schema": { "$ref": "#/components/schemas/MuxSnapshot" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/Conflict" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "window.new",
+      "summary": "Create a new window with an initial pane inside an existing session",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/window" }],
+      "x-zmux-since": "0.4.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        { "$ref": "#/components/contentDescriptors/Title" },
+        { "$ref": "#/components/contentDescriptors/Name" },
+        { "$ref": "#/components/contentDescriptors/Shell" },
+        { "$ref": "#/components/contentDescriptors/Command" },
+        { "$ref": "#/components/contentDescriptors/Cwd" },
+        { "$ref": "#/components/contentDescriptors/WorkingDirectory" },
+        { "$ref": "#/components/contentDescriptors/Env" },
+        { "$ref": "#/components/contentDescriptors/Environment" },
+        { "$ref": "#/components/contentDescriptors/ClearEnv" },
+        { "$ref": "#/components/contentDescriptors/Rows" },
+        { "$ref": "#/components/contentDescriptors/Cols" },
+        { "$ref": "#/components/contentDescriptors/ScrollbackBytes" },
+        { "$ref": "#/components/contentDescriptors/Metadata" }
+      ],
+      "result": {
+        "name": "handle",
+        "schema": { "$ref": "#/components/schemas/PaneHandle" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/LimitExceeded" },
+        { "$ref": "#/components/errors/SpawnFailed" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "window.select",
+      "summary": "Select the active window in its owning session",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/window" }],
+      "x-zmux-since": "0.4.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/WindowId" },
+        { "$ref": "#/components/contentDescriptors/TargetWindowId" },
+        { "$ref": "#/components/contentDescriptors/Target" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" }
+      ],
+      "result": {
+        "name": "snapshot",
+        "schema": { "$ref": "#/components/schemas/MuxSnapshot" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "window.rename",
+      "summary": "Rename an existing window",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/window" }],
+      "x-zmux-since": "0.4.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/WindowId" },
+        { "$ref": "#/components/contentDescriptors/TargetWindowId" },
+        { "$ref": "#/components/contentDescriptors/Target" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        { "$ref": "#/components/contentDescriptors/Name" },
+        { "$ref": "#/components/contentDescriptors/Title" }
+      ],
+      "result": {
+        "name": "snapshot",
+        "schema": { "$ref": "#/components/schemas/MuxSnapshot" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "pane.split",
+      "summary": "Split an existing pane horizontally or vertically and spawn a new PTY pane",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/pane" }],
+      "x-zmux-since": "0.4.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/PaneId" },
+        { "$ref": "#/components/contentDescriptors/TargetPaneId" },
+        { "$ref": "#/components/contentDescriptors/Target" },
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        {
+          "name": "axis",
+          "description": "Split axis: horizontal (h, -h) or vertical (v, -v). Defaults to vertical unless horizontal is true.",
+          "required": false,
+          "schema": { "$ref": "#/components/schemas/AxisInput" }
+        },
+        {
+          "name": "horizontal",
+          "description": "Shorthand boolean used when axis is omitted",
+          "required": false,
+          "schema": { "type": "boolean", "default": false }
+        },
+        { "$ref": "#/components/contentDescriptors/Title" },
+        { "$ref": "#/components/contentDescriptors/Name" },
+        { "$ref": "#/components/contentDescriptors/Shell" },
+        { "$ref": "#/components/contentDescriptors/Command" },
+        { "$ref": "#/components/contentDescriptors/Cwd" },
+        { "$ref": "#/components/contentDescriptors/WorkingDirectory" },
+        { "$ref": "#/components/contentDescriptors/Env" },
+        { "$ref": "#/components/contentDescriptors/Environment" },
+        { "$ref": "#/components/contentDescriptors/ClearEnv" },
+        { "$ref": "#/components/contentDescriptors/Rows" },
+        { "$ref": "#/components/contentDescriptors/Cols" },
+        { "$ref": "#/components/contentDescriptors/ScrollbackBytes" },
+        { "$ref": "#/components/contentDescriptors/Metadata" }
+      ],
+      "result": {
+        "name": "handle",
+        "schema": { "$ref": "#/components/schemas/PaneHandle" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/LimitExceeded" },
+        { "$ref": "#/components/errors/SpawnFailed" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "pane.select",
+      "summary": "Select the active pane inside its window and session",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/pane" }],
+      "x-zmux-since": "0.4.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/PaneId" },
+        { "$ref": "#/components/contentDescriptors/TargetPaneId" },
+        { "$ref": "#/components/contentDescriptors/Target" },
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" }
+      ],
+      "result": {
+        "name": "snapshot",
+        "schema": { "$ref": "#/components/schemas/MuxSnapshot" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "pane.rename",
+      "summary": "Set a pane title and optionally mark it as custom",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/pane" }],
+      "x-zmux-since": "0.4.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/PaneId" },
+        { "$ref": "#/components/contentDescriptors/TargetPaneId" },
+        { "$ref": "#/components/contentDescriptors/Target" },
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        { "$ref": "#/components/contentDescriptors/Title" },
+        { "$ref": "#/components/contentDescriptors/Name" },
+        {
+          "name": "custom",
+          "description": "Whether the title was explicitly customized (default true)",
+          "required": false,
+          "schema": { "type": "boolean", "default": true }
+        }
+      ],
+      "result": {
+        "name": "snapshot",
+        "schema": { "$ref": "#/components/schemas/MuxSnapshot" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "pane.respawn",
+      "summary": "Respawn a terminated pane, or replace a running pane when kill is true",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/pane" }],
+      "x-zmux-since": "0.4.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/PaneId" },
+        { "$ref": "#/components/contentDescriptors/TargetPaneId" },
+        { "$ref": "#/components/contentDescriptors/Target" },
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        {
+          "name": "kill",
+          "description": "Terminate a running pane child before respawning. When false, respawning a running pane returns conflict (PaneRunning).",
+          "required": false,
+          "schema": { "type": "boolean", "default": false }
+        }
+      ],
+      "result": {
+        "name": "snapshot",
+        "schema": { "$ref": "#/components/schemas/MuxSnapshot" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/Conflict" },
+        { "$ref": "#/components/errors/SpawnFailed" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "client.attach",
+      "summary": "Attach a logical client to a pane and receive bounded scrollback replay plus live output notifications",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/client" }],
+      "x-zmux-since": "0.4.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/PaneId" },
+        { "$ref": "#/components/contentDescriptors/TargetPaneId" },
+        { "$ref": "#/components/contentDescriptors/Target" },
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        { "$ref": "#/components/contentDescriptors/Rows" },
+        { "$ref": "#/components/contentDescriptors/Cols" },
+        {
+          "name": "createIfMissing",
+          "description": "Optional session.create parameter object to atomically create a missing target session",
+          "required": false,
+          "schema": { "$ref": "#/components/schemas/CreateOptionsObject" }
+        },
+        {
+          "name": "resumeFromOffset",
+          "description": "Exclusive byte offset already received by the client for gap-free replay resumption",
+          "required": false,
+          "x-zmux-since": "0.5.0",
+          "schema": { "type": "integer", "minimum": 0 }
+        },
+        {
+          "name": "resumeGeneration",
+          "description": "Pane process generation associated with resumeFromOffset",
+          "required": false,
+          "x-zmux-since": "0.5.0",
+          "schema": { "type": "integer", "minimum": 0 }
+        },
+        {
+          "name": "readOnly",
+          "description": "Attach without allowing input writes or PTY resizes",
+          "required": false,
+          "x-zmux-since": "0.5.0",
+          "schema": { "type": "boolean", "default": false }
+        },
+        {
+          "name": "resizePolicy",
+          "description": "How this client participates in multi-client PTY geometry resolution",
+          "required": false,
+          "x-zmux-since": "0.5.0",
+          "schema": { "$ref": "#/components/schemas/ResizePolicy" }
+        },
+        {
+          "name": "replayMode",
+          "description": "Select raw scrollback bytes, VT ansi_restore snapshot, or none",
+          "required": false,
+          "x-zmux-since": "0.5.0",
+          "schema": { "$ref": "#/components/schemas/ReplayMode" }
+        }
+      ],
+      "result": {
+        "name": "attachment",
+        "schema": { "$ref": "#/components/schemas/AttachResult" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/Conflict" },
+        { "$ref": "#/components/errors/LimitExceeded" },
+        { "$ref": "#/components/errors/SpawnFailed" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "client.detach",
+      "summary": "Detach a logical client owned by this or another connection",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/client" }],
+      "x-zmux-since": "0.4.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/ClientId" },
+        { "$ref": "#/components/contentDescriptors/TargetClientId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" }
+      ],
+      "result": {
+        "name": "ok",
+        "schema": { "$ref": "#/components/schemas/OkResult" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "client.switch",
+      "summary": "Switch an attached logical client to another pane",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/client" }],
+      "x-zmux-since": "0.4.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/ClientId" },
+        { "$ref": "#/components/contentDescriptors/TargetClientId" },
+        { "$ref": "#/components/contentDescriptors/PaneId" },
+        { "$ref": "#/components/contentDescriptors/TargetPaneId" },
+        { "$ref": "#/components/contentDescriptors/Target" },
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" }
+      ],
+      "result": {
+        "name": "snapshot",
+        "schema": { "$ref": "#/components/schemas/MuxSnapshot" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "client.list",
+      "summary": "List all currently attached logical clients",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/client" }],
+      "x-zmux-since": "0.4.0",
+      "params": [],
+      "result": {
+        "name": "clients",
+        "schema": {
+          "type": "array",
+          "items": { "$ref": "#/components/schemas/ClientInfo" }
+        }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/LimitExceeded" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "events.subscribe",
+      "summary": "Replace this connection's pane_output subscription list",
+      "description": "Pass [\"*\"] to receive pane_output from every pane, a list of pane IDs or session names, or an empty array to unsubscribe.",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/events" }],
+      "x-zmux-since": "0.4.0",
+      "params": [
+        {
+          "name": "panes",
+          "description": "Pane targets to subscribe to, or [\"*\"] for all panes",
+          "required": true,
+          "schema": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      ],
+      "result": {
+        "name": "subscription",
+        "schema": { "$ref": "#/components/schemas/SubscribeEventsResult" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "key.bind",
+      "summary": "Bind a key in a key table to a zmux command line",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/key" }],
+      "x-zmux-since": "0.4.0",
+      "params": [
+        {
+          "name": "key",
+          "description": "Key identifier to bind",
+          "required": true,
+          "schema": { "type": "string", "minLength": 1 }
+        },
+        {
+          "name": "command",
+          "description": "Command line executed when the binding fires",
+          "required": false,
+          "schema": { "type": "string", "minLength": 1 }
+        },
+        {
+          "name": "cmd",
+          "description": "Alias for command",
+          "required": false,
+          "schema": { "type": "string", "minLength": 1 }
+        },
+        {
+          "name": "table",
+          "description": "Key table name (default prefix)",
+          "required": false,
+          "schema": { "type": "string", "default": "prefix" }
+        },
+        {
+          "name": "repeat",
+          "description": "Whether the binding allows repeated invocation",
+          "required": false,
+          "schema": { "type": "boolean", "default": false }
+        }
+      ],
+      "result": {
+        "name": "keyBindings",
+        "schema": {
+          "type": "array",
+          "items": { "$ref": "#/components/schemas/KeyBinding" }
+        }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "key.dispatch",
+      "summary": "Dispatch a bound key in the context of a target pane",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/key" }],
+      "x-zmux-since": "0.4.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/PaneId" },
+        { "$ref": "#/components/contentDescriptors/TargetPaneId" },
+        { "$ref": "#/components/contentDescriptors/Target" },
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        {
+          "name": "key",
+          "description": "Key to look up and dispatch",
+          "required": true,
+          "schema": { "type": "string", "minLength": 1 }
+        },
+        {
+          "name": "table",
+          "description": "Key table name (default prefix)",
+          "required": false,
+          "schema": { "type": "string", "default": "prefix" }
+        }
+      ],
+      "result": {
+        "name": "dispatchResult",
+        "description": "Returns the updated MuxSnapshot when handled, or { handled: false } when unbound",
+        "schema": { "$ref": "#/components/schemas/KeyDispatchResult" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/Conflict" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "key.list",
+      "summary": "List all registered key bindings",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/key" }],
+      "x-zmux-since": "0.4.0",
+      "params": [],
+      "result": {
+        "name": "keyBindings",
+        "schema": {
+          "type": "array",
+          "items": { "$ref": "#/components/schemas/KeyBinding" }
+        }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/LimitExceeded" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "command.exec",
+      "summary": "Execute a tmux-style command string (split-window, new-window, respawn-pane) against a target pane",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/command" }],
+      "x-zmux-since": "0.4.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/PaneId" },
+        { "$ref": "#/components/contentDescriptors/TargetPaneId" },
+        { "$ref": "#/components/contentDescriptors/Target" },
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        {
+          "name": "command",
+          "description": "Command line to execute",
+          "required": false,
+          "schema": { "type": "string", "minLength": 1 }
+        },
+        {
+          "name": "line",
+          "description": "Alias for command",
+          "required": false,
+          "schema": { "type": "string", "minLength": 1 }
+        }
+      ],
+      "result": {
+        "name": "snapshot",
+        "schema": { "$ref": "#/components/schemas/MuxSnapshot" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/Conflict" },
+        { "$ref": "#/components/errors/LimitExceeded" },
+        { "$ref": "#/components/errors/SpawnFailed" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "session.screen",
+      "summary": "Read structured VT terminal state, rendered plain text, OSC state, modes, and optional cell grid",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/session" }],
+      "x-zmux-since": "0.5.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/PaneId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        {
+          "name": "includeScrollback",
+          "description": "Number of scrollback lines to include above the visible viewport (default 0)",
+          "required": false,
+          "schema": { "type": "integer", "minimum": 0, "default": 0 }
+        },
+        {
+          "name": "includeCells",
+          "description": "Include styled cell matrix for the visible viewport",
+          "required": false,
+          "schema": { "type": "boolean", "default": false }
+        },
+        {
+          "name": "includeAnsiRestore",
+          "description": "Include a self-contained ANSI/DEC restore sequence",
+          "required": false,
+          "schema": { "type": "boolean", "default": false }
+        }
+      ],
+      "result": {
+        "name": "screen",
+        "schema": { "$ref": "#/components/schemas/ScreenSnapshot" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/LimitExceeded" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "pane.wait",
+      "summary": "Wait server-side until a pane matches text, exits, becomes idle, or transitions OSC prompt or agent status",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/pane" }],
+      "x-zmux-since": "0.5.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/PaneId" },
+        { "$ref": "#/components/contentDescriptors/TargetPaneId" },
+        { "$ref": "#/components/contentDescriptors/Target" },
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        {
+          "name": "pattern",
+          "description": "Substring or pattern to match in pane output or rendered screen text",
+          "required": false,
+          "schema": { "type": "string" }
+        },
+        {
+          "name": "regex",
+          "description": "Treat pattern as a regular expression",
+          "required": false,
+          "schema": { "type": "boolean", "default": false }
+        },
+        {
+          "name": "exit",
+          "description": "Resolve when the pane process exits",
+          "required": false,
+          "schema": { "type": "boolean", "default": false }
+        },
+        {
+          "name": "idleMs",
+          "description": "Resolve after this many milliseconds with no output",
+          "required": false,
+          "schema": { "type": "integer", "minimum": 1 }
+        },
+        {
+          "name": "promptState",
+          "description": "Resolve when OSC 133 prompt state equals this value",
+          "required": false,
+          "schema": { "$ref": "#/components/schemas/PromptState" }
+        },
+        {
+          "name": "agentStatus",
+          "description": "Resolve when OSC 7501 agent status equals this value",
+          "required": false,
+          "schema": { "$ref": "#/components/schemas/AgentStatus" }
+        },
+        {
+          "name": "timeoutMs",
+          "description": "Maximum wait time in milliseconds (default 30000)",
+          "required": false,
+          "schema": { "type": "integer", "minimum": 1, "default": 30000 }
+        }
+      ],
+      "result": {
+        "name": "waitResult",
+        "schema": { "$ref": "#/components/schemas/PaneWaitResult" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "pane.exec",
+      "summary": "Run a shell command inside a pane and collect its exit code and bounded output",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/pane" }],
+      "x-zmux-since": "0.5.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/PaneId" },
+        { "$ref": "#/components/contentDescriptors/TargetPaneId" },
+        { "$ref": "#/components/contentDescriptors/Target" },
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        {
+          "name": "command",
+          "description": "Shell command to execute inside the pane",
+          "required": true,
+          "schema": { "type": "string", "minLength": 1 }
+        },
+        {
+          "name": "timeoutMs",
+          "description": "Execution timeout in milliseconds (default 30000)",
+          "required": false,
+          "schema": { "type": "integer", "minimum": 1, "default": 30000 }
+        },
+        {
+          "name": "captureOutput",
+          "description": "Whether to return captured command output (default true)",
+          "required": false,
+          "schema": { "type": "boolean", "default": true }
+        }
+      ],
+      "result": {
+        "name": "execResult",
+        "schema": { "$ref": "#/components/schemas/PaneExecResult" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/Terminated" },
+        { "$ref": "#/components/errors/IoError" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "pane.signal",
+      "summary": "Deliver a POSIX signal to a pane process or foreground process group",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/pane" }],
+      "x-zmux-since": "0.5.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/PaneId" },
+        { "$ref": "#/components/contentDescriptors/TargetPaneId" },
+        { "$ref": "#/components/contentDescriptors/Target" },
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        {
+          "name": "signal",
+          "description": "POSIX signal name (such as SIGINT or SIGTERM) or positive signal number",
+          "required": true,
+          "schema": {
+            "oneOf": [
+              { "type": "string", "minLength": 1 },
+              { "type": "integer", "minimum": 1, "maximum": 64 }
+            ]
+          }
+        },
+        {
+          "name": "group",
+          "description": "Send to the foreground process group when true (default true)",
+          "required": false,
+          "schema": { "type": "boolean", "default": true }
+        }
+      ],
+      "result": {
+        "name": "signalResult",
+        "schema": { "$ref": "#/components/schemas/PaneSignalResult" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/Terminated" },
+        { "$ref": "#/components/errors/IoError" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "pane.close",
+      "summary": "Close a single pane and prune its parent window or session if empty",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/pane" }],
+      "x-zmux-since": "0.5.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/PaneId" },
+        { "$ref": "#/components/contentDescriptors/TargetPaneId" },
+        { "$ref": "#/components/contentDescriptors/Target" },
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        {
+          "name": "force",
+          "description": "Force termination even when a foreground job is running",
+          "required": false,
+          "schema": { "type": "boolean", "default": false }
+        }
+      ],
+      "result": {
+        "name": "snapshot",
+        "schema": { "$ref": "#/components/schemas/MuxSnapshot" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "window.close",
+      "summary": "Close a window and terminate all panes inside it",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/window" }],
+      "x-zmux-since": "0.5.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/WindowId" },
+        { "$ref": "#/components/contentDescriptors/TargetWindowId" },
+        { "$ref": "#/components/contentDescriptors/Target" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        {
+          "name": "force",
+          "description": "Force termination of all panes inside the window",
+          "required": false,
+          "schema": { "type": "boolean", "default": false }
+        }
+      ],
+      "result": {
+        "name": "snapshot",
+        "schema": { "$ref": "#/components/schemas/MuxSnapshot" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "pane.resizeSplit",
+      "summary": "Adjust the layout split ratio for a pane's containing split node",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/pane" }],
+      "x-zmux-since": "0.5.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/PaneId" },
+        { "$ref": "#/components/contentDescriptors/TargetPaneId" },
+        { "$ref": "#/components/contentDescriptors/Target" },
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        {
+          "name": "splitId",
+          "description": "Optional explicit split node identifier within the layout tree",
+          "required": false,
+          "schema": { "type": "string", "minLength": 1 }
+        },
+        {
+          "name": "ratio",
+          "description": "Absolute fraction assigned to the first child in [0.05, 0.95]",
+          "required": false,
+          "schema": { "type": "number", "minimum": 0.05, "maximum": 0.95 }
+        },
+        {
+          "name": "delta",
+          "description": "Relative ratio adjustment applied when ratio is omitted",
+          "required": false,
+          "schema": { "type": "number", "minimum": -0.9, "maximum": 0.9 }
+        }
+      ],
+      "result": {
+        "name": "snapshot",
+        "schema": { "$ref": "#/components/schemas/MuxSnapshot" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "pane.zoom",
+      "summary": "Toggle or explicitly set zoom state for a pane within its window",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/pane" }],
+      "x-zmux-since": "0.5.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/PaneId" },
+        { "$ref": "#/components/contentDescriptors/TargetPaneId" },
+        { "$ref": "#/components/contentDescriptors/Target" },
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        {
+          "name": "zoomed",
+          "description": "Explicit zoom state. Omit to toggle.",
+          "required": false,
+          "schema": { "type": "boolean" }
+        }
+      ],
+      "result": {
+        "name": "snapshot",
+        "schema": { "$ref": "#/components/schemas/MuxSnapshot" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "pane.metadata",
+      "summary": "Read, merge, replace, or delete arbitrary string metadata key-value pairs on a pane",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/pane" }],
+      "x-zmux-since": "0.5.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/PaneId" },
+        { "$ref": "#/components/contentDescriptors/TargetPaneId" },
+        { "$ref": "#/components/contentDescriptors/Target" },
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        {
+          "name": "set",
+          "description": "Key-value pairs to merge or replace on the pane",
+          "required": false,
+          "schema": { "$ref": "#/components/schemas/StringMap" }
+        },
+        {
+          "name": "remove",
+          "description": "Keys to delete from the pane metadata map",
+          "required": false,
+          "schema": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "name": "replace",
+          "description": "Replace the entire metadata map with set instead of merging",
+          "required": false,
+          "schema": { "type": "boolean", "default": false }
+        }
+      ],
+      "result": {
+        "name": "metadata",
+        "schema": { "$ref": "#/components/schemas/PaneMetadataResult" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/LimitExceeded" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "pane.record",
+      "summary": "Start, stop, or inspect an asciicast v2 recording of a pane stream",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/pane" }],
+      "x-zmux-since": "0.6.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/PaneId" },
+        { "$ref": "#/components/contentDescriptors/TargetPaneId" },
+        { "$ref": "#/components/contentDescriptors/Target" },
+        { "$ref": "#/components/contentDescriptors/SessionId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        {
+          "name": "action",
+          "description": "Recording control action",
+          "required": true,
+          "schema": { "type": "string", "enum": ["start", "stop", "status"] }
+        },
+        {
+          "name": "path",
+          "description": "Absolute output file path when action is start",
+          "required": false,
+          "schema": { "type": "string", "minLength": 1 }
+        },
+        {
+          "name": "format",
+          "description": "Recording wire format",
+          "required": false,
+          "schema": { "type": "string", "enum": ["asciicast-v2"], "default": "asciicast-v2" }
+        },
+        {
+          "name": "maxBytes",
+          "description": "Optional maximum recording file size in bytes",
+          "required": false,
+          "schema": { "type": "integer", "minimum": 1 }
+        }
+      ],
+      "result": {
+        "name": "recordStatus",
+        "schema": { "$ref": "#/components/schemas/PaneRecordResult" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/Conflict" },
+        { "$ref": "#/components/errors/IoError" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    },
+    {
+      "name": "client.setMode",
+      "summary": "Update read-only status or resize policy for an attached client",
+      "paramStructure": "by-name",
+      "tags": [{ "$ref": "#/components/tags/client" }],
+      "x-zmux-since": "0.6.0",
+      "params": [
+        { "$ref": "#/components/contentDescriptors/ClientId" },
+        { "$ref": "#/components/contentDescriptors/TargetClientId" },
+        { "$ref": "#/components/contentDescriptors/IdAlias" },
+        {
+          "name": "readOnly",
+          "description": "Set whether the client is restricted to read-only observation",
+          "required": false,
+          "schema": { "type": "boolean" }
+        },
+        {
+          "name": "resizePolicy",
+          "description": "Set how the client participates in pane geometry resolution",
+          "required": false,
+          "schema": { "$ref": "#/components/schemas/ResizePolicy" }
+        }
+      ],
+      "result": {
+        "name": "client",
+        "schema": { "$ref": "#/components/schemas/ClientInfo" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/NotFound" },
+        { "$ref": "#/components/errors/InternalError" }
+      ]
+    }
+  ],
+  "x-notifications": [
+    {
+      "name": "pane_output",
+      "summary": "Base64-encoded PTY output chunk emitted for attached or subscribed panes",
+      "tags": [{ "$ref": "#/components/tags/notifications" }],
+      "x-zmux-since": "0.4.0",
+      "params": {
+        "name": "paneOutput",
+        "schema": { "$ref": "#/components/schemas/PaneOutputParams" }
+      }
+    },
+    {
+      "name": "pane_output_dropped",
+      "summary": "Backpressure notice emitted when queued pane_output exceeded the per-connection cap",
+      "tags": [{ "$ref": "#/components/tags/notifications" }],
+      "x-zmux-since": "0.4.0",
+      "params": {
+        "name": "paneOutputDropped",
+        "schema": { "$ref": "#/components/schemas/PaneOutputDroppedParams" }
+      }
+    },
+    {
+      "name": "pane_activity",
+      "summary": "Edge-triggered activity notice emitted when an idle pane produces output",
+      "tags": [{ "$ref": "#/components/tags/notifications" }],
+      "x-zmux-since": "0.4.0",
+      "params": {
+        "name": "paneActivity",
+        "schema": { "$ref": "#/components/schemas/PaneActivityParams" }
+      }
+    },
+    {
+      "name": "pane_bell",
+      "summary": "Terminal bell (BEL, 0x07) detected in pane PTY output",
+      "tags": [{ "$ref": "#/components/tags/notifications" }],
+      "x-zmux-since": "0.4.0",
+      "params": {
+        "name": "paneBell",
+        "schema": { "$ref": "#/components/schemas/PaneBellParams" }
+      }
+    },
+    {
+      "name": "session_exited",
+      "summary": "Broadcast when a pane child process has exited and its PTY stream has drained",
+      "tags": [{ "$ref": "#/components/tags/notifications" }],
+      "x-zmux-since": "0.4.0",
+      "params": {
+        "name": "sessionExited",
+        "schema": { "$ref": "#/components/schemas/SessionExitedParams" }
+      }
+    },
+    {
+      "name": "foreground_changed",
+      "summary": "Broadcast when a pane's foreground process group changes",
+      "tags": [{ "$ref": "#/components/tags/notifications" }],
+      "x-zmux-since": "0.4.0",
+      "params": {
+        "name": "foregroundChanged",
+        "schema": { "$ref": "#/components/schemas/ForegroundChangedParams" }
+      }
+    },
+    {
+      "name": "pane_respawned",
+      "summary": "Broadcast after a pane starts a new process generation",
+      "tags": [{ "$ref": "#/components/tags/notifications" }],
+      "x-zmux-since": "0.4.0",
+      "params": {
+        "name": "paneRespawned",
+        "schema": { "$ref": "#/components/schemas/PaneRespawnedParams" }
+      }
+    },
+    {
+      "name": "client_detached",
+      "summary": "Sent to a client's owning connection when detached remotely or when its target is removed",
+      "tags": [{ "$ref": "#/components/tags/notifications" }],
+      "x-zmux-since": "0.4.0",
+      "params": {
+        "name": "clientDetached",
+        "schema": { "$ref": "#/components/schemas/ClientDetachedParams" }
+      }
+    },
+    {
+      "name": "client_switched",
+      "summary": "Sent to a client's owning connection when another connection switches it to a different pane",
+      "tags": [{ "$ref": "#/components/tags/notifications" }],
+      "x-zmux-since": "0.4.0",
+      "params": {
+        "name": "clientSwitched",
+        "schema": { "$ref": "#/components/schemas/ClientSwitchedParams" }
+      }
+    },
+    {
+      "name": "pane_title_changed",
+      "summary": "Broadcast when OSC 0 or OSC 2 updates a pane's dynamic title",
+      "tags": [{ "$ref": "#/components/tags/notifications" }],
+      "x-zmux-since": "0.5.0",
+      "params": {
+        "name": "paneTitleChanged",
+        "schema": { "$ref": "#/components/schemas/PaneTitleChangedParams" }
+      }
+    },
+    {
+      "name": "pane_cwd_changed",
+      "summary": "Broadcast when OSC 7 reports a pane working directory change",
+      "tags": [{ "$ref": "#/components/tags/notifications" }],
+      "x-zmux-since": "0.5.0",
+      "params": {
+        "name": "paneCwdChanged",
+        "schema": { "$ref": "#/components/schemas/PaneCwdChangedParams" }
+      }
+    },
+    {
+      "name": "pane_prompt_changed",
+      "summary": "Broadcast when OSC 133 shell integration transitions prompt state or records a command exit",
+      "tags": [{ "$ref": "#/components/tags/notifications" }],
+      "x-zmux-since": "0.5.0",
+      "params": {
+        "name": "panePromptChanged",
+        "schema": { "$ref": "#/components/schemas/PanePromptChangedParams" }
+      }
+    },
+    {
+      "name": "pane_status_changed",
+      "summary": "Broadcast when OSC 7501, OSC 9, or OSC 777 updates semantic agent status",
+      "tags": [{ "$ref": "#/components/tags/notifications" }],
+      "x-zmux-since": "0.5.0",
+      "params": {
+        "name": "paneStatusChanged",
+        "schema": { "$ref": "#/components/schemas/PaneStatusChangedParams" }
+      }
+    }
+  ],
+  "components": {
+    "tags": {
+      "daemon": { "name": "daemon", "description": "Daemon lifecycle and health RPCs" },
+      "mux": { "name": "mux", "description": "Multiplexer state inspection" },
+      "session": { "name": "session", "description": "Session and PTY operations" },
+      "window": { "name": "window", "description": "Window management" },
+      "pane": { "name": "pane", "description": "Pane layout, lifecycle, and inspection" },
+      "client": { "name": "client", "description": "Multi-client attach, detach, and routing" },
+      "events": { "name": "events", "description": "Pane output subscription control" },
+      "key": { "name": "key", "description": "Key binding tables and dispatch" },
+      "command": { "name": "command", "description": "tmux-style command execution" },
+      "notifications": { "name": "notifications", "description": "Server-to-client push notifications" }
+    },
+    "contentDescriptors": {
+      "SessionId": {
+        "name": "sessionId",
+        "description": "Target session ID, session name, or pane ID",
+        "required": false,
+        "schema": { "type": "string", "minLength": 1 }
+      },
+      "PaneId": {
+        "name": "paneId",
+        "description": "Target pane ID, session ID, or session name",
+        "required": false,
+        "schema": { "type": "string", "minLength": 1 }
+      },
+      "TargetPaneId": {
+        "name": "targetPaneId",
+        "description": "Alias for paneId",
+        "required": false,
+        "schema": { "type": "string", "minLength": 1 }
+      },
+      "WindowId": {
+        "name": "windowId",
+        "description": "Target window ID or window name",
+        "required": false,
+        "schema": { "type": "string", "minLength": 1 }
+      },
+      "TargetWindowId": {
+        "name": "targetWindowId",
+        "description": "Alias for windowId",
+        "required": false,
+        "schema": { "type": "string", "minLength": 1 }
+      },
+      "ClientId": {
+        "name": "clientId",
+        "description": "Target logical client ID",
+        "required": false,
+        "schema": { "type": "string", "minLength": 1 }
+      },
+      "TargetClientId": {
+        "name": "targetClientId",
+        "description": "Alias for clientId",
+        "required": false,
+        "schema": { "type": "string", "minLength": 1 }
+      },
+      "Target": {
+        "name": "target",
+        "description": "Generic target identifier alias",
+        "required": false,
+        "schema": { "type": "string", "minLength": 1 }
+      },
+      "IdAlias": {
+        "name": "id",
+        "description": "Fallback target identifier alias (or session name on session.create)",
+        "required": false,
+        "schema": { "type": "string", "minLength": 1 }
+      },
+      "Title": {
+        "name": "title",
+        "description": "Human-readable title",
+        "required": false,
+        "schema": { "type": "string", "minLength": 1 }
+      },
+      "Name": {
+        "name": "name",
+        "description": "Human-readable name",
+        "required": false,
+        "schema": { "type": "string", "minLength": 1 }
+      },
+      "Shell": {
+        "name": "shell",
+        "description": "Shell executable path to spawn",
+        "required": false,
+        "schema": { "type": "string", "minLength": 1 }
+      },
+      "Command": {
+        "name": "command",
+        "description": "Command string passed to the shell",
+        "required": false,
+        "schema": { "type": "string" }
+      },
+      "Cwd": {
+        "name": "cwd",
+        "description": "Initial working directory for the PTY child",
+        "required": false,
+        "schema": { "type": "string", "minLength": 1 }
+      },
+      "WorkingDirectory": {
+        "name": "workingDirectory",
+        "description": "Alias for cwd",
+        "required": false,
+        "schema": { "type": "string", "minLength": 1 }
+      },
+      "Env": {
+        "name": "env",
+        "description": "Environment variables merged over the daemon environment (or replacing it when clearEnv is true)",
+        "required": false,
+        "schema": { "$ref": "#/components/schemas/StringMap" }
+      },
+      "Environment": {
+        "name": "environment",
+        "description": "Alias for env",
+        "required": false,
+        "schema": { "$ref": "#/components/schemas/StringMap" }
+      },
+      "ClearEnv": {
+        "name": "clearEnv",
+        "description": "Replace the daemon environment instead of merging env",
+        "required": false,
+        "schema": { "type": "boolean", "default": false }
+      },
+      "Rows": {
+        "name": "rows",
+        "description": "Terminal height in rows (1..65535, default 24)",
+        "required": false,
+        "schema": { "$ref": "#/components/schemas/Dimension" }
+      },
+      "Cols": {
+        "name": "cols",
+        "description": "Terminal width in columns (1..65535, default 80)",
+        "required": false,
+        "schema": { "$ref": "#/components/schemas/Dimension" }
+      },
+      "ScrollbackBytes": {
+        "name": "scrollbackBytes",
+        "description": "Scrollback ring buffer capacity in bytes (1..67108864, default 10485760)",
+        "required": false,
+        "schema": { "$ref": "#/components/schemas/ScrollbackBytes" }
+      },
+      "Metadata": {
+        "name": "metadata",
+        "description": "Initial string key-value metadata attached to the new pane",
+        "required": false,
+        "x-zmux-since": "0.5.0",
+        "schema": { "$ref": "#/components/schemas/StringMap" }
+      }
+    },
+    "errors": {
+      "ParseError": {
+        "code": -32700,
+        "message": "ParseError",
+        "data": { "kind": "parse" }
+      },
+      "InvalidRequest": {
+        "code": -32600,
+        "message": "InvalidRequest",
+        "data": { "kind": "invalid_request" }
+      },
+      "MethodNotFound": {
+        "code": -32601,
+        "message": "MethodNotFound",
+        "data": { "kind": "method_not_found" }
+      },
+      "InvalidParams": {
+        "code": -32602,
+        "message": "InvalidParams",
+        "data": { "kind": "invalid_params" }
+      },
+      "InternalError": {
+        "code": -32603,
+        "message": "InternalError",
+        "data": { "kind": "internal" }
+      },
+      "NotFound": {
+        "code": -32000,
+        "message": "PaneNotFound",
+        "data": { "kind": "not_found" }
+      },
+      "Terminated": {
+        "code": -32000,
+        "message": "SessionTerminated",
+        "data": { "kind": "terminated" }
+      },
+      "Conflict": {
+        "code": -32000,
+        "message": "DuplicateSessionName",
+        "data": { "kind": "conflict" }
+      },
+      "LimitExceeded": {
+        "code": -32000,
+        "message": "LimitExceeded",
+        "data": { "kind": "limit" }
+      },
+      "SpawnFailed": {
+        "code": -32000,
+        "message": "SpawnFailed",
+        "data": { "kind": "spawn_failed" }
+      },
+      "IoError": {
+        "code": -32000,
+        "message": "InputOutput",
+        "data": { "kind": "io" }
+      }
+    },
+    "schemas": {
+      "OkResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ok"],
+        "properties": {
+          "ok": { "type": "boolean", "const": true }
+        }
+      },
+      "StringMap": {
+        "type": "object",
+        "additionalProperties": { "type": "string" }
+      },
+      "Dimension": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 65535
+      },
+      "ScrollbackBytes": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 67108864,
+        "default": 10485760
+      },
+      "SessionState": {
+        "type": "string",
+        "enum": ["creating", "running", "terminated"]
+      },
+      "Axis": {
+        "type": "string",
+        "enum": ["horizontal", "vertical"]
+      },
+      "AxisInput": {
+        "type": "string",
+        "enum": ["horizontal", "vertical", "h", "v", "-h", "-v"]
+      },
+      "ResizePolicy": {
+        "type": "string",
+        "enum": ["latest", "smallest", "largest", "none"],
+        "x-zmux-since": "0.5.0"
+      },
+      "ReplayMode": {
+        "type": "string",
+        "enum": ["raw", "ansi_restore", "none"],
+        "x-zmux-since": "0.5.0"
+      },
+      "PromptState": {
+        "type": "string",
+        "enum": ["unknown", "prompt", "input", "running"],
+        "x-zmux-since": "0.5.0"
+      },
+      "AgentStatus": {
+        "type": "string",
+        "enum": ["unknown", "idle", "working", "waiting_for_input", "done"],
+        "x-zmux-since": "0.5.0"
+      },
+      "MouseMode": {
+        "type": "string",
+        "enum": ["none", "x10", "button", "any"],
+        "x-zmux-since": "0.5.0"
+      },
+      "DetachReason": {
+        "type": "string",
+        "enum": ["pane_removed", "session_removed", "remote_detach"]
+      },
+      "ErrorCode": {
+        "type": "integer",
+        "enum": [-32700, -32600, -32601, -32602, -32603, -32000]
+      },
+      "ErrorKind": {
+        "type": "string",
+        "enum": [
+          "parse",
+          "invalid_request",
+          "method_not_found",
+          "invalid_params",
+          "not_found",
+          "terminated",
+          "conflict",
+          "limit",
+          "spawn_failed",
+          "io",
+          "internal"
+        ]
+      },
+      "ErrorData": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind"],
+        "properties": {
+          "kind": { "$ref": "#/components/schemas/ErrorKind" }
+        }
+      },
+      "RpcErrorObject": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "$ref": "#/components/schemas/ErrorCode" },
+          "message": { "type": "string" },
+          "data": { "$ref": "#/components/schemas/ErrorData" }
+        }
+      },
+      "PingResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "pid",
+          "socketPath",
+          "sessions",
+          "panes",
+          "livePanes",
+          "connections",
+          "droppedEvents",
+          "rejectedConnections"
+        ],
+        "properties": {
+          "version": { "type": "string" },
+          "pid": { "type": "integer" },
+          "socketPath": { "type": "string" },
+          "sessions": { "type": "integer", "minimum": 0 },
+          "panes": { "type": "integer", "minimum": 0 },
+          "livePanes": { "type": "integer", "minimum": 0 },
+          "connections": { "type": "integer", "minimum": 0 },
+          "droppedEvents": { "type": "integer", "minimum": 0 },
+          "rejectedConnections": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "SessionInfo": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "title",
+          "pid",
+          "state",
+          "cwd",
+          "shell",
+          "scrollbackBytes",
+          "exitStatus",
+          "exitCode",
+          "signal",
+          "generation"
+        ],
+        "properties": {
+          "id": { "type": "string" },
+          "title": { "type": "string" },
+          "pid": { "type": "integer" },
+          "state": { "$ref": "#/components/schemas/SessionState" },
+          "cwd": { "type": ["string", "null"] },
+          "shell": { "type": ["string", "null"] },
+          "scrollbackBytes": { "type": "integer", "minimum": 0 },
+          "exitStatus": { "type": ["integer", "null"] },
+          "exitCode": { "type": ["integer", "null"] },
+          "signal": { "type": ["integer", "null"] },
+          "generation": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "SessionCreateResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "title",
+          "pid",
+          "state",
+          "cwd",
+          "shell",
+          "scrollbackBytes",
+          "exitStatus",
+          "exitCode",
+          "signal",
+          "generation",
+          "sessionId",
+          "windowId",
+          "paneId"
+        ],
+        "properties": {
+          "id": { "type": "string" },
+          "title": { "type": "string" },
+          "pid": { "type": "integer" },
+          "state": { "$ref": "#/components/schemas/SessionState" },
+          "cwd": { "type": ["string", "null"] },
+          "shell": { "type": ["string", "null"] },
+          "scrollbackBytes": { "type": "integer", "minimum": 0 },
+          "exitStatus": { "type": ["integer", "null"] },
+          "exitCode": { "type": ["integer", "null"] },
+          "signal": { "type": ["integer", "null"] },
+          "generation": { "type": "integer", "minimum": 0 },
+          "sessionId": { "type": "string" },
+          "windowId": { "type": "string" },
+          "paneId": { "type": "string" }
+        }
+      },
+      "SessionListItem": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "title",
+          "pid",
+          "state",
+          "cwd",
+          "shell",
+          "scrollbackBytes",
+          "exitStatus",
+          "exitCode",
+          "signal",
+          "generation",
+          "sessionId",
+          "sessionName",
+          "windowId",
+          "paneId",
+          "paneTitle"
+        ],
+        "properties": {
+          "id": { "type": "string" },
+          "title": { "type": "string" },
+          "pid": { "type": "integer" },
+          "state": { "$ref": "#/components/schemas/SessionState" },
+          "cwd": { "type": ["string", "null"] },
+          "shell": { "type": ["string", "null"] },
+          "scrollbackBytes": { "type": "integer", "minimum": 0 },
+          "exitStatus": { "type": ["integer", "null"] },
+          "exitCode": { "type": ["integer", "null"] },
+          "signal": { "type": ["integer", "null"] },
+          "generation": { "type": "integer", "minimum": 0 },
+          "sessionId": { "type": "string" },
+          "sessionName": { "type": "string" },
+          "windowId": { "type": "string" },
+          "paneId": { "type": "string" },
+          "paneTitle": { "type": "string" }
+        }
+      },
+      "PaneHandle": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sessionId", "windowId", "paneId", "generation"],
+        "properties": {
+          "sessionId": { "type": "string" },
+          "windowId": { "type": "string" },
+          "paneId": { "type": "string" },
+          "generation": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "CaptureResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sessionId", "text", "textBase64"],
+        "properties": {
+          "sessionId": { "type": "string" },
+          "text": { "type": "string" },
+          "textBase64": { "type": "string", "contentEncoding": "base64" }
+        }
+      },
+      "AlertState": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["activity", "bell", "exited", "lastActivityMs", "lastBellMs"],
+        "properties": {
+          "activity": { "type": "boolean" },
+          "bell": { "type": "boolean" },
+          "exited": { "type": "boolean" },
+          "lastActivityMs": { "type": "integer" },
+          "lastBellMs": { "type": "integer" }
+        }
+      },
+      "LayoutLeaf": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "paneId"],
+        "properties": {
+          "kind": { "type": "string", "const": "leaf" },
+          "paneId": { "type": "string" }
+        }
+      },
+      "LayoutSplit": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "id", "axis", "first", "second"],
+        "properties": {
+          "kind": { "type": "string", "const": "split" },
+          "id": { "type": "string" },
+          "axis": { "$ref": "#/components/schemas/Axis" },
+          "ratio": { "type": "number", "minimum": 0.05, "maximum": 0.95, "x-zmux-since": "0.5.0" },
+          "first": { "$ref": "#/components/schemas/LayoutNode" },
+          "second": { "$ref": "#/components/schemas/LayoutNode" }
+        }
+      },
+      "LayoutNode": {
+        "oneOf": [
+          { "$ref": "#/components/schemas/LayoutLeaf" },
+          { "$ref": "#/components/schemas/LayoutSplit" }
+        ]
+      },
+      "SnapshotPane": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "windowId",
+          "sessionId",
+          "index",
+          "title",
+          "hasCustomTitle",
+          "state",
+          "generation",
+          "pid",
+          "rows",
+          "cols",
+          "cwd",
+          "command",
+          "alerts"
+        ],
+        "properties": {
+          "id": { "type": "string" },
+          "windowId": { "type": "string" },
+          "sessionId": { "type": "string" },
+          "index": { "type": "integer", "minimum": 0 },
+          "title": { "type": "string" },
+          "hasCustomTitle": { "type": "boolean" },
+          "state": { "$ref": "#/components/schemas/SessionState" },
+          "generation": { "type": "integer", "minimum": 0 },
+          "pid": { "type": "integer" },
+          "rows": { "$ref": "#/components/schemas/Dimension" },
+          "cols": { "$ref": "#/components/schemas/Dimension" },
+          "cwd": { "type": ["string", "null"] },
+          "command": { "type": "string" },
+          "alerts": { "$ref": "#/components/schemas/AlertState" },
+          "metadata": { "$ref": "#/components/schemas/StringMap", "x-zmux-since": "0.5.0" }
+        }
+      },
+      "SnapshotWindow": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "sessionId", "index", "name", "activePaneId", "layout", "panes"],
+        "properties": {
+          "id": { "type": "string" },
+          "sessionId": { "type": "string" },
+          "index": { "type": "integer", "minimum": 0 },
+          "name": { "type": "string" },
+          "activePaneId": { "type": "string" },
+          "layout": { "$ref": "#/components/schemas/LayoutNode" },
+          "panes": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/SnapshotPane" }
+          },
+          "zoomedPaneId": { "type": ["string", "null"], "x-zmux-since": "0.5.0" }
+        }
+      },
+      "SnapshotSession": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "name", "activeWindowId", "windows"],
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "activeWindowId": { "type": "string" },
+          "windows": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/SnapshotWindow" }
+          }
+        }
+      },
+      "ClientInfo": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "sessionId", "windowId", "paneId", "rows", "cols", "active"],
+        "properties": {
+          "id": { "type": "string" },
+          "sessionId": { "type": "string" },
+          "windowId": { "type": "string" },
+          "paneId": { "type": "string" },
+          "rows": { "$ref": "#/components/schemas/Dimension" },
+          "cols": { "$ref": "#/components/schemas/Dimension" },
+          "active": { "type": "boolean" },
+          "readOnly": { "type": "boolean", "x-zmux-since": "0.5.0" },
+          "resizePolicy": { "$ref": "#/components/schemas/ResizePolicy", "x-zmux-since": "0.5.0" }
+        }
+      },
+      "KeyBinding": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["table", "key", "command", "repeat"],
+        "properties": {
+          "table": { "type": "string" },
+          "key": { "type": "string" },
+          "command": { "type": "string" },
+          "repeat": { "type": "boolean" }
+        }
+      },
+      "MuxSnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sessions", "clients", "keyBindings"],
+        "properties": {
+          "sessions": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/SnapshotSession" }
+          },
+          "clients": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ClientInfo" }
+          },
+          "keyBindings": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/KeyBinding" }
+          }
+        }
+      },
+      "CreateOptionsObject": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "title": { "type": "string", "minLength": 1 },
+          "name": { "type": "string", "minLength": 1 },
+          "id": { "type": "string", "minLength": 1 },
+          "shell": { "type": "string", "minLength": 1 },
+          "command": { "type": "string" },
+          "cwd": { "type": "string", "minLength": 1 },
+          "workingDirectory": { "type": "string", "minLength": 1 },
+          "env": { "$ref": "#/components/schemas/StringMap" },
+          "environment": { "$ref": "#/components/schemas/StringMap" },
+          "clearEnv": { "type": "boolean", "default": false },
+          "rows": { "$ref": "#/components/schemas/Dimension" },
+          "cols": { "$ref": "#/components/schemas/Dimension" },
+          "scrollbackBytes": { "$ref": "#/components/schemas/ScrollbackBytes" },
+          "metadata": { "$ref": "#/components/schemas/StringMap", "x-zmux-since": "0.5.0" }
+        }
+      },
+      "AttachResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "clientId",
+          "sessionId",
+          "windowId",
+          "paneId",
+          "rows",
+          "cols",
+          "created",
+          "exited",
+          "exitCode",
+          "signal",
+          "generation",
+          "replayBase64",
+          "replayStartOffset",
+          "replayEndOffset"
+        ],
+        "properties": {
+          "clientId": { "type": "string" },
+          "sessionId": { "type": "string" },
+          "windowId": { "type": "string" },
+          "paneId": { "type": "string" },
+          "rows": { "$ref": "#/components/schemas/Dimension" },
+          "cols": { "$ref": "#/components/schemas/Dimension" },
+          "created": { "type": "boolean" },
+          "exited": { "type": "boolean" },
+          "exitCode": { "type": ["integer", "null"] },
+          "signal": { "type": ["integer", "null"] },
+          "generation": { "type": "integer", "minimum": 0 },
+          "replayBase64": { "type": "string", "contentEncoding": "base64" },
+          "replayStartOffset": { "type": "integer", "minimum": 0 },
+          "replayEndOffset": { "type": "integer", "minimum": 0 },
+          "replayMode": { "$ref": "#/components/schemas/ReplayMode", "x-zmux-since": "0.5.0" },
+          "readOnly": { "type": "boolean", "x-zmux-since": "0.5.0" },
+          "resumed": { "type": "boolean", "x-zmux-since": "0.5.0" }
+        }
+      },
+      "SubscribeEventsResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ok", "all", "panes"],
+        "properties": {
+          "ok": { "type": "boolean", "const": true },
+          "all": { "type": "boolean" },
+          "panes": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "KeyDispatchUnhandledResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["handled"],
+        "properties": {
+          "handled": { "type": "boolean", "const": false }
+        }
+      },
+      "KeyDispatchResult": {
+        "oneOf": [
+          { "$ref": "#/components/schemas/MuxSnapshot" },
+          { "$ref": "#/components/schemas/KeyDispatchUnhandledResult" }
+        ]
+      },
+      "TerminalColor": {
+        "x-zmux-since": "0.5.0",
+        "oneOf": [
+          { "type": "null" },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "index"],
+            "properties": {
+              "kind": { "type": "string", "const": "indexed" },
+              "index": { "type": "integer", "minimum": 0, "maximum": 255 }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "r", "g", "b"],
+            "properties": {
+              "kind": { "type": "string", "const": "rgb" },
+              "r": { "type": "integer", "minimum": 0, "maximum": 255 },
+              "g": { "type": "integer", "minimum": 0, "maximum": 255 },
+              "b": { "type": "integer", "minimum": 0, "maximum": 255 }
+            }
+          }
+        ]
+      },
+      "TerminalCell": {
+        "type": "object",
+        "x-zmux-since": "0.5.0",
+        "additionalProperties": false,
+        "required": ["char", "width"],
+        "properties": {
+          "char": { "type": "string" },
+          "width": { "type": "integer", "minimum": 0, "maximum": 2 },
+          "fg": { "$ref": "#/components/schemas/TerminalColor" },
+          "bg": { "$ref": "#/components/schemas/TerminalColor" },
+          "bold": { "type": "boolean" },
+          "dim": { "type": "boolean" },
+          "italic": { "type": "boolean" },
+          "underline": { "type": "boolean" },
+          "blink": { "type": "boolean" },
+          "inverse": { "type": "boolean" },
+          "hidden": { "type": "boolean" },
+          "strikethrough": { "type": "boolean" }
+        }
+      },
+      "TerminalCursor": {
+        "type": "object",
+        "x-zmux-since": "0.5.0",
+        "additionalProperties": false,
+        "required": ["row", "col", "visible"],
+        "properties": {
+          "row": { "type": "integer", "minimum": 0 },
+          "col": { "type": "integer", "minimum": 0 },
+          "visible": { "type": "boolean" }
+        }
+      },
+      "TerminalModes": {
+        "type": "object",
+        "x-zmux-since": "0.5.0",
+        "additionalProperties": false,
+        "required": [
+          "decckm",
+          "origin",
+          "autowrap",
+          "cursorVisible",
+          "altScreen",
+          "mouseMode",
+          "mouseSgr",
+          "focusEvents",
+          "bracketedPaste",
+          "syncOutput",
+          "insertMode",
+          "linefeedMode"
+        ],
+        "properties": {
+          "decckm": { "type": "boolean" },
+          "origin": { "type": "boolean" },
+          "autowrap": { "type": "boolean" },
+          "cursorVisible": { "type": "boolean" },
+          "altScreen": { "type": "boolean" },
+          "mouseMode": { "$ref": "#/components/schemas/MouseMode" },
+          "mouseSgr": { "type": "boolean" },
+          "focusEvents": { "type": "boolean" },
+          "bracketedPaste": { "type": "boolean" },
+          "syncOutput": { "type": "boolean" },
+          "insertMode": { "type": "boolean" },
+          "linefeedMode": { "type": "boolean" },
+          "kittyKeyboardFlags": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "ScreenSnapshot": {
+        "type": "object",
+        "x-zmux-since": "0.5.0",
+        "additionalProperties": false,
+        "required": [
+          "rows",
+          "cols",
+          "cursor",
+          "altScreen",
+          "title",
+          "cwd",
+          "promptState",
+          "lastCommandExitCode",
+          "commandSeq",
+          "agentStatus",
+          "modes",
+          "text",
+          "lines"
+        ],
+        "properties": {
+          "rows": { "$ref": "#/components/schemas/Dimension" },
+          "cols": { "$ref": "#/components/schemas/Dimension" },
+          "cursor": { "$ref": "#/components/schemas/TerminalCursor" },
+          "altScreen": { "type": "boolean" },
+          "title": { "type": "string" },
+          "cwd": { "type": ["string", "null"] },
+          "promptState": { "$ref": "#/components/schemas/PromptState" },
+          "lastCommandExitCode": { "type": ["integer", "null"] },
+          "commandSeq": { "type": "integer", "minimum": 0 },
+          "agentStatus": { "$ref": "#/components/schemas/AgentStatus" },
+          "modes": { "$ref": "#/components/schemas/TerminalModes" },
+          "text": { "type": "string" },
+          "lines": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "cells": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": { "$ref": "#/components/schemas/TerminalCell" }
+            }
+          },
+          "ansiRestore": { "type": "string" }
+        }
+      },
+      "PaneWaitResult": {
+        "type": "object",
+        "x-zmux-since": "0.5.0",
+        "additionalProperties": false,
+        "required": ["matched", "reason", "generation", "offset"],
+        "properties": {
+          "matched": { "type": "boolean" },
+          "reason": {
+            "type": "string",
+            "enum": ["pattern", "exit", "idle", "prompt", "status", "timeout"]
+          },
+          "matchText": { "type": ["string", "null"] },
+          "exitCode": { "type": ["integer", "null"] },
+          "signal": { "type": ["integer", "null"] },
+          "generation": { "type": "integer", "minimum": 0 },
+          "offset": { "type": "integer", "minimum": 0 },
+          "screenText": { "type": "string" }
+        }
+      },
+      "PaneExecResult": {
+        "type": "object",
+        "x-zmux-since": "0.5.0",
+        "additionalProperties": false,
+        "required": ["paneId", "exitCode", "signal", "output", "outputBase64", "timedOut", "durationMs"],
+        "properties": {
+          "paneId": { "type": "string" },
+          "exitCode": { "type": ["integer", "null"] },
+          "signal": { "type": ["integer", "null"] },
+          "output": { "type": "string" },
+          "outputBase64": { "type": "string", "contentEncoding": "base64" },
+          "timedOut": { "type": "boolean" },
+          "durationMs": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "PaneSignalResult": {
+        "type": "object",
+        "x-zmux-since": "0.5.0",
+        "additionalProperties": false,
+        "required": ["ok", "paneId", "signal"],
+        "properties": {
+          "ok": { "type": "boolean", "const": true },
+          "paneId": { "type": "string" },
+          "signal": { "type": "string" }
+        }
+      },
+      "PaneMetadataResult": {
+        "type": "object",
+        "x-zmux-since": "0.5.0",
+        "additionalProperties": false,
+        "required": ["paneId", "metadata"],
+        "properties": {
+          "paneId": { "type": "string" },
+          "metadata": { "$ref": "#/components/schemas/StringMap" }
+        }
+      },
+      "PaneRecordResult": {
+        "type": "object",
+        "x-zmux-since": "0.6.0",
+        "additionalProperties": false,
+        "required": ["paneId", "recording", "path", "format", "bytesWritten", "startedAtMs"],
+        "properties": {
+          "paneId": { "type": "string" },
+          "recording": { "type": "boolean" },
+          "path": { "type": ["string", "null"] },
+          "format": { "type": "string", "enum": ["asciicast-v2"] },
+          "bytesWritten": { "type": "integer", "minimum": 0 },
+          "startedAtMs": { "type": ["integer", "null"] }
+        }
+      },
+      "PaneOutputParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pane_id", "data_base64", "offset", "generation"],
+        "properties": {
+          "pane_id": { "type": "string" },
+          "data_base64": { "type": "string", "contentEncoding": "base64" },
+          "offset": { "type": "integer", "minimum": 0 },
+          "generation": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "PaneOutputDroppedParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pane_id", "dropped_bytes", "resume_offset", "generation"],
+        "properties": {
+          "pane_id": { "type": "string" },
+          "dropped_bytes": { "type": "integer", "minimum": 0 },
+          "resume_offset": { "type": "integer", "minimum": 0 },
+          "generation": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "PaneActivityParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pane_id", "last_activity_ms", "generation"],
+        "properties": {
+          "pane_id": { "type": "string" },
+          "last_activity_ms": { "type": "integer" },
+          "generation": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "PaneBellParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pane_id", "last_bell_ms", "generation"],
+        "properties": {
+          "pane_id": { "type": "string" },
+          "last_bell_ms": { "type": "integer" },
+          "generation": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "SessionExitedParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["session_id", "pid", "exit_code", "signal", "generation"],
+        "properties": {
+          "session_id": { "type": "string" },
+          "pid": { "type": "integer" },
+          "exit_code": { "type": ["integer", "null"] },
+          "signal": { "type": ["integer", "null"] },
+          "generation": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "ForegroundChangedParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["session_id", "pid", "comm", "argv", "argv_truncated"],
+        "properties": {
+          "session_id": { "type": "string" },
+          "pid": { "type": "integer" },
+          "comm": { "type": "string" },
+          "argv": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "argv_truncated": { "type": "boolean" }
+        }
+      },
+      "PaneRespawnedParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pane_id", "generation", "pid"],
+        "properties": {
+          "pane_id": { "type": "string" },
+          "generation": { "type": "integer", "minimum": 0 },
+          "pid": { "type": "integer" }
+        }
+      },
+      "ClientDetachedParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["client_id", "reason"],
+        "properties": {
+          "client_id": { "type": "string" },
+          "reason": { "$ref": "#/components/schemas/DetachReason" }
+        }
+      },
+      "ClientSwitchedParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "client_id",
+          "pane_id",
+          "generation",
+          "replayBase64",
+          "replayStartOffset",
+          "replayEndOffset"
+        ],
+        "properties": {
+          "client_id": { "type": "string" },
+          "pane_id": { "type": "string" },
+          "generation": { "type": "integer", "minimum": 0 },
+          "replayBase64": { "type": "string", "contentEncoding": "base64" },
+          "replayStartOffset": { "type": "integer", "minimum": 0 },
+          "replayEndOffset": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "PaneTitleChangedParams": {
+        "type": "object",
+        "x-zmux-since": "0.5.0",
+        "additionalProperties": false,
+        "required": ["pane_id", "title", "generation"],
+        "properties": {
+          "pane_id": { "type": "string" },
+          "title": { "type": "string" },
+          "generation": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "PaneCwdChangedParams": {
+        "type": "object",
+        "x-zmux-since": "0.5.0",
+        "additionalProperties": false,
+        "required": ["pane_id", "cwd", "generation"],
+        "properties": {
+          "pane_id": { "type": "string" },
+          "cwd": { "type": "string" },
+          "generation": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "PanePromptChangedParams": {
+        "type": "object",
+        "x-zmux-since": "0.5.0",
+        "additionalProperties": false,
+        "required": ["pane_id", "prompt_state", "last_exit_code", "command_seq", "generation"],
+        "properties": {
+          "pane_id": { "type": "string" },
+          "prompt_state": { "$ref": "#/components/schemas/PromptState" },
+          "last_exit_code": { "type": ["integer", "null"] },
+          "command_seq": { "type": "integer", "minimum": 0 },
+          "generation": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "PaneStatusChangedParams": {
+        "type": "object",
+        "x-zmux-since": "0.5.0",
+        "additionalProperties": false,
+        "required": ["pane_id", "status", "message", "generation"],
+        "properties": {
+          "pane_id": { "type": "string" },
+          "status": { "$ref": "#/components/schemas/AgentStatus" },
+          "message": { "type": ["string", "null"] },
+          "generation": { "type": "integer", "minimum": 0 }
+        }
+      }
+    }
+  }
+}
