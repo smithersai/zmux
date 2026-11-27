@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-jg16QZ0faLZKxCO/rFZ0tk59rJRLlm1rpG5e/4hMPFY='; style-src 'sha256-oA0afPDzxqeowWpeRBXKONrxe0T+ExiTOOt7xRl9VWY='; base-uri 'none'; form-action 'none'; connect-src 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-jg16QZ0faLZKxCO/rFZ0tk59rJRLlm1rpG5e/4hMPFY='; style-src 'sha256-9nMAWQQ6QJkdE/Lmq/ZvWN77wrgpBTbLVspVVoeualg='; base-uri 'none'; form-action 'none'; connect-src 'none'">
 <title>zmux Protocol &amp; Ring-Buffer Playground</title>
 <style>
 :root { color-scheme: light dark; font: 14.5px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
@@ -15,11 +15,11 @@ body { margin: 0; padding: 0; background: Canvas; color: CanvasText; }
 .site-nav-links { display: flex; gap: 16px; flex-wrap: wrap; font-size: 14px; }
 .site-nav-links a { color: GrayText; text-decoration: none; font-weight: 500; }
 .site-nav-links a:hover, .site-nav-links a.active { color: LinkText; }
-main { max-width: 920px; margin: 0 auto; padding: clamp(16px, 3vw, 32px); display: grid; gap: 18px; }
+main { max-width: 920px; width: 100%; box-sizing: border-box; margin: 0 auto; padding: clamp(16px, 3vw, 32px); display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; }
 header { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 10px; }
 h1 { margin: 0; font-size: clamp(22px, 4vw, 32px); letter-spacing: -0.02em; }
 .badge { font-family: ui-monospace, monospace; font-size: 12px; padding: 3px 9px; border: 1px solid GrayText; border-radius: 999px; }
-.card { border: 1px solid GrayText; border-radius: 12px; padding: clamp(14px, 2.5vw, 22px); display: grid; gap: 14px; }
+.card { min-width: 0; border: 1px solid GrayText; border-radius: 12px; padding: clamp(14px, 2.5vw, 22px); display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
 .presets { display: flex; flex-wrap: wrap; gap: 8px; }
 .preset-btn { font: 12.5px ui-monospace, monospace; padding: 5px 10px; border-radius: 8px; border: 1px solid GrayText; background: ButtonFace; color: ButtonText; cursor: pointer; }
 .preset-btn:hover { opacity: 0.88; }
