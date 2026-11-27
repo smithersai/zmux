@@ -1,4 +1,5 @@
 {
+  "apiVersion": 1,
   "summary": "zmux: public Smithers Cloud Zig factory with shared object store, Lighthouse backpressure audits, wiki, and auto releases.",
   "flows": [
     {
@@ -305,6 +306,15 @@
     ],
     "maintainers": [
       "roninjin10"
+    ]
+  },
+  "contributes": {
+    "triggers": [
+      {
+        "on": "manual",
+        "flow": "uphill",
+        "title": "Run Uphill audit"
+      }
     ]
   }
 }

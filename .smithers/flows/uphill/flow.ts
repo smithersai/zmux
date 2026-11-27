@@ -4,15 +4,12 @@ import { CiJob } from "@smthrs/sandbox"
 import { Schema } from "effect"
 
 const uphillJob = CiJob.make("uphill", {
-  steps: [
-    { name: "uphill-check", run: "uphill check" },
-    { name: "uphill-compact", run: "uphill --compact" }
-  ]
+  steps: [{ name: "uphill-audit", run: "sh .smithers/scripts/hosted-uphill.sh" }]
 })
 
 export default Flow.make("uphill", {
   description: "Run Uphill continuous metrics, validate metric definitions, and report compact scores and opportunities.",
-  capabilities: ["proc:spawn:uphill *"],
+  capabilities: ["proc:spawn:sh .smithers/scripts/hosted-uphill.sh"],
   effects: {
     reads: ["**"],
     writes: [".uphill/**"],
@@ -22,14 +19,10 @@ export default Flow.make("uphill", {
   },
   modelInvocable: true,
   payload: {
-    target: CiJob.Target
+    run: Schema.String, repo: Schema.String, sha: Schema.String, ref: Schema.String, event: Schema.String
   },
   success: Schema.Struct({
     uphill: CiJob.Result
   }),
-  body: Node.capture({}, ({ target }) =>
-    Node.all({
-      uphill: uphillJob.call(target)
-    })
-  )
+  body: (run) => Node.all({ uphill: uphillJob.call(run) })
 })

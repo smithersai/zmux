@@ -51,6 +51,12 @@ function checkFactory() {
   assert(!HTML_TAG.test(factory.summary), "factory.json summary must not contain HTML")
   assert(Array.isArray(factory.flows) && factory.flows.length > 0, "factory.json must declare flows")
 
+  assert(factory.apiVersion === 1, "manual runs require factory apiVersion 1")
+  const manualAudit = factory.contributes?.triggers?.filter((row) => row.on === "manual" && row.flow === "uphill")
+  assert(manualAudit?.length === 1, "declare the manual Uphill audit once")
+  assert(factory.flows.some((flow) => flow.id === "uphill" && flow.path === ".smithers/flows/uphill/flow.ts"),
+    "the manual Uphill audit must resolve to its repository flow")
+
   const discovered = new Set(walkFlowFiles(join(ROOT, ".smithers", "flows")))
   const declaredPaths = new Set()
   const declaredIds = new Set()

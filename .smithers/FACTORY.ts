@@ -5,6 +5,8 @@
  * .smithers/trust-policy.json, and .smithers/wiki/ by //.smithers:factory-check.
  */
 import { Smithers as S } from "@smthrs/targets"
+import { On, Trigger } from "@smthrs/triggers"
+import Uphill from "./flows/uphill/flow.ts"
 
 export const review = S.Flow({
   flow: "checks/review",
@@ -67,6 +69,7 @@ export const sandboxAuth = S.Flow({
 })
 
 export const factory = S.Factory({
+  triggers: { uphill: Trigger.bind({ flow: Uphill, on: On.manual(), title: "Run Uphill audit" }) },
   summary: "zmux: public Smithers Cloud Zig factory with shared object store, Lighthouse backpressure audits, wiki, and auto releases.",
   flows: [
     review,
