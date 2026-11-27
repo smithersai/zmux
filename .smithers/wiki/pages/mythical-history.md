@@ -32,9 +32,9 @@ In commit `335234ec`, `zmux` migrated to **Zig 0.17.1** and explicit `std.Io` in
 
 Three multi-track review rounds (`bb5bc114` through `693d92a0`) formalized the `v0.4.0` wire contract (Decisions D1 through D6), added a 32-target LLVM SanitizerCoverage fuzz suite (`test/fuzz/`) plus live-PTY chaos fuzzers, built 85+ ReleaseFast benchmarks (`bench/baseline.json`, with 64-byte ring-buffer appends at ~5.9 ns median and 58 GB/s throughput), added privileged Ubuntu foreign-UID CI tests, and wired the first incremental `PACKAGE.ts` build graph to `https://build.smithers.sh`.
 
-### Era V: Public Smithers Cloud Coding Factory (Nov 26, 2026)
+### Era V: Public Smithers Cloud Coding Factory (Nov 26 to 27, 2026)
 
-Starting with Uphill continuous metrics (`9d241246`), `zmux` completed its permanent switchover to `https://smithers.sh/smithersai/zmux` with a 6-gauge Lighthouse Backpressure Audit UI, personalized Maintainer / Contributor / Viewer home pages, authenticated BYOA Cloud MCP with one-time sandbox auth, split cache trust boundaries, and automatic GitHub release and docs publishing.
+Starting with Uphill continuous metrics (`9d241246`), `zmux` completed its permanent switchover to `https://smithers.sh/smithersai/zmux` with a 6-gauge Lighthouse Backpressure Audit UI, personalized Maintainer / Contributor / Viewer home pages, authenticated BYOA Cloud MCP with one-time sandbox auth, split cache trust boundaries, SHA-256 verified `install.sh`, an interactive 6-step Session Lifecycle Trace playground, and automatic GitHub release and docs publishing. In `896e237b`, all 12 monolithic Zig subsystems were decomposed into 84 focused files under 24 kB each, lifting Lighthouse backpressure to **98/100 overall** (Footprint 95, Style 96, Correctness 100, Testing 97, Documentation 97, Factory and Trust 100) with zero missed targets.
 
 ## Lifecycle of a change
 

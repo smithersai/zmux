@@ -274,18 +274,7 @@ test "hangupForeground reaches a foreground job in its own process group" {
     // its own process group, which a signal to the shell's group misses.
     var child = try Pty.spawn(allocator, std.testing.io, .{ .shell = "/bin/sh" });
     defer proc.cleanupPtyForTest(&child);
-    try child.write("sleep 9998\n", sys.monotonicMs() + 2000, -1);
-
-    var fg: posix.pid_t = 0;
-    const deadline = sys.monotonicMs() + 5000;
-    var sink: [4096]u8 = undefined;
-    while (sys.monotonicMs() < deadline) {
-        if (child.pollReadable(10) catch false) _ = child.read(&sink) catch 0;
-        fg = tcgetpgrp(child.master_fd);
-        if (fg > 1 and fg != child.child_pid) break;
-    }
-    try std.testing.expect(fg > 1 and fg != child.child_pid);
-    try std.testing.expect(proc.processRunning(fg));
+    const fg = try startTrappedForegroundJob(&child, "");
 
     child.hangupForeground();
     try std.testing.expect(child.waitBlocking(5000));
@@ -296,12 +285,13 @@ test "hangupForeground reaches a foreground job in its own process group" {
     try std.testing.expect(!proc.processRunning(fg));
 }
 
-/// Start an interactive shell whose foreground job ignores `traps`, wait for
-/// the post-trap sentinel on the PTY, and return its foreground process group.
+/// Start an interactive shell whose foreground job ignores `traps` (if any),
+/// wait for the post-trap sentinel on the PTY, and return its foreground group.
 fn startTrappedForegroundJob(child: *Pty, comptime traps: []const u8) !posix.pid_t {
     // Split the sentinel via printf %s so PTY input echo never triggers early.
-    const cmd = "sh -c 'trap \"\" " ++ traps ++
-        "; printf \"__ZMUX_%s__\\n\" \"FG_READY\"; exec sleep 9996'\n";
+    const trap_prefix = if (traps.len > 0) "trap \"\" " ++ traps ++ "; " else "";
+    const cmd = "sh -c '" ++ trap_prefix ++
+        "printf \"__ZMUX_%s__\\n\" \"FG_READY\"; exec sleep 9996'\n";
     try child.write(cmd, sys.monotonicMs() + 2000, -1);
 
     var fg: posix.pid_t = 0;

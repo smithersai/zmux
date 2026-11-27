@@ -2,6 +2,96 @@
   "generatedFrom": "jj log -r ::main",
   "commits": [
     {
+      "sha": "cfe2a58e",
+      "date": "2026-11-27",
+      "author": "William Cory",
+      "subject": "fix(audit): suppress already-green passing targets from Lighthouse Opportunities table"
+    },
+    {
+      "sha": "55a8ef7f",
+      "date": "2026-11-27",
+      "author": "William Cory",
+      "subject": "fix(ci): split GitHub Pages build and deploy jobs to eliminate artifact indexing race"
+    },
+    {
+      "sha": "896e237b",
+      "date": "2026-11-27",
+      "author": "William Cory",
+      "subject": "refactor(architecture): modularize all 12 large Zig subsystems into 84 focused files (Footprint 95, Overall 98/100)"
+    },
+    {
+      "sha": "0acddaa8",
+      "date": "2026-11-27",
+      "author": "William Cory",
+      "subject": "fix(ui,docs): tighten audit markdown columns, deduplicate history H1, and shorten benchmark filter placeholder"
+    },
+    {
+      "sha": "91bcf51d",
+      "date": "2026-11-27",
+      "author": "William Cory",
+      "subject": "feat(ci): publish Lighthouse Backpressure trust & score summary in Uphill GitHub Actions"
+    },
+    {
+      "sha": "41abd675",
+      "date": "2026-11-27",
+      "author": "William Cory",
+      "subject": "feat(install,test): add SHA-256 verified install.sh and site-wide link/artifact E2E check"
+    },
+    {
+      "sha": "408e8b05",
+      "date": "2026-11-27",
+      "author": "William Cory",
+      "subject": "test(main): expand src/main.zig to 24 unit tests and comptime protocol invariants"
+    },
+    {
+      "sha": "a33b31d0",
+      "date": "2026-11-27",
+      "author": "William Cory",
+      "subject": "feat(playground,fuzz): add 6-step Session Lifecycle Trace mode and cross-platform fuzz-soak minimization"
+    },
+    {
+      "sha": "8985418e",
+      "date": "2026-11-27",
+      "author": "William Cory",
+      "subject": "test(factory): enforce clean public copy invariants on all wiki pages"
+    },
+    {
+      "sha": "0c70c95c",
+      "date": "2026-11-27",
+      "author": "William Cory",
+      "subject": "feat(ui,docs): add Lighthouse Benchmarks tab, Wiki search and backlinks, Overview perf table, and clean ASCII diagram"
+    },
+    {
+      "sha": "81e5d458",
+      "date": "2026-11-27",
+      "author": "William Cory",
+      "subject": "fix(uphill): parse single-line zig-dependencies block accurately and roll up subsystem tests"
+    },
+    {
+      "sha": "d8f77667",
+      "date": "2026-11-27",
+      "author": "William Cory",
+      "subject": "refactor(quality): uplift Uphill to Style 95, Correctness 100, Testing 97, Documentation 97 and add socket_path/pty fuzz & bench targets"
+    },
+    {
+      "sha": "f9755e0c",
+      "date": "2026-11-27",
+      "author": "William Cory",
+      "subject": "fix(docs,ui): emit audit report.md, eliminate playground CSP warning, and polish live nav/hero"
+    },
+    {
+      "sha": "fbd665f5",
+      "date": "2026-11-27",
+      "author": "William Cory",
+      "subject": "feat(factory): add Mythical History timeline, PR cache namespace isolation, MCP doctor/intent auth, and backpressure polish"
+    },
+    {
+      "sha": "c61a25ec",
+      "date": "2026-11-26",
+      "author": "William Cory",
+      "subject": "feat(factory): complete Smithers Cloud switchover, personalized UI, Lighthouse backpressure, wiki, MCP auth, and CI fixes"
+    },
+    {
       "sha": "9d241246",
       "date": "2026-11-26",
       "author": "William Cory",
@@ -150,156 +240,6 @@
       "date": "2026-11-22",
       "author": "William Cory",
       "subject": "feat(observability): add structured logger, socket path cap, and race-free socket bind"
-    },
-    {
-      "sha": "d088ddb0",
-      "date": "2026-11-22",
-      "author": "William Cory",
-      "subject": "feat(foreground): implement Linux /proc comm and cmdline inspection"
-    },
-    {
-      "sha": "9e435dcb",
-      "date": "2026-11-22",
-      "author": "William Cory",
-      "subject": "ci: bump GitHub Actions to Node 24, add fmt/cross-compile/smoke checks"
-    },
-    {
-      "sha": "4e7071e6",
-      "date": "2026-07-02",
-      "author": "William Cory",
-      "subject": "docs: bring README in line with the code; export connect module (audit batch G)"
-    },
-    {
-      "sha": "a04f331a",
-      "date": "2026-07-02",
-      "author": "William Cory",
-      "subject": "test: complete audit-driven coverage (audit batch F)"
-    },
-    {
-      "sha": "52268b54",
-      "date": "2026-07-02",
-      "author": "William Cory",
-      "subject": "feat: detach key, management verbs, richer key input (audit batch E)"
-    },
-    {
-      "sha": "b743fa18",
-      "date": "2026-07-02",
-      "author": "William Cory",
-      "subject": "ci: add test workflow and harden release pipeline (audit batch G/CI)"
-    },
-    {
-      "sha": "2c419e8d",
-      "date": "2026-07-02",
-      "author": "William Cory",
-      "subject": "fix: daemon hardening & security (audit batch D)"
-    },
-    {
-      "sha": "2ae7f257",
-      "date": "2026-07-02",
-      "author": "William Cory",
-      "subject": "fix: PTY and client robustness (audit batch C)"
-    },
-    {
-      "sha": "15ade62c",
-      "date": "2026-07-02",
-      "author": "William Cory",
-      "subject": "fix: mux model correctness (audit batch B)"
-    },
-    {
-      "sha": "90e0b5d0",
-      "date": "2026-07-02",
-      "author": "William Cory",
-      "subject": "fix: daemon lifecycle & concurrency core (audit batch A)"
-    },
-    {
-      "sha": "da6bad3f",
-      "date": "2026-07-02",
-      "author": "William Cory",
-      "subject": "✅ test(integration): handle async RPC notifications"
-    },
-    {
-      "sha": "207549a1",
-      "date": "2026-07-02",
-      "author": "William Cory",
-      "subject": "✅ test(connect): cover RPC response handling"
-    },
-    {
-      "sha": "dfb6c2d0",
-      "date": "2026-07-02",
-      "author": "William Cory",
-      "subject": "✅ test(mux): cover client switching and split cleanup"
-    },
-    {
-      "sha": "e7151392",
-      "date": "2026-07-02",
-      "author": "William Cory",
-      "subject": "✅ test(server): cover mux argument parsing"
-    },
-    {
-      "sha": "53afe8cf",
-      "date": "2026-07-02",
-      "author": "William Cory",
-      "subject": "✅ test(protocol): cover JSON-RPC id handling"
-    },
-    {
-      "sha": "a859fa08",
-      "date": "2026-06-18",
-      "author": "William Cory",
-      "subject": "👷 ci(release): build and publish prebuilt binaries on v* tags"
-    },
-    {
-      "sha": "9c581d5a",
-      "date": "2026-05-09",
-      "author": "Will Cory",
-      "subject": "Merge pull request #1 from patcito/fix/connect-create-or-attach"
-    },
-    {
-      "sha": "3fe07e07",
-      "date": "2026-05-08",
-      "author": "Patrick Aljord",
-      "subject": "perf: remove ~350ms keystroke latency floor"
-    },
-    {
-      "sha": "a4327f4c",
-      "date": "2026-05-08",
-      "author": "Patrick Aljord",
-      "subject": "fix(connect): forward input to canonical paneId, not the user's name"
-    },
-    {
-      "sha": "a09806e3",
-      "date": "2026-05-08",
-      "author": "Patrick Aljord",
-      "subject": "fix: make zmux-connect \"open or create\" by name match the README"
-    },
-    {
-      "sha": "d3fe3cff",
-      "date": "2026-05-07",
-      "author": "William Cory",
-      "subject": "Fix session daemon hangups"
-    },
-    {
-      "sha": "b03b0c37",
-      "date": "2026-05-07",
-      "author": "William Cory",
-      "subject": "🐛 fix(server): preserve replacement sockets on shutdown"
-    },
-    {
-      "sha": "eb764732",
-      "date": "2026-05-07",
-      "author": "William Cory",
-      "subject": "docs: rename Tabmonsters references to Smithers App"
-    },
-    {
-      "sha": "c146b430",
-      "date": "2026-05-07",
-      "author": "William Cory",
-      "subject": "feat: initial release of zmux"
-    },
-    {
-      "sha": "00000000",
-      "date": "1969-12-31",
-      "author": "",
-      "subject": ""
     }
   ]
 }

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-A4DhUorGtEF2GlRt5g5Tw3xA3Mg2pavbGjhpFl4mnk4='; style-src 'sha256-/YDHkAGIYvTqm2dGlcd2zbL8GKsQed9AjsEWa0Uq6Cs='; base-uri 'none'; form-action 'none'; connect-src 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-jg16QZ0faLZKxCO/rFZ0tk59rJRLlm1rpG5e/4hMPFY='; style-src 'sha256-oA0afPDzxqeowWpeRBXKONrxe0T+ExiTOOt7xRl9VWY='; base-uri 'none'; form-action 'none'; connect-src 'none'">
 <title>zmux Protocol &amp; Ring-Buffer Playground</title>
 <style>
 :root { color-scheme: light dark; font: 14.5px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
@@ -31,6 +31,11 @@ textarea#chunks { min-height: 132px; }
 .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
 .actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 button.primary { font: inherit; font-weight: 700; padding: 8px 18px; border-radius: 8px; border: 1px solid GrayText; background: ButtonFace; color: ButtonText; cursor: pointer; }
+button.secondary { font: 12.5px ui-monospace, monospace; padding: 8px 12px; border-radius: 8px; border: 1px solid GrayText; background: transparent; color: CanvasText; cursor: pointer; }
+button.secondary:hover { opacity: 0.85; }
+.meta-strip { display: flex; flex-wrap: wrap; gap: 8px; }
+.meta-chip { font: 12px ui-monospace, monospace; padding: 3px 9px; border-radius: 999px; border: 1px solid GrayText; opacity: 0.9; }
+pre.term-preview { background: #0d1117; color: #e6edf3; border-color: #30363d; }
 #status { font-size: 13px; opacity: 0.85; margin: 0; }
 pre { margin: 0; padding: 12px; border-radius: 8px; border: 1px solid GrayText; overflow-x: auto; font: 12.5px/1.45 ui-monospace, monospace; white-space: pre-wrap; word-break: break-word; }
 ul.notes { margin: 0; padding-left: 18px; display: grid; gap: 4px; font-size: 13.5px; }
@@ -117,12 +122,18 @@ hello-smithers</textarea>
 
     <div class="actions">
       <button type="button" class="primary" id="run-btn">Run Frame</button>
+      <button type="button" class="secondary" id="copy-nc-btn">Copy nc -U command</button>
       <p id="status" role="status">Ready (local deterministic wire verifier)</p>
     </div>
   </section>
 
   <section class="card" id="result-card" hidden>
     <strong>Response &amp; Wire Analysis</strong>
+    <div class="meta-strip" id="meta-strip" hidden></div>
+    <div id="replay-wrap" hidden>
+      <strong>Decoded Terminal Replay Preview</strong>
+      <pre class="term-preview" id="replay-out"></pre>
+    </div>
     <pre id="response-out"></pre>
     <div id="notif-wrap" hidden>
       <strong>Server Notifications</strong>
@@ -167,8 +178,12 @@ const traceInputEl = document.getElementById("trace-input");
 const frameEl = document.getElementById("frame");
 const chunksEl = document.getElementById("chunks");
 const runBtn = document.getElementById("run-btn");
+const copyNcBtn = document.getElementById("copy-nc-btn");
 const statusEl = document.getElementById("status");
 const resultCard = document.getElementById("result-card");
+const metaStrip = document.getElementById("meta-strip");
+const replayWrap = document.getElementById("replay-wrap");
+const replayOut = document.getElementById("replay-out");
 const responseOut = document.getElementById("response-out");
 const notifWrap = document.getElementById("notif-wrap");
 const notifOut = document.getElementById("notif-out");
@@ -283,8 +298,53 @@ function localExec(params) {
   return { ok: true, response: hasId ? { jsonrpc: "2.0", id: parsed.id, result } : null, notifications, notes };
 }
 
+function fromB64(b64) {
+  try {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return "";
+  }
+}
+
 function paint(data) {
-  responseOut.textContent = JSON.stringify(data.response ?? data.result ?? data, null, 2);
+  const payload = data.response ?? data.result ?? data;
+  responseOut.textContent = JSON.stringify(payload, null, 2);
+
+  const chips = [];
+  const res = payload?.result ?? payload;
+  if (typeof res?.replayEndOffset === "number") chips.push("replayEndOffset: " + res.replayEndOffset + " B");
+  if (typeof res?.retainedBytes === "number" && typeof res?.capacity === "number") {
+    chips.push("retained: " + res.retainedBytes + " / " + res.capacity + " B");
+  }
+  if (typeof res?.evictedBytes === "number") chips.push("evicted: " + res.evictedBytes + " B");
+  if (typeof res?.generation === "number") chips.push("generation: " + res.generation);
+  if (typeof res?.finalGeneration === "number") chips.push("finalGeneration: " + res.finalGeneration);
+  if (typeof res?.totalBytesStreamed === "number") chips.push("streamed: " + res.totalBytesStreamed + " B");
+
+  metaStrip.replaceChildren();
+  for (const text of chips) {
+    const span = document.createElement("span");
+    span.className = "meta-chip";
+    span.textContent = text;
+    metaStrip.appendChild(span);
+  }
+  metaStrip.hidden = chips.length === 0;
+
+  let preview = "";
+  if (typeof res?.replayText === "string" && res.replayText.length > 0) preview = res.replayText;
+  else if (typeof res?.replayBase64 === "string" && res.replayBase64.length > 0) preview = fromB64(res.replayBase64);
+  else if (typeof res?.text === "string" && res.text.length > 0) preview = res.text;
+  else if (Array.isArray(res?.steps)) {
+    const capStep = res.steps.find((s) => s.method === "session.capture");
+    if (typeof capStep?.result?.text === "string") preview = capStep.result.text;
+    else if (typeof capStep?.response?.result?.text === "string") preview = capStep.response.result.text;
+  }
+  replayWrap.hidden = preview.length === 0;
+  replayOut.textContent = preview;
+
   const notifs = Array.isArray(data.notifications) ? data.notifications : [];
   notifWrap.hidden = notifs.length === 0;
   notifOut.textContent = JSON.stringify(notifs, null, 2);
@@ -298,23 +358,34 @@ function paint(data) {
   statusEl.textContent = data.ok ? "Frame valid" : "Contract error returned";
 }
 
+function executeCurrent() {
+  const mode = modeEl.value;
+  const params = mode === "ringbuffer"
+    ? { mode: "ringbuffer", capacity: Number(capEl.value), chunks: chunksEl.value.split("\n").filter(Boolean) }
+    : mode === "session_trace"
+      ? { mode: "session_trace", sessionId: traceSessionEl.value.trim(), command: traceCmdEl.value.trim(), input: traceInputEl.value }
+      : { mode: "rpc", frame: frameEl.value.trim() };
+  if (port) {
+    statusEl.textContent = "Running in Smithers sandbox...";
+    port.postMessage({ jsonrpc: "2.0", id: ++nextId, method: "playground/exec", params });
+  } else {
+    paint(localExec(params));
+  }
+}
+
 modeEl.addEventListener("change", () => {
   const mode = modeEl.value;
   rpcPanel.hidden = mode !== "rpc";
   ringPanel.hidden = mode !== "ringbuffer";
   tracePanel.hidden = mode !== "session_trace";
   capWrap.hidden = mode !== "ringbuffer";
+  copyNcBtn.hidden = mode !== "rpc";
   runBtn.textContent = mode === "ringbuffer"
     ? "Simulate Replay"
     : mode === "session_trace"
       ? "Run Session Trace"
       : "Run Frame";
-  resultCard.hidden = true;
-  statusEl.textContent = mode === "ringbuffer"
-    ? "Ready (scrollback ring-buffer replay simulator)"
-    : mode === "session_trace"
-      ? "Ready (6-step PTY echo and generation trace)"
-      : "Ready (local deterministic wire verifier)";
+  executeCurrent();
 });
 
 const siteNav = document.getElementById("site-nav");
@@ -325,6 +396,23 @@ if (parent !== window && siteNav) {
 for (const btn of document.querySelectorAll(".preset-btn")) {
   btn.addEventListener("click", () => {
     frameEl.value = PRESETS[btn.dataset.preset] || PRESETS.ping;
+    executeCurrent();
+  });
+}
+
+if (copyNcBtn) {
+  copyNcBtn.addEventListener("click", () => {
+    const safeFrame = frameEl.value.trim().replace(/'/g, "'\\''");
+    const cmd = "printf '%s\\n' '" + safeFrame + "' | nc -U \"${ZMUX_SOCKET:-/tmp/zmux.sock}\"";
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(cmd).then(() => {
+        statusEl.textContent = "Copied UNIX socket command to clipboard";
+      }).catch(() => {
+        statusEl.textContent = cmd;
+      });
+    } else {
+      statusEl.textContent = cmd;
+    }
   });
 }
 
@@ -344,20 +432,8 @@ if (parent !== window && /^[A-Za-z0-9_-]{22,128}$/.test(nonce ?? "")) {
   parent.postMessage({ jsonrpc: "2.0", id: "playground", method: "ui/initialize", params: { nonce } }, HOST);
 }
 
-runBtn.addEventListener("click", () => {
-  const mode = modeEl.value;
-  const params = mode === "ringbuffer"
-    ? { mode: "ringbuffer", capacity: Number(capEl.value), chunks: chunksEl.value.split("\n").filter(Boolean) }
-    : mode === "session_trace"
-      ? { mode: "session_trace", sessionId: traceSessionEl.value.trim(), command: traceCmdEl.value.trim(), input: traceInputEl.value }
-      : { mode: "rpc", frame: frameEl.value.trim() };
-  if (port) {
-    statusEl.textContent = "Running in Smithers sandbox...";
-    port.postMessage({ jsonrpc: "2.0", id: ++nextId, method: "playground/exec", params });
-  } else {
-    paint(localExec(params));
-  }
-});
+runBtn.addEventListener("click", executeCurrent);
+executeCurrent();
 </script>
 </body>
 </html>
