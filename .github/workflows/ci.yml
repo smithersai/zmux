@@ -115,11 +115,14 @@ jobs:
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.1
+          cache-size-limit: 4096
 
       - name: Run unit and integration tests on musl
         run: |
           zig_dir=$(dirname "$(readlink -f "$(command -v zig)")")
+          host_uid=$(id -u)
+          host_gid=$(id -g)
           docker run --rm \
             -v "$zig_dir:/opt/zig:ro" -v "$GITHUB_WORKSPACE:/src" \
             -w /src alpine:3.23 \
-            /opt/zig/zig build test -Dtarget=x86_64-linux-musl --summary all
+            sh -ec 'trap "chown -R '"$host_uid:$host_gid"' /src/.zig-cache /src/zig-out 2>/dev/null || true" EXIT; /opt/zig/zig build test -Dtarget=x86_64-linux-musl --summary all'
