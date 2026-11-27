@@ -20,6 +20,8 @@ const validatorInputs = [
   S.glob("//.smithers/playground/**"),
   S.file("//.smithers/scripts/mint-sandbox-auth.mjs"),
   S.file("//.smithers/scripts/mint-sandbox-auth.test.mjs"),
+  S.file("//scripts/install.sh"),
+  S.file("//scripts/install.test.mjs"),
   S.file("//.github/workflows/ci.yml"),
   S.file("//bench/baseline.json")
 ]
@@ -76,6 +78,24 @@ const viewsCheck = S.Shell.Test({
   timeout: "2m"
 })
 
+// Builds the static docs site and verifies zero broken relative links,
+// complete llms.txt pages, install.sh, and Lighthouse audit outputs.
+const siteCheck = S.Shell.Test({
+  bin: node,
+  args: ["--test", ".smithers/scripts/site-check.test.mjs"],
+  data: [
+    ...validatorInputs,
+    S.file("//.smithers/scripts/site-check.test.mjs"),
+    S.file("//scripts/build-docs.mjs"),
+    S.file("//README.md"),
+    S.file("//CHANGELOG.md"),
+    S.file("//CONTRIBUTING.md"),
+    S.file("//AGENTS.md"),
+    S.file("//.agents/uphill/rules.md")
+  ],
+  timeout: "2m"
+})
+
 // Prints a fresh one-time-use sandbox auth bundle for local or agent runs.
 const sandboxAuth = S.Shell.Run({
   manual: true,
@@ -94,6 +114,7 @@ export const Package = S.Package({
     "trust-policy-check": trustPolicyCheck,
     "wiki-check": wikiCheck,
     "views-check": viewsCheck,
+    "site-check": siteCheck,
     "sandbox-auth": sandboxAuth
   }
 })

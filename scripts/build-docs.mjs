@@ -528,6 +528,9 @@ ${renderMarkdown(mythicalMd)}
   }
 
   copyFileSync(join(ROOT, ".smithers", "playground", "index.html"), join(OUT, "playground", "index.html"))
+  if (existsSync(join(ROOT, "scripts", "install.sh"))) {
+    copyFileSync(join(ROOT, "scripts", "install.sh"), join(OUT, "install.sh"))
+  }
 
   const scorePills = (auditJson.categories ?? [])
     .map((c) => `<span class="pill ${escapeHtml(c.band || "average")}">${escapeHtml(c.title)}: ${c.score}/100</span>`)
@@ -612,7 +615,8 @@ ${benchRows ? `<h2>Performance highlights (ReleaseFast baselines)</h2>
 </div>` : ""}
 
 <h2>Install</h2>
-<pre><code>zig fetch --save=zmux git+https://github.com/smithersai/zmux</code></pre>
+<pre><code>curl -fsSL https://smithersai.github.io/zmux/install.sh | sh
+zig fetch --save=zmux git+https://github.com/smithersai/zmux</code></pre>
 
 <h2>Connect via Authenticated Cloud MCP</h2>
 <pre><code>claude mcp add zmux --transport http https://smithers.sh/smithersai/zmux/mcp

@@ -222,7 +222,8 @@ function checkViews() {
       "--test",
       ".smithers/playground/run.test.mjs",
       ".smithers/views/backpressure/run.test.mjs",
-      ".smithers/scripts/mint-sandbox-auth.test.mjs"
+      ".smithers/scripts/mint-sandbox-auth.test.mjs",
+      "scripts/install.test.mjs"
     ],
     {
       cwd: ROOT,

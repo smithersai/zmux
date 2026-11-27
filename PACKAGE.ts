@@ -259,6 +259,7 @@ const docsSite = S.Shell.Build({
   args: ["scripts/build-docs.mjs"],
   data: [
     S.file("scripts/build-docs.mjs"),
+    S.file("scripts/install.sh"),
     S.file("README.md"),
     S.file("CHANGELOG.md"),
     S.file("CONTRIBUTING.md"),
