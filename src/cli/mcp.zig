@@ -199,6 +199,8 @@ fn dispatchToolCall(
     return dispatchToolCallOnClient(allocator, &client, id_json, params);
 }
 
+const EmptyObj = struct {};
+
 fn buildInitializeResponse(allocator: std.mem.Allocator, id_json: []const u8, params: std.json.Value) ![]u8 {
     const requested = connect_wire.jsonObjectString(params, "protocolVersion");
     const negotiated = if (requested) |ver|
@@ -208,7 +210,7 @@ fn buildInitializeResponse(allocator: std.mem.Allocator, id_json: []const u8, pa
     assert(negotiated.len == 10);
     return protocol.result(allocator, id_json, .{
         .protocolVersion = negotiated,
-        .capabilities = .{ .tools = .{} },
+        .capabilities = .{ .tools = EmptyObj{} },
         .serverInfo = .{ .name = "zmux", .version = protocol.version },
     });
 }

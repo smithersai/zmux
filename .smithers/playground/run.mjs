@@ -16,7 +16,7 @@
 
 const MAX_REQUEST_BYTES = 16 * 1024
 const MAX_JSON_DEPTH = 32
-const PROTOCOL_VERSION = "0.4.0"
+const PROTOCOL_VERSION = "0.5.0"
 
 const KNOWN_METHODS = new Set([
   "daemon.ping",
@@ -28,20 +28,31 @@ const KNOWN_METHODS = new Set([
   "session.terminate",
   "session.resize",
   "session.capture",
+  "session.screen",
   "session.send",
   "session.sendKey",
   "session.rename",
   "window.new",
   "window.select",
   "window.rename",
+  "window.close",
   "pane.split",
   "pane.select",
   "pane.rename",
   "pane.respawn",
+  "pane.wait",
+  "pane.exec",
+  "pane.signal",
+  "pane.close",
+  "pane.resizeSplit",
+  "pane.zoom",
+  "pane.metadata",
+  "pane.record",
   "client.attach",
   "client.detach",
   "client.switch",
   "client.list",
+  "client.setMode",
   "events.subscribe",
   "key.bind",
   "key.dispatch",

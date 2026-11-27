@@ -1,5 +1,53 @@
 # Changelog
 
+## [0.5.0] - 2026-11-27
+
+Terminal intelligence, zero-poll OS event reactor, agent-native JSON-RPC extensions, unified `zmux` CLI with built-in MCP server and SSH attach, canonical OpenRPC 1.3.2 schema, official TypeScript and Python SDKs, WebSocket/SSE web bridge, `libzmux` C99 ABI, and multi-channel packaging. All v0.4.0 D1-D6 wire contracts remain strictly backwards-compatible.
+
+### Added
+
+- **Pure-Zig VT100/xterm/OSC terminal state engine (`src/vt/`, `zmux.vt`)**:
+  - Zero-dependency stateful ECMA-48/CSI/SGR/OSC terminal emulator tracking primary and alternate screen buffers, truecolor/256-color styles, UTF-8 + wide East Asian cell widths, DEC private modes, and bounded scrollback lines.
+  - Parses OSC 0/2 titles, OSC 7 CWD (`file://` URIs), OSC 52 clipboard updates, OSC 133 shell prompt/command boundaries (`A`/`B`/`C`/`D`), and OSC 7501/9/777 agent status markers.
+  - Generates lossless `ansiRestore` state snapshots for TUI reattach (`client.attach` with `replayMode: "vt"` or `"ansi_restore"`) and structured `session.screen` JSON snapshots (`rows`, `cols`, `cursor`, `modes`, `title`, `cwd`, `promptState`, `agentStatus`, `text`, `lines`, optional `cells`, optional `ansiRestore`).
+- **Zero-poll OS event reactor (`src/reactor/`, `zmux.reactor`)**:
+  - macOS `kqueue(2)` (`EVFILT_READ` + `EVFILT_PROC` `NOTE_EXIT` + `EVFILT_USER`) and Linux `epoll(7)` + `eventfd(2)` + `pidfd_open(2)` with clean fallback.
+  - Integrated into `src/native/reader.zig` to replace the 25 ms Darwin polling loop with immediate kernel event wakeups.
+- **Agent-native JSON-RPC extensions (11 additive RPCs, 39 total; 4 new notifications, 13 total)**:
+  - `session.screen`: query rendered VT screen, cursor, modes, OSC metadata, plain text, cell matrix, and ANSI restore sequences.
+  - `session.capture` additive `format` parameter (`raw`, `plain`, `ansi`, `cells`).
+  - `pane.wait`: server-side condition-variable wait for pattern/regex, process exit, idle duration, OSC 133 prompt/command completion, OSC 7501 agent status, or foreground return.
+  - `pane.exec`: run a shell command inside an existing pane and return structured `{exitCode, signal, output, outputBase64, timedOut, durationMs}`.
+  - `pane.signal`: deliver POSIX signals by name (`SIGINT`, `TERM`, `SIGUSR1`, etc.) or number to a pane's foreground process group or child process.
+  - `pane.close` and `window.close`: explicit pane and window teardown with snapshot reply.
+  - `pane.resizeSplit` and `pane.zoom`: update binary split node ratios and per-window zoomed pane state (`zoomedPaneId`).
+  - `pane.metadata`: bounded 16 KiB string key/value metadata on panes, surfaced in `mux.snapshot`.
+  - `pane.record`: start, stop, and inspect bounded asciicast v2 (`.cast`) pane recordings.
+  - `client.attach` additive options (`readOnly`, `resizePolicy`, `replayMode`, `resumeFromOffset`, `resumeGeneration`) and `client.setMode` for dynamic observer/resize control.
+  - Push notifications: `pane_title_changed`, `pane_cwd_changed`, `pane_prompt_changed`, and `pane_status_changed`.
+  - `daemon.ping` additive health counters (`livePanes`, `connections`, `droppedEvents`, `rejectedConnections`).
+- **Unified `zmux` CLI (`src/cli/`, `zig-out/bin/zmux`)**:
+  - Auto-spawns `zmuxd` by default (`--no-spawn` to disable) and exposes ergonomic verbs: `attach`, `new`, `ls`, `run`/`exec`, `send`, `screen`, `capture`/`tail`, `wait`, `signal`, `split`, `close`, `kill`, `rename`, `events`, `record`, `doctor`, `daemon`, and `shutdown`.
+  - **Built-in `zmux mcp`**: zero-dependency stdio Model Context Protocol server exposing 9 agent tools (`zmux_list_sessions`, `zmux_create_session`, `zmux_send_input`, `zmux_send_key`, `zmux_read_screen`, `zmux_wait`, `zmux_exec`, `zmux_signal`, `zmux_terminate`).
+  - **Built-in `zmux ssh <host> [session]`**: remote UNIX-socket tunnel attach with automatic reconnect and `resumeFromOffset` deduplication.
+- **Canonical OpenRPC 1.3.2 specification (`protocol/openrpc.json`)**:
+  - Machine-readable contract covering all 39 methods, 13 notifications, 61 schemas, and 11 error kinds, verified in CI by `protocol/validate-spec.mjs` against Zig server dispatch tables.
+- **Official TypeScript/Bun/Node SDK (`sdk/ts/`, `@smithers/zmux`)**:
+  - Zero-dependency UNIX-socket JSON-RPC client, `AttachedPane` stream reconciler, `@smithers/zmux/xterm` browser/Electron terminal adapter, authenticated `zmux-ws` WebSocket + HTTP `/rpc` + SSE `/events` bridge with strict loopback Origin checks, and standalone browser demo (`sdk/ts/demo/index.html`).
+- **Official Python 3.10+ SDK (`sdk/python/`)**:
+  - Zero-dependency `ZmuxClient` (sync) and `AsyncZmuxClient` (`asyncio`), `AttachedPane`/`AsyncAttachedPane`, byte-exact socket-path parity, and offset/generation deduplication.
+- **Embeddable C99 library (`libzmux.a` + `include/zmux.h`, `src/c_api/`)**:
+  - Opaque C99 ABI for scrollback ring buffers, UNIX-socket JSON-RPC clients with peer auth, and VT terminal state inspection (`zmux_vt_*`), verified with a `-std=c99 -Wall -Wextra -Werror` smoke test suite.
+- **Packaging and distribution**:
+  - Audited POSIX installer (`scripts/install.sh`) with mandatory SHA-256 verification and `--dry-run`.
+  - Automated Homebrew formula template and generator (`packaging/homebrew/zmux.rb.tmpl`, `scripts/generate-homebrew.mjs`), Nix flake (`flake.nix`), and `@smithers/zmux-cli` `bunx`/`npx` launcher (`sdk/cli-npm/`).
+  - Release workflow now publishes unified `zmux-<target>.tar.gz`, split `zmuxd`/`zmux-connect` archives, `libzmux-<target>.tar.gz`, `SHA256SUMS`, and `zmux.rb`.
+
+### Changed
+
+- `session.info`, `session.resize`, `session.capture`, `session.send`, and `session.sendKey` now also accept `paneId`, `targetPaneId`, and `target` in addition to `sessionId` and `id`.
+- Expanded coverage-guided fuzzing to 49 targets across 17 subsystems and benchmark suites to 114 benchmarks across 17 suites.
+
 ## [0.4.0] - 2026-11-23
 
 Round-1 and Round-2 review hardening. Decisions D1-D6 change the wire contract.

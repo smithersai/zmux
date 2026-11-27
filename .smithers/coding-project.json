@@ -29,6 +29,7 @@
         "protocol-and-framing",
         "daemon-and-security",
         "mux-model-and-scrollback",
+        "vt-reactor-and-ecosystem",
         "factory-and-trust-model",
         "mythical-history"
       ]
@@ -180,6 +181,32 @@
         "start-here",
         "factory-and-trust-model",
         "testing-fuzzing-and-benchmarks"
+      ]
+    },
+    {
+      "id": "vt-reactor-and-ecosystem",
+      "title": "VT engine, OS reactor, CLI, MCP, and SDK ecosystem",
+      "purpose": "Explain the pure-Zig VT100/OSC screen engine, kqueue/epoll reactor, unified zmux CLI + MCP server, OpenRPC spec, TS/Python SDKs, and libzmux C99 ABI.",
+      "kind": "current",
+      "document": ".smithers/wiki/pages/vt-reactor-and-ecosystem.md",
+      "inputs": [
+        "src/vt.zig",
+        "src/vt/terminal.zig",
+        "src/vt/osc.zig",
+        "src/reactor.zig",
+        "src/reactor/kqueue.zig",
+        "src/reactor/epoll.zig",
+        "src/cli.zig",
+        "src/cli/mcp.zig",
+        "src/c_api.zig",
+        "include/zmux.h",
+        "protocol/openrpc.json"
+      ],
+      "related": [
+        "start-here",
+        "protocol-and-framing",
+        "pty-and-process-lifecycle",
+        "mux-model-and-scrollback"
       ]
     }
   ]

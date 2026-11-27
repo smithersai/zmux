@@ -50,7 +50,7 @@ pub const paneOutputNotification = frames.paneOutputNotification;
 pub const attachResult = frames.attachResult;
 
 /// zmux wire protocol version reported by `daemon.ping` and handshakes.
-pub const version = "0.4.0";
+pub const version = "0.5.0";
 
 /// Notification method sent when a session's foreground process changes.
 pub const foreground_changed_method = "foreground_changed";

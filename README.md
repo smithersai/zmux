@@ -1,120 +1,85 @@
 # zmux
 
-A tmux-style PTY session multiplexer, written in Zig and shipped as a Zig
-package. A long-lived daemon owns the mux model and PTY child processes;
-clients attach and detach over a UNIX-domain JSON-RPC socket.
+A headless, zero-dependency PTY session multiplexer and terminal intelligence daemon written in Zig. A long-lived daemon (`zmuxd`) owns the mux tree, PTY child processes, bounded scrollback ring buffers, and a pure-Zig VT100/xterm/OSC terminal state engine. Clients attach over a UNIX-domain JSON-RPC 2.0 socket through the unified `zmux` CLI, built-in `zmux mcp` server, official TypeScript and Python SDKs, the authenticated `zmux-ws` web bridge, or the embeddable `libzmux` C99 ABI.
 
-`zmux` is the session backbone behind the [Smithers App](https://github.com/smithersai)
-and is intended for any application that needs persistent terminal sessions
-without depending on `tmux(1)` itself: native desktop apps, GTK frontends,
-web terminals, headless agent runtimes, and CI fixtures all attach to the
-same daemon model.
+`zmux` is the session backbone behind the [Smithers App](https://github.com/smithersai) and is built for any application that needs persistent, inspectable terminal sessions without depending on `tmux(1)`: native desktop apps, web terminals (`xterm.js`), coding agents (Claude Code, Codex, MCP hosts), SSH workflows, and CI fixtures all attach to the same daemon model.
 
-```
-┌────────────┐     UNIX socket / JSON-RPC      ┌───────────────────────┐
-│  client A  │ ------------------------------> │                       │
-└────────────┘                                 │                       │
-┌────────────┐                                 │   zmuxd (daemon)      │
-│  client B  │ ------------------------------> │  - sessions / windows │
-└────────────┘                                 │  - panes / PTYs       │
-┌────────────┐                                 │  - scrollback buffer  │
-│  client C  │ ------------------------------> │  - key bindings       │
-└────────────┘                                 └───────────────────────┘
+```text
+┌────────────────────────────┐     UNIX socket / JSON-RPC 2.0      ┌─────────────────────────────┐
+│  zmux CLI / zmux ssh / MCP │ ──────────────────────────────────> │                             │
+└────────────────────────────┘                                     │      zmuxd (daemon)         │
+┌────────────────────────────┐                                     │  - sessions / windows       │
+│  TS / Python / C99 SDKs    │ ──────────────────────────────────> │  - panes / splits / zoom    │
+└────────────────────────────┘                                     │  - kqueue / epoll reactor   │
+┌────────────────────────────┐                                     │  - pure-Zig VT100/OSC grid  │
+│  zmux-ws -> xterm.js Web   │ ──────────────────────────────────> │  - scrollback + asciicast   │
+└────────────────────────────┘                                     └─────────────────────────────┘
 ```
 
 ## Why zmux
 
-`tmux(1)` is a great terminal multiplexer but a poor library: its server speaks
-a line-oriented control protocol bolted onto a CLI, its model lives behind
-opaque format strings, and embedding it means shelling out to a binary you
-do not own. `zmux` keeps tmux's server-owns-the-PTY architecture and drops
-everything else:
+`tmux(1)` is a great interactive multiplexer for humans, but a painful programmatic substrate. Its control mode bolts a line-oriented protocol onto a CLI, its state hides behind opaque format strings, and embedding it means shelling out to a binary you do not own. `zmux` keeps tmux's daemon-owns-the-PTY architecture and reimagines everything else for apps and agents:
 
-- **JSON-RPC over a UNIX socket.** Every API call is a structured request with
-  a structured response. No format strings, no screen-scraping `tmux ls`.
-- **First-class multi-client semantics.** Multiple logical clients can attach
-  to the same pane simultaneously. Native, web, and headless frontends share
-  one daemon-owned PTY without fighting over the fd.
-- **Server-side scrollback capture.** Every pane streams into a bounded ring
-  buffer. New attachments replay the recent backlog instead of starting at a
-  blank screen.
-- **Out-of-band notifications.** Pane output, activity, bell, exit, and
-  foreground-process changes arrive as JSON-RPC notifications, so a UI does
-  not need to poll.
-- **Embeddable.** Zig package, MIT license, no required system services.
+- **Typed JSON-RPC 2.0 + OpenRPC 1.3.2.** All 39 RPCs and 13 push notifications are documented in [`protocol/openrpc.json`](protocol/openrpc.json) and verified against Zig server dispatch tables in CI. No format strings or screen-scraping.
+- **Pure-Zig VT100/xterm/OSC terminal intelligence.** Every pane tracks a stateful cell grid, primary and alternate screen buffers, cursor and DEC modes, OSC 0/2 title, OSC 7 CWD, OSC 52 clipboard, OSC 133 prompt/command boundaries, and OSC 7501/9/777 agent status with zero external dependencies.
+- **Agent-native primitives out of the box.** `session.screen` reads rendered text and cells, `pane.wait` blocks server-side on patterns, exits, idle windows, or prompt completion, `pane.exec` returns structured `{exitCode, output, durationMs}`, `pane.signal` delivers POSIX signals, `pane.record` writes asciicast v2 `.cast` files, and `zmux mcp` exposes 9 stdio MCP tools directly from the single native binary.
+- **Zero-poll OS event reactor.** macOS `kqueue(2)` (`EVFILT_PROC` + `NOTE_EXIT`) and Linux `epoll(7)` + `eventfd(2)` + `pidfd_open(2)` eliminate legacy 25 ms exit polling loops.
+- **First-class multi-client sharing and lossless reattach.** Multiple humans, web terminals, and headless agents share one daemon-owned PTY with per-client `readOnly` and `resizePolicy` modes, `replayMode: "vt"` lossless TUI restoration, and gap-free `resumeFromOffset` delta replay.
+- **Embeddable everywhere.** Zero runtime dependencies, MIT license, native Zig package, `libzmux.a` + `include/zmux.h` C99 ABI, zero-dep `@smithers/zmux` TypeScript/Bun/Node SDK + `zmux-ws` + `xterm` adapter, and zero-dep Python 3.10+ sync/`asyncio` SDK.
+
+## Architectural thesis: headless backbone, not terminal chrome
+
+`zmux` is intentionally focused on being the fast, secure, programmatic PTY backbone. Status bars, popups, copy-mode UIs, mouse menus, and `.tmux.conf` scripting belong in the host application (your terminal emulator, desktop app, web UI, or coding agent), not baked into the daemon. Like tmux, `zmux` keeps sessions alive across client and app restarts while `zmuxd` and its PTY children run. It does not persist live processes across an OS reboot.
 
 ## What's supported
 
-- UNIX-domain JSON-RPC control socket
-- Owner-only socket files and private daemon-managed directories
-- Same-UID peer credential validation by both client and daemon
-- Daemon-side startup locking so concurrent starters cannot unlink or steal a
-  live daemon socket
-- `daemon.ping` / `daemon.shutdown`
-- Server-owned session, window, pane, layout, client, key binding, activity /
-  bell / exit alert, and respawn state exposed by `mux.snapshot`
-- `session.{create,info,list,terminate,resize,capture,send,sendKey,rename}`
-- `window.{new,select,rename}`
-- `pane.{split,select,rename,respawn}`
-- `client.{attach,detach,switch,list}` — multiple logical clients per pane
-- `key.{bind,dispatch,list}` — prefix-style key binding and dispatch
-- `command.exec` — first tmux-like command parser for `split-window`,
-  `new-window`, and `respawn-pane`
-- PTY resize, raw-byte input, named-key input, and bounded scrollback capture
-- Pane output, activity, bell, exit, and foreground process notifications
-- Client-side raw mode, SIGWINCH resize forwarding, and termios restoration
-- Helper binary aliases for embedding apps:
-  `smithers-session-daemon` and `smithers-session-connect`
-
-## Current gaps
-
-`zmux` is intentionally smaller than tmux. It owns the state and the daemon
-model, but the command surface is narrower. The following are not yet
-implemented and would be welcome contributions:
-
-- Full tmux command-line target syntax (`-t session:window.pane` everywhere)
-- Copy mode and paste buffers
-- Status bars, menus, popups
-- Hooks and formats
-- Config file (`.tmux.conf`-style) loading
-- Layout persistence across daemon restarts
-
-Like tmux, `zmux` keeps sessions alive across client/app restarts only while
-the daemon process and its PTY child processes remain alive. It does not keep
-live processes alive across an operating-system reboot.
+- **Daemon & security:** UNIX-domain JSON-RPC 2.0 control socket, private `0700` daemon-managed directories, `0600` socket files, same-UID peer credential authentication (`SO_PEERCRED` / `getpeereid`), persistent `flock(2)` startup locking, and slow-client backpressure.
+- **Unified `zmux` CLI:** auto-spawns `zmuxd` by default (`--no-spawn` to opt out) with `attach`, `new`, `ls`, `run`/`exec`, `send`, `screen`, `capture`/`tail`, `wait`, `signal`, `split`, `close`, `kill`, `rename`, `events`, `record`, `ssh`, `mcp`, `doctor`, `daemon`, and `shutdown`.
+- **Daemon & mux core:** `daemon.{ping,shutdown}`, `mux.snapshot`, `session.{create,info,list,terminate,resize,capture,screen,send,sendKey,rename}`, `window.{new,select,rename,close}`, `pane.{split,select,rename,respawn,close,resizeSplit,zoom,metadata,wait,exec,signal,record}`, `client.{attach,detach,switch,list,setMode}`, `events.subscribe`, `key.{bind,dispatch,list}`, and `command.exec`.
+- **VT & OSC state engine:** primary/alt screens, SGR 16/256/truecolor, UTF-8 wide cell widths, DEC modes, `replayMode: "vt"` ANSI restore snapshots, formatted `session.capture` (`raw`, `plain`, `ansi`, `cells`), and live push notifications (`pane_title_changed`, `pane_cwd_changed`, `pane_prompt_changed`, `pane_status_changed`).
+- **SDKs & Web bridge:** [`protocol/openrpc.json`](protocol/openrpc.json), [`sdk/ts/`](sdk/ts/) (`@smithers/zmux`, `@smithers/zmux/xterm`, `zmux-ws`), [`sdk/python/`](sdk/python/) (sync + `asyncio`), and [`include/zmux.h`](include/zmux.h) + `libzmux.a` C99 ABI.
+- **Compatibility binaries:** `zmuxd`, `zmux-connect`, `smithers-session-daemon`, and `smithers-session-connect`.
 
 ## Install
 
-`zmux` requires Zig **0.17.1** or a later **0.17.x** patch release. A
-`comptime` guard in `build.zig` accepts `>= 0.17.1` and `< 0.18.0` and rejects
-0.18 development builds. Use zmux v0.2.1 for Zig 0.15.2. It fixes Linux socket directory creation from v0.2.0.
-
-### Prebuilt binaries
-
-GitHub Releases ship `.tar.gz` archives with matching
-`.sha256` checksums for all four targets below. v0.1.0 shipped raw binaries
-for linux-x64 and macos-arm64.
-
-| Asset | Target |
-|-------|--------|
-| `zmuxd-linux-x64.tar.gz` / `zmux-connect-linux-x64.tar.gz` | Linux x86_64, musl |
-| `zmuxd-linux-arm64.tar.gz` / `zmux-connect-linux-arm64.tar.gz` | Linux arm64, musl |
-| `zmuxd-macos-arm64.tar.gz` / `zmux-connect-macos-arm64.tar.gz` | macOS arm64 |
-| `zmuxd-macos-x64.tar.gz` / `zmux-connect-macos-x64.tar.gz` | macOS x86_64 |
-
-Each tarball includes the binary and `LICENSE`, with a matching `.sha256`
-sidecar:
+### One-line POSIX installer (SHA-256 verified)
 
 ```sh
-release_tag=vX.Y.Z
-curl -LO "https://github.com/smithersai/zmux/releases/download/${release_tag}/zmux-connect-linux-x64.tar.gz"
-curl -LO "https://github.com/smithersai/zmux/releases/download/${release_tag}/zmux-connect-linux-x64.tar.gz.sha256"
-shasum -a 256 -c zmux-connect-linux-x64.tar.gz.sha256
-tar -xzf zmux-connect-linux-x64.tar.gz
-chmod +x zmux-connect
+curl -fsSL https://raw.githubusercontent.com/smithersai/zmux/main/scripts/install.sh | sh
 ```
 
+Installs `zmux`, `zmuxd`, and `zmux-connect` into `~/.local/bin` after verifying `SHA256SUMS`. Pass `--dry-run`, `--dir DIR`, or `--version v0.5.0` to customize.
+
+### Homebrew, Nix, and bunx/npx
+
+```sh
+# Homebrew (formula zmux.rb is generated and attached to every GitHub Release)
+brew install https://github.com/smithersai/zmux/releases/latest/download/zmux.rb
+
+# Nix flakes
+nix run github:smithersai/zmux -- doctor --json
+
+# Node / Bun zero-install launcher (downloads and SHA-256 verifies native binary)
+bunx @smithers/zmux-cli ls
+```
+
+### Prebuilt release tarballs
+
+GitHub Releases ship `.tar.gz` archives with `.sha256` sidecars, a consolidated `SHA256SUMS`, and `zmux.rb` for all four targets:
+
+| Asset | Contents | Target |
+|-------|----------|--------|
+| `zmux-linux-x64.tar.gz` | `zmux`, `zmuxd`, `zmux-connect`, `LICENSE` | Linux x86_64, static musl |
+| `zmux-linux-arm64.tar.gz` | `zmux`, `zmuxd`, `zmux-connect`, `LICENSE` | Linux arm64, static musl |
+| `zmux-macos-arm64.tar.gz` | `zmux`, `zmuxd`, `zmux-connect`, `LICENSE` | macOS arm64 |
+| `zmux-macos-x64.tar.gz` | `zmux`, `zmuxd`, `zmux-connect`, `LICENSE` | macOS x86_64 |
+| `libzmux-<target>.tar.gz` | `libzmux.a`, `zmux.h`, `LICENSE` | All four targets |
+
+Legacy split archives (`zmuxd-<target>.tar.gz` and `zmux-connect-<target>.tar.gz`) continue to ship alongside the unified archive.
+
 ### As a Zig package
+
+`zmux` requires Zig **0.17.1** or a later **0.17.x** patch release (`>= 0.17.1, < 0.18.0`). Use zmux v0.2.1 for Zig 0.15.2.
 
 ```sh
 zig fetch --save=zmux git+https://github.com/smithersai/zmux
@@ -128,10 +93,11 @@ const zmux_dep = b.dependency("zmux", .{
     .optimize = optimize,
 });
 
-// Use the library API
+// Use the Zig library API (Server, SessionManager, NativeSession, vt, reactor, cli)
 exe.root_module.addImport("zmux", zmux_dep.module("zmux"));
 
-// Or install one of the prebuilt executables
+// Or install prebuilt binaries / libzmux.a
+b.installArtifact(zmux_dep.artifact("zmux"));
 b.installArtifact(zmux_dep.artifact("zmuxd"));
 b.installArtifact(zmux_dep.artifact("zmux-connect"));
 ```
@@ -141,7 +107,7 @@ b.installArtifact(zmux_dep.artifact("zmux-connect"));
 ```sh
 git clone https://github.com/smithersai/zmux
 cd zmux
-zig build
+zig build -Doptimize=ReleaseSafe
 zig build test
 ```
 
@@ -149,98 +115,105 @@ Produces:
 
 | Artifact | Purpose |
 |----------|---------|
-| `zig-out/bin/zmuxd` | Long-lived daemon. Owns sessions and PTY child processes. |
-| `zig-out/bin/zmux-connect` | Client. Attaches stdin/stdout to a session over the daemon socket. |
+| `zig-out/bin/zmux` | Unified CLI (auto-spawns `zmuxd`, interactive attach, agent verbs, `zmux mcp`, `zmux ssh`, `zmux doctor`). |
+| `zig-out/bin/zmuxd` | Long-lived daemon owning sessions, PTYs, VT engines, and scrollback buffers. |
+| `zig-out/bin/zmux-connect` | Backwards-compatible interactive attach client. |
 | `zig-out/bin/smithers-session-daemon` | Alias of `zmuxd` for embedding apps. |
 | `zig-out/bin/smithers-session-connect` | Alias of `zmux-connect` for embedding apps. |
+| `zig-out/lib/libzmux.a` + `zig-out/include/zmux.h` | Embeddable C99 static library and header. |
 
 ## Quickstart
 
-The tmux-like one-command path starts a daemon on demand, opens or creates a
-session named `work`, and attaches your terminal:
+### Interactive sessions and agent scripting
+
+`zmux` auto-starts `zmuxd` on demand when the daemon socket is absent:
 
 ```sh
-zmux-connect work --spawn-daemon
+# Open or create an interactive session named "work" (detach with Ctrl-\)
+zmux work
+
+# Reattach with lossless VT state restoration (ideal for vim, htop, TUIs)
+zmux attach work --replay vt
+
+# Script panes directly from a shell or coding agent
+zmux new build --command "/bin/sh"
+zmux exec build "zig build test"
+zmux screen build --format plain
+zmux wait build --pattern "passed" --timeout-ms 30000
+zmux signal build SIGINT
+zmux record build start --out session.cast
+zmux doctor --json
 ```
 
-`--spawn-daemon` looks for a sibling `zmuxd` next to the `zmux-connect`
-binary (`smithers-session-connect` prefers `smithers-session-daemon`) and
-waits up to 4 seconds for the socket. An auto-spawned daemon writes startup
-stderr to `<socket>.log` in a private directory owned by your UID.
-Pass an existing private parent when auto-spawning on a custom path.
+### Built-in MCP server for coding agents
 
-Detach with `Ctrl-\` by default, then reattach with the same session name:
+Register the native binary directly with Claude Code, Cursor, or any stdio MCP host (zero Node/Python runtime required):
 
 ```sh
-zmux-connect work
+claude mcp add zmux -- zmux mcp
 ```
 
-Use `--detach-key ctrl-a` to choose a different chord, or
-`--detach-key none` to disable it. Detach interception is enabled only when
-stdin is a TTY, so piped input is forwarded verbatim. After piped input
-reaches EOF, the client reads output until the session ends or the socket
-is quiet for two seconds. The pane keeps running when the client leaves.
-Reattaching to an exited pane prints its replay and exit status, then
-respawns it with the original command.
+`zmux mcp` exposes 9 tools: `zmux_list_sessions`, `zmux_create_session`, `zmux_send_input`, `zmux_send_key`, `zmux_read_screen`, `zmux_wait`, `zmux_exec`, `zmux_signal`, and `zmux_terminate`.
 
-You can also start the daemon explicitly on its default socket.
+### Remote sessions over SSH
+
+Attach to a remote host's `zmuxd` socket with automatic tunnel reconnect and gap-free `resumeFromOffset` replay:
 
 ```sh
-# Terminal 1 — daemon
-zmuxd
-
-# Terminal 2 — open or create a session named "work"
-zmux-connect work
+zmux ssh devbox work
 ```
 
-Pass `--no-create` to require an existing session, or `--command CMD` to
-override the shell command spawned in the new session. Both binaries support
-`--version` / `-V`.
+### TypeScript, Python, Web, and C99 SDKs
 
-Common management calls are available through `zmux-connect`:
+```ts
+// TypeScript / Bun / Node (@smithers/zmux, zero dependencies)
+import { ZmuxClient } from "@smithers/zmux"
+
+const client = await ZmuxClient.connect({ spawnDaemon: true })
+const pane = await client.createSession({ id: "agent", command: "/bin/sh" })
+const res = await client.execPane({ paneId: pane.paneId, command: "uname -a" })
+const screen = await client.screen({ paneId: pane.paneId })
+console.log(res.exitCode, screen.title, screen.cwd, screen.text)
+client.close()
+```
+
+```python
+# Python 3.10+ (sdk/python, zero dependencies, sync + asyncio)
+from zmux import ZmuxClient
+
+with ZmuxClient.connect(spawn_daemon=True) as client:
+    pane = client.create_session(name="agent", command="/bin/sh")
+    screen = client.screen(pane.pane_id)
+    print(screen.text)
+```
 
 ```sh
-zmux-connect ls
-zmux-connect rename work renamed
-zmux-connect kill renamed
-zmux-connect shutdown
+# Authenticated WebSocket / HTTP / SSE bridge for browser xterm.js UIs
+bun sdk/ts/src/bridge-cli.ts --port 7777
 ```
 
-Add `--json` to `ls`, `kill`, `rename`, or `shutdown` to print the raw
-JSON-RPC response on stdout, including errors. An RPC error exits with status 1.
-`--socket PATH` may precede the verb. To attach to a session named `attach`,
-`ls`, `kill`, `rename`, or `shutdown`, use `zmux-connect attach NAME` or
-`zmux-connect -- NAME`. The latter form also accepts names starting with `-`.
+### Raw UNIX socket JSON-RPC
 
-To connect programmatically, use the daemon’s resolved path from the next
-section. This example uses the default HOME-based socket.
+To connect programmatically without an SDK, speak newline-delimited JSON-RPC 2.0 over the daemon's socket:
 
 ```sh
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"daemon.ping"}' \
   | nc -U "$HOME/.smithers/sessions.sock"
-# {"jsonrpc":"2.0","id":1,"result":{"version":"0.4.0","pid":12345,"socketPath":"/home/user/.smithers/sessions.sock","sessions":0,"panes":0}}
+# {"jsonrpc":"2.0","id":1,"result":{"version":"0.5.0","pid":12345,"socketPath":"/home/user/.smithers/sessions.sock","sessions":0,"panes":0}}
 ```
 
-The socket protocol is one JSON document per physical line, terminated by
-`\n`. Do not split one request across multiple lines. The daemon disconnects
-clients that do not complete their first frame within 10 seconds of connecting
-or do not complete a started frame within 30 seconds.
+The socket protocol is one JSON document per physical line terminated by `\n`. Do not split one request across multiple lines. The daemon disconnects clients that do not complete their first frame within 10 seconds of connecting or do not complete a started frame within 30 seconds.
 
-`session.create` accepts `id` (or equivalently `name`/`title`) as the
-human-readable session name; the daemon allocates a separate auto-generated
-pane id and returns it as `paneId`. `client.attach` accepts either a name
-or an ID. An exact ID takes precedence over a name. Duplicate names
-return `DuplicateSessionName`.
+`session.create` accepts `id` (or `name`/`title`) as the human-readable session name. The daemon allocates a separate auto-generated pane id and returns it as `paneId`. `client.attach` accepts either a name or an ID, with exact IDs taking precedence over names. Duplicate session names return `DuplicateSessionName`.
 
 ```sh
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"session.create","params":{"id":"work","rows":40,"cols":120,"command":"bash"}}' \
   | nc -U "$HOME/.smithers/sessions.sock"
 ```
 
-## Socket & lifecycle
+## Socket and lifecycle
 
-`--socket PATH` overrides the default socket path. Without it, `zmuxd` and
-`zmux-connect` resolve the path identically:
+`--socket PATH` overrides the default socket path. Without it, `zmux`, `zmuxd`, `zmux-connect`, and all SDKs resolve the path identically:
 
 | Order | Source |
 |-------|--------|
@@ -250,49 +223,19 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"session.create","params":{"id":
 | 4 | `$HOME/.smithers/sessions.sock` |
 | 5 | `/tmp/zmux-<uid>/sessions.sock` when `HOME` is unset |
 
-Unix socket paths are limited to 103 bytes on macOS and 107 bytes on Linux.
-The CLI resolves relative paths against its working directory.
-The library requires an absolute path and returns `SocketPathNotAbsolute`
-for relative paths. If the resolved path is too long, choose a shorter path with `--socket` or
-`ZMUX_SOCKET`.
+UNIX socket paths are limited to 103 bytes on macOS and 107 bytes on Linux. The CLI resolves relative paths against its working directory. The library requires an absolute path and returns `SocketPathNotAbsolute` for relative paths.
 
-Set the verbosity of structured daemon diagnostics on stderr with
-`zmuxd --log-level <error|warn|info|debug>` or the `ZMUX_LOG_LEVEL` environment
-variable. The default is `warn`.
+Set structured daemon log verbosity on stderr with `zmuxd --log-level <error|warn|info|debug>` or `ZMUX_LOG_LEVEL` (default `warn`).
 
-The daemon writes an advisory pid file at `<socket>.pid` and uses
-`<socket>.lock` for startup locking. A second daemon started against a live
-socket exits successfully without unlinking the running daemon's socket.
+The daemon writes an advisory pid file at `<socket>.pid` and acquires `<socket>.lock` with `flock(2)` on startup. A second daemon started against a live socket exits with status 0 without unlinking the active socket. By default `zmuxd` self-exits after 3600 idle seconds only when it has zero live sessions and zero attached clients (`--idle-seconds 0` disables idle exit).
 
-By default `zmuxd` self-exits after 3600 idle seconds, but only when it has
-zero live sessions. Use `--idle-seconds 0` to run until explicit shutdown.
-Sessions and PTY children die with the daemon; zmux does not persist live
-processes across daemon shutdown or operating-system reboot.
+After startup `zmuxd` runs in `/`. Panes start in the creator's `cwd` (or `$HOME`, falling back to `/`) and inherit the daemon umask. Terminating a pane sends `SIGHUP` and `SIGCONT` to its foreground and shell process groups, `SIGTERM` 100 ms later, and `SIGKILL` at the deadline. `SIGTERM` and `SIGINT` request graceful daemon shutdown, while `SIGHUP` is ignored so an auto-spawned daemon survives its spawning terminal.
 
-After startup `zmuxd` runs in `/`, not in the directory it was launched
-from. A pane starts in the `cwd` its creator passes. `zmux-connect` passes
-its own working directory when it creates a session. Without `cwd`, a pane
-starts in `$HOME`, or in `/` when `$HOME` is not an existing absolute
-directory. Panes inherit the daemon's umask.
-
-Terminating a pane sends `SIGHUP` and `SIGCONT` to its foreground and shell
-process groups, `SIGTERM` 100 ms later, and `SIGKILL` at the deadline.
-Background jobs that a shell moved to their own process group die only if
-the shell forwards `SIGHUP` to them, as bash does and dash does not.
-
-`SIGTERM` and `SIGINT` request graceful shutdown. `SIGHUP` is ignored so an
-auto-spawned daemon survives the spawning client's terminal. You can also
-stop the daemon with `zmux-connect shutdown` or the `daemon.shutdown` RPC.
-
-The daemon accepts at most 256 concurrent client connections. `scrollbackBytes`
-defaults to 10 MiB and must be 64 MiB or smaller for `session.create`,
-`window.new`, and `pane.split`.
+The daemon accepts up to 256 concurrent client connections. `scrollbackBytes` defaults to 10 MiB and must be 64 MiB or smaller.
 
 ## Library use
 
-The Zig API exposes the daemon, mux model, and protocol primitives so an
-embedding app can run an in-process server (tests, single-process apps) or
-build a custom client:
+### Embedding in Zig
 
 ```zig
 const std = @import("std");
@@ -305,38 +248,33 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-Every stateful entry point takes a `std.Io` after the allocator:
-`zmux.Server.init(gpa, io, socket_path, idle_timeout_seconds)`,
-`zmux.NativeSession.create(gpa, io, options)`, and
-`zmux.SessionManager.init(gpa, io, event_sink)`. zmux runs each client
-connection and PTY reader on its own `std.Thread`. The allocator must be
-thread-safe and outlive `Server.deinit`. Use thread-safe Io such as
-`std.Io.Threaded` (`std.process.Init.io` is one). The
-`Io` supplies mutexes, clocks, sleeps, randomness, and file access. PTY and
-socket descriptors use nonblocking I/O driven by `poll(2)`.
+Every stateful entry point takes a `std.Io` after the allocator: `zmux.Server.init(gpa, io, socket_path, idle_timeout_seconds)`, `zmux.NativeSession.create(gpa, io, options)`, and `zmux.SessionManager.init(gpa, io, event_sink)`. The allocator must be thread-safe and outlive `Server.deinit`. Use a thread-safe `Io` such as `std.Io.Threaded` (`std.process.Init.io`).
 
-Top-level modules:
+Top-level Zig modules:
 
 | Module | Role |
 |--------|------|
-| `zmux.server` | UNIX-socket JSON-RPC server, request dispatch |
-| `zmux.daemon` | `zmuxd` entry point and startup lock |
-| `zmux.mux` | Session / window / pane / client / key state |
-| `zmux.native` | PTY child spawn, fd lifecycle, event sink |
-| `zmux.pty` | Low-level `openpty(3)` plus manual fork/exec PTY child spawning |
-| `zmux.protocol` | JSON-RPC framing, error codes, version |
-| `zmux.buffer` | Bounded ring buffer for scrollback |
-| `zmux.foreground` | Foreground-process detection: full comm/argv on macOS and Linux, pid-only fallback on other platforms |
-| `zmux.connect` | Client implementation (raw mode, SIGWINCH) |
+| `zmux.server` | UNIX-socket JSON-RPC 2.0 server, peer auth, 39 RPC handlers |
+| `zmux.daemon` | `zmuxd` entry point and `flock(2)` startup lock |
+| `zmux.cli` | Unified `zmux` CLI, built-in `zmux mcp`, `zmux ssh`, and `zmux doctor` |
+| `zmux.connect` | Interactive attach runtime (raw mode, `SIGWINCH`, detach chords) |
+| `zmux.mux` | Session, window, pane, split/zoom layout, metadata, client, and key state |
+| `zmux.native` | Per-pane PTY runtime, VT bridge, asciicast recorder, condition waits |
+| `zmux.vt` | Pure-Zig VT100/xterm/ECMA-48/OSC terminal state engine |
+| `zmux.reactor` | Zero-poll OS reactor (`kqueue` on macOS, `epoll` + `pidfd` on Linux) |
+| `zmux.pty` | Low-level `openpty(3)` and manual fork/exec PTY child spawning |
+| `zmux.protocol` | JSON-RPC 2.0 framing, nesting bounds, error kinds, version |
+| `zmux.buffer` | Bounded scrollback ring buffer with monotonic offsets |
+| `zmux.foreground` | Foreground-process detection on macOS (`proc_pidinfo`) and Linux (`/proc`) |
+| `zmux.c_api` | `libzmux` C99 ABI (`include/zmux.h`) for scrollback, client, and VT handles |
+
+### Embedding via C99 (`libzmux.a` + `include/zmux.h`)
+
+Link against `zig-out/lib/libzmux.a` and include `zig-out/include/zmux.h` to embed scrollback buffers, authenticated UNIX-socket JSON-RPC clients, and the pure-Zig VT terminal engine in C, Swift, Rust, or Go. See [`test/c_api/smoke.c`](test/c_api/smoke.c).
 
 ## Protocol
 
-`zmux` speaks JSON-RPC 2.0 over a newline-delimited UNIX-domain socket. The
-protocol version is reported by `daemon.ping` along with the daemon `pid`,
-`socketPath`, and separate `sessions` and `panes` counts (see
-`src/protocol.zig`). Request and response fields use camelCase. Notifications
-use snake_case params. `mux.snapshot` pane alerts expose `activity`, `bell`,
-`exited`, `lastActivityMs`, and `lastBellMs`.
+`zmux` speaks JSON-RPC 2.0 over a newline-delimited UNIX-domain socket. The complete machine-readable contract lives in [`protocol/openrpc.json`](protocol/openrpc.json) (39 methods, 13 notifications, 61 schemas, 11 error kinds). Request and response fields use camelCase, and notification params use snake_case.
 
 ### Requests
 
@@ -344,64 +282,41 @@ use snake_case params. `mux.snapshot` pane alerts expose `activity`, `bell`,
 { "jsonrpc": "2.0", "id": 1, "method": "session.create", "params": { "id": "work", "rows": 40, "cols": 120, "command": "bash" } }
 ```
 
-Mutating requests that create a pane (`session.create`, `window.new`,
-and `pane.split`) return `{sessionId, windowId, paneId, generation}`. They
-merge `env` over the daemon environment by default. Set `clearEnv: true` to
-supply a replacement environment. An unset `TERM` defaults to
-`xterm-256color`.
+Mutating calls that create a pane (`session.create`, `window.new`, and `pane.split`) return `{sessionId, windowId, paneId, generation}`. They merge `env` over the daemon environment by default (`clearEnv: true` replaces it, and unset `TERM` defaults to `xterm-256color`).
 
-`client.attach` accepts `createIfMissing` with `session.create` parameters
-to open or create atomically. The result includes `created`, `exited`,
-`exitCode`, `signal`, `generation`, and the exclusive byte offset
-`replayEndOffset` of the base64 scrollback replay. Use the returned `paneId` and
-discard live bytes below `replayEndOffset` in that generation. Attach also
-succeeds after a pane has exited. `pane.respawn` defaults to `kill: false`
-and returns `PaneRunning` on a running pane. Use `kill: true` to replace it.
+`client.attach` accepts `createIfMissing`, `readOnly`, `resizePolicy` (`latest`, `smallest`, `ignore`), `replayMode` (`raw`, `vt`/`ansi_restore`, `none`), and `resumeFromOffset` + `resumeGeneration` for gap-free delta reconnects. The response returns `created`, `exited`, `exitCode`, `signal`, `generation`, `replayBase64`, `replayStartOffset`, `replayEndOffset`, `replayMode`, `readOnly`, `resumed`, and `truncated`. Discard live `pane_output` bytes below `replayEndOffset` in that generation.
 
-`session.capture` returns UTF-8 `text` with invalid sequences replaced by
-U+FFFD. Use `textBase64` for the original bytes.
+`session.screen` returns rendered VT state (`rows`, `cols`, `cursor`, `altScreen`, `title`, `cwd`, `promptState`, `lastCommandExitCode`, `commandSeq`, `agentStatus`, `modes`, `text`, `lines`, optional `cells`, and optional `ansiRestore`). `session.capture` supports `format` (`raw`, `plain`, `ansi`, `cells`) and returns lossy UTF-8 `text` alongside raw `textBase64`.
 
-### Notifications (server → client)
+### Notifications (server -> client)
 
 ```json
 { "jsonrpc": "2.0", "method": "pane_output", "params": { "pane_id": "pane-1", "data_base64": "aGVsbG8=", "offset": 12, "generation": 1 } }
 ```
 
-`pane_output` goes to attached connections and explicit subscribers.
-Call `events.subscribe` with `{"panes":["*"]}` or a list of pane IDs to
-observe unattached panes. Lifecycle events are global. A slow reader
-can receive `pane_output_dropped` and see a gap in its terminal output.
-The notification gives the number of dropped bytes and the byte offset
-where live output resumes.
+`pane_output` goes to attached connections and explicit `events.subscribe` observers (`{"panes":["*"]}` or pane IDs). Lifecycle and OSC notifications are global. Slow readers receive `pane_output_dropped` with the dropped byte count and `resume_offset`.
 
 | Notification | Params | Sent when |
 |--------------|--------|-----------|
 | `pane_output` | `pane_id`, `data_base64`, `offset`, `generation` | PTY produced bytes |
-| `pane_output_dropped` | `pane_id`, `dropped_bytes`, `resume_offset`, `generation` | The connection's output queue crossed its high-water mark |
-| `pane_activity` | `pane_id`, `last_activity_ms`, `generation` | Pane received output after at least a second of inactivity |
+| `pane_output_dropped` | `pane_id`, `dropped_bytes`, `resume_offset`, `generation` | Connection output queue hit its high-water mark |
+| `pane_activity` | `pane_id`, `last_activity_ms`, `generation` | Output arrived after at least one second of silence |
 | `pane_bell` | `pane_id`, `last_bell_ms`, `generation` | Pane received a `BEL` |
-| `session_exited` | `session_id`, `pid`, `exit_code`, `signal`, `generation` | Pane's PTY output ended after child exit |
-| `foreground_changed` | `session_id`, `pid`, `comm`, `argv`, `argv_truncated` | Pane's foreground process changed |
+| `pane_title_changed` | `pane_id`, `title`, `generation` | OSC 0 or OSC 2 updated the pane title |
+| `pane_cwd_changed` | `pane_id`, `cwd`, `generation` | OSC 7 reported a new working directory |
+| `pane_prompt_changed` | `pane_id`, `state`, `exit_code`, `command_seq`, `generation` | OSC 133 marked a prompt or command boundary |
+| `pane_status_changed` | `pane_id`, `status`, `text`, `generation` | OSC 7501/9/777 updated agent status |
+| `session_exited` | `session_id`, `pid`, `exit_code`, `signal`, `generation` | Pane PTY output ended after child exit |
+| `foreground_changed` | `session_id`, `pid`, `comm`, `argv`, `argv_truncated` | Pane foreground process changed |
 | `pane_respawned` | `pane_id`, `generation`, `pid` | Pane acquired a new PTY child |
-| `client_detached` | `client_id`, `reason` | A client detached remotely or its pane/session was removed |
-| `client_switched` | `client_id`, `pane_id`, `generation`, `replay_base64`, `replay_end_offset` | A different connection switched this client to another pane |
+| `client_detached` | `client_id`, `reason` | Client detached remotely or its pane/session was removed |
+| `client_switched` | `client_id`, `pane_id`, `generation`, `replay_base64`, `replay_end_offset` | Another connection switched this client to another pane |
 
-For compatibility, the notification field `session_id` carries a **pane ID**.
-The owning connection receives `client_detached` or `client_switched` when
-another connection modifies its attachment. Resize uses the most recent
-requested size for a pane, including across a respawn or detach.
-
-On macOS, `foreground_changed.comm` and `argv` come from platform process
-inspection. On Linux, they come from `/proc/<pid>/comm` and
-`/proc/<pid>/cmdline`, respectively. On other platforms, the notification
-falls back to the process ID, with a `pid-<n>` placeholder for `comm` and an
-empty `argv`.
+For compatibility, `session_id` in `session_exited` and `foreground_changed` carries a pane ID.
 
 ### Errors
 
-Requests with no `id` are notifications and receive no response. A request
-ID may be a string, integer, or null. Errors include a stable `message` such
-as `PaneNotFound` and a category in `error.data.kind`. Branch on the category.
+Requests with no `id` are notifications and receive no response. Request IDs may be strings, integers, or null. Errors include a stable `message` (such as `PaneNotFound`) and a category in `error.data.kind`. Branch on `data.kind`.
 
 | Code | `data.kind` |
 |------|-------------|
@@ -412,171 +327,49 @@ as `PaneNotFound` and a category in `error.data.kind`. Branch on the category.
 | `-32000` | `not_found`, `terminated`, `conflict`, `limit`, `spawn_failed`, `io` |
 | `-32603` | `internal` |
 
-## Troubleshooting
-
-- `zmux-connect: no daemon at <socket>`: start `zmuxd`, pass
-  `--spawn-daemon`, or make sure daemon and client resolve the same socket
-  path.
-- `PaneNotFound`: the requested pane/session is absent. Without `--no-create`,
-  `zmux-connect <name>` creates a missing session automatically; with
-  `--no-create`, it exits instead.
-- Daemon start exits immediately with status 0: another daemon is already
-  accepting connections on that socket. This is intentional concurrent-start
-  behavior.
-- A clean restart reuses the advisory `<socket>.lock` sentinel and replaces
-  a stale socket after verifying its owner and type. Leave the lock file in
-  place so concurrent starters lock the same inode. The advisory pid file
-  is `<socket>.pid`.
-- Auto-spawn failure: check `<socket>.log` for daemon startup stderr.
-- Daemon disappeared after inactivity: the default idle timeout is 3600
-  seconds with zero running panes and zero attached clients. Restart it or use `--idle-seconds 0`.
-- Terminal looks stuck after an interrupted client: run `reset` or
-  `stty sane`.
-- Stop the daemon with `zmux-connect shutdown`, a `daemon.shutdown` RPC, or
-  `SIGTERM`.
-
 ## Security
 
-- Daemon-managed socket directories must be owned by the effective UID and
-  have no group or other permission bits. The daemon creates missing managed
-  directories with mode `0700` and binds sockets with mode `0600`. Explicit
-  socket directories belong to the caller.
-- The daemon and client authenticate the peer's effective UID with
-  `SO_PEERCRED` on Linux and `getpeereid(3)` on macOS. They require a matching
-  UID before exchanging RPCs.
-- Startup is locked by `flock(2)` on a sentinel file; concurrent starters
-  detect a live daemon and exit cleanly instead of unlinking the socket.
+- Daemon-managed socket directories must be owned by the effective UID with no group or other permission bits. Missing directories are created with mode `0700` and sockets are bound with mode `0600`.
+- Daemon and client authenticate the peer effective UID with `SO_PEERCRED` on Linux and `getpeereid(3)` on macOS before exchanging RPCs.
+- Startup is locked with `flock(2)` on `<socket>.lock` so concurrent starters never unlink a live socket.
+- `zmux-ws` enforces constant-time bearer token verification and loopback-only `Origin` checks by default.
 
 ## Platform support
 
-| Platform | Daemon | Client |
-|----------|--------|--------|
-| macOS (arm64, x86_64) | ✅ | ✅ |
-| Linux (glibc, musl)   | ✅ | ✅ |
-| iOS                   | ❌ (no `fork`) | ❌ |
-| Windows               | ❌ | ❌ |
+| Platform | Daemon | CLI / Client | `libzmux` |
+|----------|--------|--------------|-----------|
+| macOS (arm64, x86_64) | ✅ (`kqueue`) | ✅ | ✅ |
+| Linux (glibc, static musl) | ✅ (`epoll` + `pidfd`) | ✅ | ✅ |
+| iOS | ❌ (no `fork`) | ❌ | ❌ |
+| Windows | ❌ | ❌ | ❌ |
 
 Minimum macOS deployment target is 14.0.
 
-## Development
+## Development, fuzzing, and benchmarks
 
 ```sh
-zig build           # build all artifacts
-zig build test      # unit + integration tests + fuzz corpus smoke checks
+zig build -Doptimize=ReleaseSafe   # build zmux, zmuxd, zmux-connect, libzmux.a
+zig build test --summary all       # unit + integration + 49 fuzz corpus + C99 smoke tests
+zig build fuzz -Doptimize=ReleaseSafe --fuzz=25K
+zig build bench-check              # compile all 17 benchmark suites (114 benchmarks)
 ```
 
-The integration suite drives the real server over a UNIX socket and exercises
-session create / attach / detach / scrollback replay end-to-end. See
-`test/integration/session_daemon.zig`.
-
-### Fuzz testing
-
-`zmux` ships a 32-target coverage-guided structured fuzz suite built on Zig
-0.17's `std.testing.fuzz` + `std.testing.Smith` with LLVM SanitizerCoverage
-instrumentation (`test/fuzz/`). Every fuzz target checks differential oracles,
-single-line JSON-RPC / JSON log invariants, structural state-graph invariants,
-and `FailingAllocator` OOM leak/atomicity guarantees:
+Every subsystem declares its exact Zig dependency closure in [`PACKAGE.ts`](PACKAGE.ts) and runs through Smithers Cloud ([smithers.sh/smithersai/zmux](https://smithers.sh/smithersai/zmux)) with shared read-only caching at `https://build.smithers.sh` and continuous Uphill Lighthouse backpressure audits:
 
 ```sh
-# Fast pure + pipe/socketpair fuzz suite (26 targets)
-zig build fuzz -Doptimize=ReleaseSafe --fuzz=25K --summary all
-
-# Continuous fuzzing with web UI (runs until interrupted)
-zig build fuzz -Doptimize=ReleaseSafe --fuzz
-
-# Target a single fuzzer by name
-zig build fuzz -Dtest-filter="ScrollbackBuffer" --fuzz=100K
-
-# Live real-PTY, private socket binding, pid/lock, and multi-client chaos (6 targets)
-zig build fuzz-live --fuzz=150 --summary all
-```
-
-`zig build test` automatically executes every fuzz target's regression corpus
-deterministically without `--fuzz`. CI runs bounded coverage-guided campaigns
-for `fuzz` on Ubuntu and macOS and `fuzz-live` on Ubuntu through `smthrs ci`.
-
-### Performance benchmarks & incremental Smithers workflow
-
-`zmux` includes 85 `ReleaseFast` benchmarks across all 12 modules (`bench/`),
-paired with a committed baseline ([`bench/baseline.json`](bench/baseline.json))
-and incremental Smithers target declarations ([`.smithers/WORKSPACE.ts`](.smithers/WORKSPACE.ts),
-[`PACKAGE.ts`](PACKAGE.ts)).
-
-Each per-module test and benchmark target declares its exact Zig source
-dependency closure. Benchmarks are `Shell.Build` targets whose
-`.benchmarks/<module>.json` result is a cached output, so unchanged modules
-replay their last measurement and only affected benchmarks re-run:
-
-```sh
-# mise.toml pins Zig 0.17.1; use it when PATH carries another zig
 mise install && export ZIG="$(mise which zig)"
-
-# Everything CI runs: fmt, ReleaseSafe + 4 cross-compiles, per-module tests,
-# integration, bounded coverage-guided fuzz, benchmarks, factory/home/wiki/trust checks, docs site
 smthrs ci '//...'
-
-# Also run the live PTY / UNIX-socket chaos fuzzers (exclusive tier)
-smthrs ci '//...' --include-exclusive
-
-# Print the Markdown comparison table against bench/baseline.json
 smthrs run //:bench
-
-# Run the Uphill Lighthouse-style backpressure audit
 uphill --compact
-
-# Validate factory manifest, personalized home, trust policy, wiki, and views
 smthrs test '//.smithers/...'
-
-# Build the static docs site, llms.txt, Engineering Wiki, and Lighthouse audit
 smthrs build //:docsSite
-
-# Print a one-time-use attenuated sandbox auth bundle for Cloud MCP agents
-node .smithers/scripts/mint-sandbox-auth.mjs
 ```
 
-### Public Smithers Cloud factory, Cloud MCP, and trust model
-
-`zmux` is developed publicly on [Smithers Cloud](https://smithers.sh/smithersai/zmux)
-with a personalized UI tailored to maintainers, contributors, and viewers
-([`.smithers/home.json`](.smithers/home.json)), an engineering wiki
-([`.smithers/wiki/README.md`](.smithers/wiki/README.md)), a source-linked
-[Mythical History](https://smithersai.github.io/zmux/history/), a live
-[Lighthouse Backpressure Audit Report](https://smithersai.github.io/zmux/audit/),
-and an interactive [JSON-RPC Protocol Inspector](https://smithersai.github.io/zmux/playground/).
-
-- **Authenticated Cloud MCP:** Connect your coding agent over OAuth 2.1 + PKCE
-  to `https://smithers.sh/smithersai/zmux/mcp` (`claude mcp add zmux --transport http https://smithers.sh/smithersai/zmux/mcp`)
-  to create and manage issues, TODOs, pull requests, artifacts, and stacked changesets.
-- **Shared object store & trust boundary:** Results cache locally under
-  `.smithers/cache` and sync through `https://build.smithers.sh`. Non-maintainers
-  and contributor sandboxes are encouraged to run checks untrusted with read-only
-  cache access (`SMITHERS_CACHE_READ_TOKEN`), while only Smithers-controlled
-  sandboxes and maintainer gates write to the shared cache, clear merge gates,
-  and trigger automatic GitHub releases and docs publishing ([`.smithers/trust-policy.json`](.smithers/trust-policy.json)).
-- **Factory flows & wiki:** Declared in [`.smithers/FACTORY.ts`](.smithers/FACTORY.ts),
-  [`.smithers/factory.json`](.smithers/factory.json), and [`.smithers/coding-project.json`](.smithers/coding-project.json).
-  See [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`AGENTS.md`](AGENTS.md) for the
-  complete contribution and agent workflow.
-
-You can also invoke individual suites directly with Zig:
-
-```sh
-zig build bench-buffer                     # single module suite (ReleaseFast)
-zig build bench-server -- --quick          # faster sampling for quick iteration
-zig build bench-check                      # compile all benchmark binaries
-zig build bench                            # run all 12 benchmark suites
-```
+Explore the public factory portal, [Engineering Wiki](https://smithersai.github.io/zmux/wiki/), [Mythical History](https://smithersai.github.io/zmux/history/), [Lighthouse Backpressure Audit](https://smithersai.github.io/zmux/audit/), and interactive [JSON-RPC Protocol Inspector](https://smithersai.github.io/zmux/playground/).
 
 ## Acknowledgements
 
-`zmux` borrows tmux's architecture wholesale. The reference points used while
-writing it:
-
-- `tmux/server.c` — server socket creation, long-running server loop
-- `tmux/client.c` — client connect / start-server retry and start lock
-- `tmux/proc.c` — background server process model
-- `tmux/spawn.c` — server-owned PTY child creation
-- `tmux/tmux.1` — documented client/server attach/detach behavior
+`zmux` borrows tmux's server-owns-the-PTY process model (`server.c`, `client.c`, `proc.c`, `spawn.c`, and `tmux.1`) while building a clean-room Zig runtime and structured JSON-RPC protocol for modern apps and agents.
 
 ## License
 

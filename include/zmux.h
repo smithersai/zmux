@@ -51,8 +51,11 @@ typedef struct zmux_scrollback zmux_scrollback_t;
 /** Opaque handle to an authenticated UNIX-socket zmux JSON-RPC client. */
 typedef struct zmux_client zmux_client_t;
 
+/** Opaque handle to a zero-dependency virtual terminal state engine. */
+typedef struct zmux_vt zmux_vt_t;
+
 /**
- * Return the static NUL-terminated zmux wire protocol version (for example "0.4.0").
+ * Return the static NUL-terminated zmux wire protocol version (for example "0.5.0").
  * The returned pointer is statically allocated and must not be freed.
  */
 const char *zmux_version(void);
@@ -224,6 +227,64 @@ zmux_status_t zmux_client_read_frame(
     zmux_client_t *client,
     uint32_t timeout_ms,
     char **out_json,
+    size_t *out_len
+);
+
+/* -------------------------------------------------------------------------
+ * Virtual terminal state engine (VT100 / xterm / OSC)
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Allocate a new virtual terminal of @p rows x @p cols with up to
+ * @p max_scrollback archived primary-screen lines. Returns NULL on zero
+ * dimensions or out-of-memory.
+ */
+zmux_vt_t *zmux_vt_new(uint16_t rows, uint16_t cols, size_t max_scrollback);
+
+/**
+ * Destroy a virtual terminal created with zmux_vt_new(). Safe with NULL.
+ */
+void zmux_vt_free(zmux_vt_t *vt);
+
+/**
+ * Feed @p len raw PTY bytes into @p vt.
+ */
+zmux_status_t zmux_vt_feed(zmux_vt_t *vt, const uint8_t *data, size_t len);
+
+/**
+ * Resize @p vt to @p rows x @p cols (both must be non-zero).
+ */
+zmux_status_t zmux_vt_resize(zmux_vt_t *vt, uint16_t rows, uint16_t cols);
+
+/**
+ * Render ANSI-free plain text from @p vt (optionally including up to
+ * @p scrollback_lines archived lines). Free @p *out_buf with zmux_string_free().
+ */
+zmux_status_t zmux_vt_plain_text(
+    const zmux_vt_t *vt,
+    size_t scrollback_lines,
+    char **out_buf,
+    size_t *out_len
+);
+
+/**
+ * Render a lossless ANSI/DEC terminal state restore payload from @p vt.
+ * Free @p *out_buf with zmux_string_free().
+ */
+zmux_status_t zmux_vt_ansi_restore(
+    const zmux_vt_t *vt,
+    char **out_buf,
+    size_t *out_len
+);
+
+/**
+ * Render the structured screen snapshot JSON object from @p vt.
+ * Free @p *out_buf with zmux_string_free().
+ */
+zmux_status_t zmux_vt_screen_json(
+    const zmux_vt_t *vt,
+    size_t scrollback_lines,
+    char **out_buf,
     size_t *out_len
 );
 

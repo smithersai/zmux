@@ -5,6 +5,9 @@ import { Smithers as S } from "@smthrs/targets"
 // for example ZIG="$(mise which zig)". The binary's bytes are cache-key input.
 const zig = S.Host.bin("zig", { env: "ZIG" })
 const node = S.Host.bin("node")
+const bun = S.Host.bin("bun")
+const python3 = S.Host.bin("python3")
+const sh = S.Host.bin("sh")
 
 // Exact per-module Zig dependency closures so Smithers invalidates and runs
 // only the unit tests and performance benchmarks whose inputs actually changed.
@@ -54,6 +57,23 @@ const ptySrcs = [
   "src/pty/spawn.zig",
   ...sysSrcs
 ] as const
+const vtSrcs = [
+  "src/vt.zig",
+  "src/vt/grid.zig",
+  "src/vt/modes.zig",
+  "src/vt/osc.zig",
+  "src/vt/parser.zig",
+  "src/vt/scrollback.zig",
+  "src/vt/snapshot.zig",
+  "src/vt/style.zig",
+  "src/vt/terminal.zig"
+] as const
+const reactorSrcs = [
+  "src/reactor.zig",
+  "src/reactor/epoll.zig",
+  "src/reactor/kqueue.zig",
+  ...sysSrcs
+] as const
 const nativeSrcs = [
   "src/native.zig",
   "src/native/control.zig",
@@ -61,12 +81,18 @@ const nativeSrcs = [
   "src/native/harness.zig",
   "src/native/keys.zig",
   "src/native/reader.zig",
+  "src/native/recording.zig",
+  "src/native/screen.zig",
   "src/native/session.zig",
+  "src/native/vt_bridge.zig",
+  "src/native/wait.zig",
   ...bufferSrcs,
   ...foregroundSrcs,
   ...logSrcs,
   ...ptySrcs,
-  ...protocolSrcs
+  ...protocolSrcs,
+  ...reactorSrcs,
+  ...vtSrcs
 ] as const
 const muxSrcs = [
   "src/mux.zig",
@@ -77,7 +103,9 @@ const muxSrcs = [
   "src/mux/invariants.zig",
   "src/mux/json.zig",
   "src/mux/layout.zig",
+  "src/mux/layout_ops.zig",
   "src/mux/lookup.zig",
+  "src/mux/metadata.zig",
   "src/mux/removal.zig",
   "src/mux/respawn.zig",
   "src/mux/types.zig",
@@ -99,6 +127,35 @@ const connectSrcs = [
   ...socketPathSrcs,
   ...sysSrcs
 ] as const
+const cliSrcs = [
+  "src/cli.zig",
+  "src/cli/args.zig",
+  "src/cli/args_sub.zig",
+  "src/cli/attach.zig",
+  "src/cli/doctor.zig",
+  "src/cli/help.zig",
+  "src/cli/mcp.zig",
+  "src/cli/mcp_tools.zig",
+  "src/cli/rpc.zig",
+  "src/cli/ssh.zig",
+  "src/cli/stream.zig",
+  "src/cli/verbs.zig",
+  ...connectSrcs,
+  ...logSrcs
+] as const
+const cApiSrcs = [
+  "src/c_api.zig",
+  "src/c_api/client.zig",
+  "src/c_api/scrollback.zig",
+  "src/c_api/vt.zig",
+  "include/zmux.h",
+  ...bufferSrcs,
+  ...protocolSrcs,
+  ...rpcLineReaderSrcs,
+  ...socketPathSrcs,
+  ...sysSrcs,
+  ...vtSrcs
+] as const
 const serverSrcs = [
   "src/server.zig",
   "src/server/accept.zig",
@@ -113,8 +170,11 @@ const serverSrcs = [
   "src/server/limits.zig",
   "src/server/params.zig",
   "src/server/payload.zig",
+  "src/server/rpc_agent.zig",
   "src/server/rpc_client.zig",
   "src/server/rpc_layout.zig",
+  "src/server/rpc_pane.zig",
+  "src/server/rpc_screen.zig",
   "src/server/rpc_session.zig",
   "src/server/socket_bind.zig",
   "src/server/socket_dir.zig",
@@ -142,7 +202,7 @@ const daemonSrcs = [
   ...socketPathSrcs,
   ...sysSrcs
 ] as const
-const mainSrcs = ["src/main.zig", ...daemonSrcs, ...connectSrcs] as const
+const mainSrcs = ["src/main.zig", ...daemonSrcs, ...connectSrcs, ...cliSrcs, ...cApiSrcs] as const
 
 const unitTest = (step: string, cacheKey: string, srcs: ReadonlyArray<string>) =>
   S.Shell.Test({
@@ -190,7 +250,7 @@ const build = S.Shell.Build({
   bin: zig,
   args: ["build", "--cache-dir", ".zig-cache/smthrs-build", "-Doptimize=ReleaseSafe"],
   data: files([...mainSrcs, ...buildManifests]),
-  outDirs: ["zig-out/bin"],
+  outDirs: ["zig-out/bin", "zig-out/lib", "zig-out/include"],
   timeout: "10m"
 })
 
@@ -208,7 +268,11 @@ const crossBuild = (triple: string) =>
       "-Doptimize=ReleaseSafe"
     ],
     data: files([...mainSrcs, ...buildManifests]),
-    outDirs: [`zig-out/cross/${triple}/bin`],
+    outDirs: [
+      `zig-out/cross/${triple}/bin`,
+      `zig-out/cross/${triple}/lib`,
+      `zig-out/cross/${triple}/include`
+    ],
     timeout: "10m"
   })
 
@@ -233,6 +297,64 @@ const testConnect = unitTest("test-connect", "connect", connectSrcs)
 const testServer = unitTest("test-server", "server", serverSrcs)
 const testDaemon = unitTest("test-daemon", "daemon", daemonSrcs)
 const testMain = unitTest("test-main", "main", [...mainSrcs, "README.md"])
+const testVt = unitTest("test-vt", "vt", vtSrcs)
+const testReactor = unitTest("test-reactor", "reactor", reactorSrcs)
+const testCli = unitTest("test-cli", "cli", cliSrcs)
+const testCApiZig = unitTest("test-c-api-zig", "c-api-zig", cApiSrcs)
+const testCApi = S.Shell.Test({
+  bin: zig,
+  args: ["build", "--cache-dir", ".zig-cache/smthrs-test-c-api", "test-c-api"],
+  data: files([...cApiSrcs, "test/c_api/smoke.c", ...buildManifests]),
+  timeout: "5m"
+})
+const testOpenRpc = S.Shell.Test({
+  bin: node,
+  args: ["--test", "protocol/validate-spec.test.mjs"],
+  data: [
+    S.file("protocol/openrpc.json"),
+    S.file("protocol/validate-spec.mjs"),
+    S.file("protocol/validate-spec.test.mjs"),
+    ...files([...serverSrcs, ...protocolSrcs])
+  ],
+  timeout: "2m"
+})
+const testPackaging = S.Shell.Test({
+  bin: node,
+  args: [
+    "--test",
+    "scripts/install.test.mjs",
+    "scripts/generate-homebrew.test.mjs",
+    "sdk/cli-npm/test/launcher.test.mjs"
+  ],
+  data: [
+    S.file("scripts/install.sh"),
+    S.file("scripts/install.test.mjs"),
+    S.file("scripts/generate-homebrew.mjs"),
+    S.file("scripts/generate-homebrew.test.mjs"),
+    S.file("packaging/homebrew/zmux.rb.tmpl"),
+    S.glob("sdk/cli-npm/**")
+  ],
+  timeout: "2m"
+})
+const testInstallPosix = S.Shell.Test({
+  bin: sh,
+  args: ["scripts/install.test.sh"],
+  data: [S.file("scripts/install.sh"), S.file("scripts/install.test.sh")],
+  timeout: "2m"
+})
+const testSdkTs = S.Shell.Test({
+  bin: bun,
+  args: ["test", "sdk/ts/test/"],
+  data: [build, S.glob("sdk/ts/**")],
+  timeout: "5m"
+})
+const testSdkPython = S.Shell.Test({
+  bin: python3,
+  args: ["-m", "unittest", "discover", "-s", "sdk/python/tests", "-v"],
+  env: { PYTHONPATH: "sdk/python", PYTHONDONTWRITEBYTECODE: "1" },
+  data: [build, S.glob("sdk/python/**")],
+  timeout: "5m"
+})
 
 const testFuzz = S.Shell.Test({
   bin: zig,
@@ -289,6 +411,10 @@ const benchMux = benchTarget("mux", "mux", muxSrcs)
 const benchConnect = benchTarget("connect", "connect", [...connectSrcs, "src/main.zig"])
 const benchDaemon = benchTarget("daemon", "daemon", daemonSrcs)
 const benchServer = benchTarget("server", "server", [...serverSrcs, "src/main.zig"])
+const benchVt = benchTarget("vt", "vt", vtSrcs)
+const benchReactor = benchTarget("reactor", "reactor", reactorSrcs)
+const benchCli = benchTarget("cli", "cli", cliSrcs)
+const benchCApi = benchTarget("c-api", "c_api", [...cApiSrcs, "src/main.zig"])
 
 const allBenchTargets = [
   benchBuffer,
@@ -303,7 +429,11 @@ const allBenchTargets = [
   benchMux,
   benchConnect,
   benchDaemon,
-  benchServer
+  benchServer,
+  benchVt,
+  benchReactor,
+  benchCli,
+  benchCApi
 ]
 
 // Aggregates all per-module benchmark JSON outputs (newly run for modified
@@ -407,6 +537,16 @@ export const Package = S.Package({
     testServer,
     testDaemon,
     testMain,
+    testVt,
+    testReactor,
+    testCli,
+    testCApiZig,
+    testCApi,
+    testOpenRpc,
+    testPackaging,
+    testInstallPosix,
+    testSdkTs,
+    testSdkPython,
     testFuzz,
     fuzzCoverage,
     fuzzLive,
@@ -424,6 +564,10 @@ export const Package = S.Package({
     benchConnect,
     benchDaemon,
     benchServer,
+    benchVt,
+    benchReactor,
+    benchCli,
+    benchCApi,
     benchReport,
     bench,
     benchUpdateBaseline,

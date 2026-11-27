@@ -21,4 +21,8 @@ comptime {
     _ = @import("daemon_sys.zig");
     _ = @import("socket_path.zig");
     _ = @import("pty.zig");
+    _ = @import("vt.zig");
+    _ = @import("reactor.zig");
+    _ = @import("cli.zig");
+    _ = @import("c_api.zig");
 }

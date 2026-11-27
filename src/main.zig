@@ -7,6 +7,10 @@
 
 /// Fixed-capacity scrollback ring that keeps each pane's newest output.
 pub const buffer = @import("buffer.zig");
+/// `libzmux` C99 ABI exports for embedding zmux from C, Swift, Rust, Python, and Go.
+pub const c_api = @import("c_api.zig");
+/// Unified `zmux` CLI binary, built-in MCP server, SSH attach, and diagnostics.
+pub const cli = @import("cli.zig");
 /// `zmux-connect` client: attaches a terminal to a daemon session.
 pub const connect = @import("connect.zig");
 /// `zmuxd` entry point: argument parsing and daemon startup.
@@ -21,12 +25,16 @@ pub const native = @import("native.zig");
 pub const protocol = @import("protocol.zig");
 /// PTY allocation and child process spawning.
 pub const pty = @import("pty.zig");
+/// Cross-platform `kqueue`/`epoll` OS event reactor for zero-poll PTY and PID waits.
+pub const reactor = @import("reactor.zig");
 /// UNIX-socket daemon server that owns sessions and serves clients.
 pub const server = @import("server.zig");
 /// POSIX plumbing `std.Io` does not model (raw descriptors, `AF_UNIX`
 /// sockets, signals). Exported for the bundled executables and tests; it is
 /// not part of the stable embedding API.
 pub const sys = @import("sys.zig");
+/// Zero-dependency VT100/xterm/OSC virtual terminal state engine.
+pub const vt = @import("vt.zig");
 
 /// Internal modules exposed for the repository's own test and fuzz suites;
 /// not part of the stable embedding API.
@@ -74,6 +82,10 @@ test {
     std.testing.refAllDecls(mux.Manager);
     std.testing.refAllDecls(mux.PaneHandle);
     std.testing.refAllDecls(internal.socket_path);
+    std.testing.refAllDecls(vt.Terminal);
+    std.testing.refAllDecls(reactor.Reactor);
+    std.testing.refAllDecls(cli);
+    std.testing.refAllDecls(c_api);
 }
 
 test "advertised top-level modules are exported" {
@@ -160,9 +172,9 @@ test "README request and notification examples match the wire types" {
 test "all top-level public modules are exported" {
     const std = @import("std");
     const names = [_][]const u8{
-        "buffer",   "connect",  "daemon", "foreground", "mux",
-        "native",   "protocol", "pty",    "server",     "sys",
-        "internal",
+        "buffer",     "c_api",  "cli",    "connect",  "daemon",
+        "foreground", "mux",    "native", "protocol", "pty",
+        "reactor",    "server", "sys",    "vt",       "internal",
     };
     inline for (names) |name| {
         try std.testing.expect(@hasDecl(@This(), name));

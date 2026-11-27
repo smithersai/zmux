@@ -133,9 +133,9 @@
         {
           "type": "hero",
           "title": "zmux",
-          "tagline": "tmux-style PTY session multiplexer in Zig with a structured JSON-RPC UNIX socket protocol.",
-          "text": "A long-lived daemon owns sessions, windows, panes, and PTYs so desktop apps, web terminals, and agents attach and replay scrollback without shelling out to tmux.",
-          "install": "gh repo clone smithersai/zmux",
+          "tagline": "Headless PTY multiplexer and terminal intelligence daemon in Zig with JSON-RPC, MCP, and SDKs.",
+          "text": "A zero-dependency daemon owns sessions, windows, panes, PTYs, and a pure-Zig VT100/OSC screen engine so native apps, web terminals, and coding agents attach, inspect screens, and run commands without shelling out to tmux.",
+          "install": "curl -fsSL https://raw.githubusercontent.com/smithersai/zmux/main/scripts/install.sh | sh",
           "actions": [
             {
               "label": "Documentation",
@@ -151,8 +151,8 @@
             }
           ],
           "announcement": {
-            "label": "v0.4.0: Hardened JSON-RPC protocol, bounded replay, and Zig 0.17.1",
-            "url": "https://github.com/smithersai/zmux/releases/tag/v0.4.0"
+            "label": "v0.5.0: Pure-Zig VT screen engine, kqueue/epoll reactor, unified zmux CLI + MCP, TS/Python/C SDKs",
+            "url": "https://github.com/smithersai/zmux/releases/tag/v0.5.0"
           }
         },
         {
@@ -171,28 +171,28 @@
               "label": "Runtime deps"
             },
             {
-              "value": "Linux · macOS",
-              "label": "arm64 and x64"
+              "value": "39 RPCs",
+              "label": "OpenRPC 1.3.2"
             },
             {
-              "value": "JSON-RPC 2.0",
-              "label": "UNIX socket API"
+              "value": "TS · Py · C99",
+              "label": "Official SDKs"
             },
             {
-              "value": "Smithers Cloud",
-              "label": "Public factory"
+              "value": "Built-in MCP",
+              "label": "9 agent tools"
             }
           ]
         },
         {
           "type": "code",
-          "title": "Quick start over UNIX socket",
+          "title": "Quick start with unified zmux CLI",
           "language": "sh",
-          "code": "zmuxd --socket /tmp/zmux.sock &\nprintf '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"daemon.ping\"}\\n' | nc -U /tmp/zmux.sock\nzmux-connect --socket /tmp/zmux.sock work --spawn-daemon"
+          "code": "zmux work\nzmux exec work \"zig build test\"\nzmux screen work --format plain\nzmux mcp"
         },
         {
           "type": "code",
-          "title": "Embed in Zig",
+          "title": "Embed in Zig or C99",
           "file": "src/main.zig",
           "language": "zig",
           "code": "const zmux = @import(\"zmux\");\n\nvar srv = try zmux.Server.init(allocator, io, \"/tmp/zmux.sock\", 60);\ndefer srv.deinit();\ntry srv.run();"
@@ -202,24 +202,24 @@
           "title": "Why zmux",
           "cards": [
             {
-              "title": "Structured JSON-RPC over UNIX socket",
-              "text": "Every call returns typed JSON with explicit error kinds. No format strings or screen-scraping."
+              "title": "Structured JSON-RPC and OpenRPC 1.3.2",
+              "text": "39 typed RPCs and 13 push notifications with explicit error kinds. No format strings or screen-scraping."
             },
             {
-              "title": "Multi-client PTY sharing",
-              "text": "Native apps, web terminals, and headless agents attach to the same daemon-owned pane together."
+              "title": "Pure-Zig VT100 and OSC intelligence",
+              "text": "Stateful screen grid, lossless TUI reattach, OSC 7 CWD, OSC 133 prompts, and agent status tracking."
             },
             {
-              "title": "Bounded scrollback replay",
-              "text": "Ring-buffered output tracks monotonic offsets and generations so reattaching clients never miss bytes."
+              "title": "Agent-native primitives and MCP",
+              "text": "Server-side pane.wait, pane.exec, pane.signal, asciicast recording, and zero-dep zmux mcp stdio server."
             },
             {
-              "title": "Owner-only socket security",
-              "text": "Private 0700 directories, same-UID peer credential checks, and startup locking protect every daemon."
+              "title": "Zero-poll kqueue and epoll reactor",
+              "text": "Kernel event loops eliminate PTY exit polling on macOS and Linux while preserving owner-only socket security."
             },
             {
-              "title": "Incremental Smithers builds",
-              "text": "Per-module Zig dependency closures cache tests, fuzz runs, and benchmarks in the shared cloud object store."
+              "title": "Official TypeScript, Python, and C99 SDKs",
+              "text": "Zero-dependency TS/Bun/Node SDK with xterm adapter and zmux-ws bridge, Python sync/async SDK, and libzmux.a."
             },
             {
               "title": "Lighthouse backpressure",
@@ -239,6 +239,12 @@
           "type": "releases",
           "title": "Releases",
           "releases": [
+            {
+              "name": "v0.5.0",
+              "url": "https://github.com/smithersai/zmux/releases/tag/v0.5.0",
+              "date": "2026-11-27",
+              "summary": "Pure-Zig VT screen engine, kqueue/epoll reactor, 11 agent RPCs, unified zmux CLI with MCP and SSH, OpenRPC, TS/Python/C99 SDKs."
+            },
             {
               "name": "v0.4.0",
               "url": "https://github.com/smithersai/zmux/releases/tag/v0.4.0",

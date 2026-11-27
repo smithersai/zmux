@@ -19,7 +19,7 @@ static void fail(const char *msg, int line) {
 static void test_version_and_status(void) {
     const char *ver = zmux_version();
     CHECK(ver != NULL);
-    CHECK(strcmp(ver, "0.4.0") == 0);
+    CHECK(strcmp(ver, "0.5.0") == 0);
 
     const zmux_status_t codes[] = {
         ZMUX_OK,
@@ -155,7 +155,16 @@ static void test_live_daemon(const char *sock_path) {
     CHECK(json != NULL);
     CHECK(len == strlen(json));
     CHECK(strstr(json, "\"result\"") != NULL);
-    CHECK(strstr(json, "\"0.4.0\"") != NULL);
+    CHECK(strstr(json, "\"0.5.0\"") != NULL);
+    zmux_string_free(json);
+
+    json = NULL;
+    len = 0;
+    st = zmux_client_call_raw(client, "mux.snapshot", "{}", 2000, &json, &len);
+    CHECK(st == ZMUX_OK);
+    CHECK(json != NULL);
+    CHECK(len == strlen(json));
+    CHECK(strstr(json, "\"sessions\"") != NULL);
     zmux_string_free(json);
 
     json = NULL;
@@ -164,7 +173,7 @@ static void test_live_daemon(const char *sock_path) {
     CHECK(st == ZMUX_OK);
     CHECK(json != NULL);
     CHECK(len == strlen(json));
-    CHECK(strstr(json, "\"sessions\"") != NULL);
+    CHECK(strstr(json, "\"result\"") != NULL);
     zmux_string_free(json);
 
     json = NULL;
@@ -187,10 +196,45 @@ static void test_live_daemon(const char *sock_path) {
     printf("libzmux live daemon ping + RPC checks passed (%s)\n", sock_path);
 }
 
+static void test_vt_engine(void) {
+    CHECK(zmux_vt_new(0, 80, 16) == NULL);
+    zmux_vt_free(NULL);
+
+    zmux_vt_t *vt = zmux_vt_new(6, 40, 32);
+    CHECK(vt != NULL);
+
+    const char *stream = "\x1b]2;c99-demo\x07\x1b[32mhello\x1b[0m\r\nworld";
+    CHECK(zmux_vt_feed(vt, (const uint8_t *)stream, strlen(stream)) == ZMUX_OK);
+
+    char *plain = NULL;
+    size_t plain_len = 0;
+    CHECK(zmux_vt_plain_text(vt, 0, &plain, &plain_len) == ZMUX_OK);
+    CHECK(plain != NULL && plain_len == strlen(plain));
+    CHECK(strstr(plain, "hello") != NULL && strstr(plain, "world") != NULL);
+    zmux_string_free(plain);
+
+    char *ansi = NULL;
+    size_t ansi_len = 0;
+    CHECK(zmux_vt_ansi_restore(vt, &ansi, &ansi_len) == ZMUX_OK);
+    CHECK(ansi != NULL && ansi_len > 0);
+    zmux_string_free(ansi);
+
+    char *json = NULL;
+    size_t json_len = 0;
+    CHECK(zmux_vt_screen_json(vt, 0, &json, &json_len) == ZMUX_OK);
+    CHECK(json != NULL && json_len == strlen(json));
+    CHECK(strstr(json, "\"title\":\"c99-demo\"") != NULL);
+    zmux_string_free(json);
+
+    CHECK(zmux_vt_resize(vt, 12, 80) == ZMUX_OK);
+    zmux_vt_free(vt);
+}
+
 int main(void) {
     test_version_and_status();
     test_default_socket_path();
     test_scrollback();
+    test_vt_engine();
     test_client_errors();
 
     const char *live_sock = getenv("ZMUX_TEST_SOCKET");

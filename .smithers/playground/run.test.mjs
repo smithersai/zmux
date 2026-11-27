@@ -8,13 +8,23 @@ import { executePlaygroundRequest, simulateRingBuffer, simulateSessionTrace } fr
 
 const here = dirname(fileURLToPath(import.meta.url))
 
-test("daemon.ping returns protocol version 0.4.0", () => {
+test("daemon.ping returns protocol version 0.5.0", () => {
   const out = executePlaygroundRequest({
     mode: "rpc",
     frame: '{"jsonrpc":"2.0","id":1,"method":"daemon.ping"}'
   })
   assert.equal(out.ok, true)
-  assert.equal(out.response.result.version, "0.4.0")
+  assert.equal(out.response.result.version, "0.5.0")
+})
+
+test("v0.5.0 agent-native methods validate cleanly", () => {
+  for (const method of ["session.screen", "pane.wait", "pane.exec", "pane.signal", "pane.record", "client.setMode"]) {
+    const out = executePlaygroundRequest({
+      mode: "rpc",
+      frame: JSON.stringify({ jsonrpc: "2.0", id: 99, method, params: { paneId: "pane-1" } })
+    })
+    assert.equal(out.ok, true, `expected ${method} to validate`)
+  }
 })
 
 test("malformed JSON returns -32700 parse error", () => {

@@ -14,6 +14,7 @@ grounded in exact public source files, and validated in CI by `//.smithers:wiki-
 6. [Testing, fuzzing, benchmarks, and Uphill](pages/testing-fuzzing-and-benchmarks.md): incremental Zig targets, fuzz suites, benchmarks, and Lighthouse backpressure.
 7. [Smithers Cloud factory, object store, and trust model](pages/factory-and-trust-model.md): personalized UI, Cloud MCP, one-time sandbox auth, and trusted vs untrusted execution.
 8. [Mythical history, stacked changesets, and releases](pages/mythical-history.md): TODO to Change to Land to GitHub mirror auto-release and docs publishing.
+9. [VT engine, OS reactor, CLI, MCP, and SDK ecosystem](pages/vt-reactor-and-ecosystem.md): pure-Zig VT100/OSC state engine, kqueue/epoll reactor, unified `zmux` CLI + MCP server, OpenRPC 1.3.2, TS/Python SDKs, and `libzmux` C99 ABI.
 
 ## Freshness and Security Rules
 

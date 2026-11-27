@@ -82,14 +82,32 @@ pub fn build(b: *std.Build) void {
         .root_module = createRootModule(b, target, optimize, "src/connect.zig"),
     });
 
+    const cli = b.addExecutable(.{
+        .name = "zmux",
+        .root_module = createRootModule(b, target, optimize, "src/cli.zig"),
+    });
+
+    const libzmux = b.addLibrary(.{
+        .name = "zmux",
+        .linkage = .static,
+        .root_module = createRootModule(b, target, optimize, "src/c_api.zig"),
+    });
+
     // iOS cannot spawn local PTY child processes; package artifacts are only
     // installed for desktop/server targets.
     if (target.result.os.tag != .ios) {
+        b.installArtifact(cli);
         b.installArtifact(daemon);
         b.getInstallStep().dependOn(&b.addInstallArtifact(daemon, .{ .dest_sub_path = "smithers-session-daemon" }).step);
         b.installArtifact(connect);
         b.getInstallStep().dependOn(&b.addInstallArtifact(connect, .{ .dest_sub_path = "smithers-session-connect" }).step);
+        b.installArtifact(libzmux);
+        b.getInstallStep().dependOn(&b.addInstallFileWithDir(b.path("include/zmux.h"), .header, "zmux.h").step);
     }
+
+    const lib_step = b.step("lib", "Build libzmux static C99 library and install zmux.h");
+    lib_step.dependOn(&b.addInstallArtifact(libzmux, .{}).step);
+    lib_step.dependOn(&b.addInstallFileWithDir(b.path("include/zmux.h"), .header, "zmux.h").step);
 
     const test_step = b.step("test", "Run zmux unit and integration tests");
 
@@ -178,6 +196,31 @@ pub fn build(b: *std.Build) void {
     addUnitTestStep(b, target, optimize, test_filters, "test-daemon", "src/daemon.zig", "Run daemon unit tests");
     addUnitTestStep(b, target, optimize, test_filters, "test-main", "src/main.zig", "Run main library unit tests");
     addUnitTestStep(b, target, optimize, test_filters, "test-socket-path", "src/socket_path.zig", "Run socket_path unit tests");
+    addUnitTestStep(b, target, optimize, test_filters, "test-vt", "src/vt.zig", "Run vt virtual terminal unit tests");
+    addUnitTestStep(b, target, optimize, test_filters, "test-reactor", "src/reactor.zig", "Run reactor OS event unit tests");
+    addUnitTestStep(b, target, optimize, test_filters, "test-cli", "src/cli.zig", "Run unified zmux CLI unit tests");
+    addUnitTestStep(b, target, optimize, test_filters, "test-c-api-zig", "src/c_api.zig", "Run libzmux C ABI Zig unit tests");
+
+    const c_smoke_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    c_smoke_mod.addCSourceFile(.{
+        .file = b.path("test/c_api/smoke.c"),
+        .flags = &.{ "-std=c99", "-Wall", "-Wextra", "-Werror" },
+    });
+    c_smoke_mod.addIncludePath(b.path("include"));
+    c_smoke_mod.linkLibrary(libzmux);
+    const c_smoke_exe = b.addExecutable(.{
+        .name = "zmux-c-api-smoke",
+        .root_module = c_smoke_mod,
+    });
+    const run_c_smoke = b.addRunArtifact(c_smoke_exe);
+    const test_c_api_step = b.step("test-c-api", "Compile and run the libzmux C99 smoke test");
+    test_c_api_step.dependOn(&run_c_smoke.step);
+    test_step.dependOn(&run_c_smoke.step);
+
     const test_integration_step = b.step("test-integration", "Run integration test suite");
     test_integration_step.dependOn(&b.addRunArtifact(integration_tests).step);
 
@@ -213,6 +256,9 @@ pub fn build(b: *std.Build) void {
     const mod_mux = createRootModule(b, target, bench_optimize, "src/mux.zig");
     const mod_daemon = createRootModule(b, target, bench_optimize, "src/daemon.zig");
     const mod_socket_path = createRootModule(b, target, bench_optimize, "src/socket_path.zig");
+    const mod_vt = createRootModule(b, target, bench_optimize, "src/vt.zig");
+    const mod_reactor = createRootModule(b, target, bench_optimize, "src/reactor.zig");
+    const mod_cli = createRootModule(b, target, bench_optimize, "src/cli.zig");
 
     addBenchStep(b, bench_step, bench_check_step, target, bench_optimize, bench_harness_mod, "buffer", "bench/buffer_bench.zig", &.{
         .{ .name = "buffer", .module = mod_buffer },
@@ -252,6 +298,18 @@ pub fn build(b: *std.Build) void {
     });
     addBenchStep(b, bench_step, bench_check_step, target, bench_optimize, bench_harness_mod, "socket-path", "bench/socket_path_bench.zig", &.{
         .{ .name = "socket_path", .module = mod_socket_path },
+    });
+    addBenchStep(b, bench_step, bench_check_step, target, bench_optimize, bench_harness_mod, "vt", "bench/vt_bench.zig", &.{
+        .{ .name = "vt", .module = mod_vt },
+    });
+    addBenchStep(b, bench_step, bench_check_step, target, bench_optimize, bench_harness_mod, "reactor", "bench/reactor_bench.zig", &.{
+        .{ .name = "reactor", .module = mod_reactor },
+    });
+    addBenchStep(b, bench_step, bench_check_step, target, bench_optimize, bench_harness_mod, "cli", "bench/cli_bench.zig", &.{
+        .{ .name = "cli", .module = mod_cli },
+    });
+    addBenchStep(b, bench_step, bench_check_step, target, bench_optimize, bench_harness_mod, "c-api", "bench/c_api_bench.zig", &.{
+        .{ .name = "zmux", .module = mod_zmux },
     });
 
     const report_mod = b.createModule(.{

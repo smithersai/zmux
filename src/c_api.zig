@@ -8,6 +8,8 @@ const std = @import("std");
 
 const client_impl = @import("c_api/client.zig");
 const scrollback_impl = @import("c_api/scrollback.zig");
+/// Virtual terminal C99 ABI exports (`zmux_vt_*`).
+pub const vt_impl = @import("c_api/vt.zig");
 const protocol = @import("protocol.zig");
 const socket_path = @import("socket_path.zig");
 const sys = @import("sys.zig");
@@ -38,6 +40,14 @@ pub const ZmuxScrollback = scrollback_impl.Handle;
 
 /// Opaque C JSON-RPC client handle (`zmux_client_t`).
 pub const ZmuxClient = client_impl.Handle;
+
+/// Opaque C virtual terminal handle (`zmux_vt_t`).
+pub const ZmuxVt = vt_impl.VtHandle;
+
+comptime {
+    // Force Zig to emit the C ABI symbols declared in `src/c_api/vt.zig`.
+    _ = vt_impl;
+}
 
 /// Return the static NUL-terminated zmux wire protocol version string.
 pub export fn zmux_version() callconv(.c) [*:0]const u8 {
@@ -274,6 +284,7 @@ fn mapClientError(err: client_impl.Error) Status {
 test {
     _ = scrollback_impl;
     _ = client_impl;
+    _ = vt_impl;
 }
 
 test "zmux_version matches protocol.version" {

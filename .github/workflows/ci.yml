@@ -54,6 +54,9 @@ jobs:
         with:
           node-version: "26.4.0"
 
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
       - name: Install smthrs
         run: npm install --global --ignore-scripts --no-audit --no-fund smthrs@1.0.0-rc.16
 

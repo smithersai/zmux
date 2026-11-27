@@ -92,7 +92,7 @@ describe("live zmuxd integration: ZmuxClient, AttachedPane, zmux-ws bridge, xter
     const client = await ZmuxClient.connect({ socketPath });
     try {
       const ping = await client.ping();
-      expect(ping.version).toBe("0.4.0");
+      expect(ping.version).toBe("0.5.0");
       expect(ping.socketPath).toBe(socketPath);
       expect(ping.pid).toBeGreaterThan(0);
 
@@ -225,7 +225,7 @@ describe("live zmuxd integration: ZmuxClient, AttachedPane, zmux-ws bridge, xter
       });
       try {
         const ping = await client.ping();
-        expect(ping.version).toBe("0.4.0");
+        expect(ping.version).toBe("0.5.0");
         expect(ping.socketPath).toBe(tmp.socketPath);
         await client.shutdown();
       } finally {
@@ -285,7 +285,7 @@ describe("live zmuxd integration: ZmuxClient, AttachedPane, zmux-ws bridge, xter
     expect(rpcRes.headers.get("access-control-allow-origin")).toBe("http://localhost:5173");
     const rpcBody = (await rpcRes.json()) as { id: number; result: { version: string } };
     expect(rpcBody.id).toBe(9);
-    expect(rpcBody.result.version).toBe("0.4.0");
+    expect(rpcBody.result.version).toBe("0.5.0");
 
     // 5. SSE /events live stream
     const unauthSse = await fetch(`${b.httpUrl}/events`);
@@ -391,6 +391,160 @@ describe("live zmuxd integration: ZmuxClient, AttachedPane, zmux-ws bridge, xter
       }
     } finally {
       attachment.dispose();
+    }
+  });
+
+  test("ZmuxClient exercises live v0.5.0 VT screen, agent RPCs, layout ops, recording, and delta resume", async () => {
+    const client = await ZmuxClient.connect({ socketPath });
+    const recPath = path.join(path.dirname(socketPath), "live-v05.cast");
+    try {
+      await client.subscribeEvents(["*"]);
+      const titleEvents: string[] = [];
+      client.on("pane_title_changed", (ev) => titleEvents.push(ev.title));
+
+      const created = await client.createSession({
+        id: "v05-live",
+        command: "/bin/sh",
+        rows: 20,
+        cols: 70,
+        env: { HOME: "/nonexistent", PS1: "$ " },
+      });
+
+      // pane.exec with output capture + exitCode 0 and non-zero
+      const ex0 = await client.execPane({
+        paneId: created.paneId,
+        command: "printf '\\033]2;ts-v05-title\\007\\033]7;file://h/tmp\\007HELLO_V05_EXEC'",
+        timeoutMs: 5000,
+      });
+      expect(ex0.exitCode).toBe(0);
+      expect(ex0.timedOut).toBe(false);
+      expect(ex0.output).toContain("HELLO_V05_EXEC");
+
+      const ex7 = await client.execPane({
+        paneId: created.paneId,
+        command: "(exit 7)",
+        captureOutput: false,
+        timeoutMs: 5000,
+      });
+      expect(ex7.exitCode).toBe(7);
+
+      // session.screen + formatted session.capture
+      const screen = await client.screen({
+        paneId: created.paneId,
+        includeCells: true,
+        includeAnsiRestore: true,
+        includeScrollback: 5,
+      });
+      expect(screen.rows).toBe(20);
+      expect(screen.cols).toBe(70);
+      expect(screen.title).toBe("ts-v05-title");
+      expect(screen.cwd).toBe("/tmp");
+      expect(screen.text).toContain("HELLO_V05_EXEC");
+      expect(Array.isArray(screen.cells)).toBe(true);
+      expect(typeof screen.ansiRestore).toBe("string");
+      expect(screen.ansiRestore!.length).toBeGreaterThan(0);
+
+      const capPlain = await client.captureSession({
+        paneId: created.paneId,
+        format: "plain",
+      });
+      expect(capPlain.text).toContain("HELLO_V05_EXEC");
+
+      // pane.wait + pane.signal
+      await client.send({
+        paneId: created.paneId,
+        text: "trap 'echo SIG_TRAPPED_TS' USR1; echo WAIT_READY_TS",
+        enter: true,
+      });
+      const w1 = await client.waitPane({
+        paneId: created.paneId,
+        pattern: "WAIT_READY_TS",
+        timeoutMs: 5000,
+      });
+      expect(w1.matched).toBe(true);
+      expect(w1.reason).toBe("pattern");
+
+      const sigRes = await client.signalPane({ paneId: created.paneId, signal: "SIGUSR1" });
+      expect(sigRes.ok).toBe(true);
+      expect(sigRes.signal).toBe("SIGUSR1");
+
+      const w2 = await client.waitPane({
+        paneId: created.paneId,
+        pattern: "SIG_TRAPPED_TS",
+        timeoutMs: 5000,
+      });
+      expect(w2.matched).toBe(true);
+
+      // pane.record start -> status -> stop (asciicast v2)
+      const recStart = await client.recordPane({
+        paneId: created.paneId,
+        action: "start",
+        path: recPath,
+      });
+      expect(recStart.recording).toBe(true);
+      expect(recStart.format).toBe("asciicast-v2");
+      await client.send({ paneId: created.paneId, text: "echo CAST_LINE", enter: true });
+      await client.waitPane({ paneId: created.paneId, pattern: "CAST_LINE", timeoutMs: 5000 });
+      const recStop = await client.recordPane({ paneId: created.paneId, action: "stop" });
+      expect(recStop.recording).toBe(false);
+      expect(recStop.bytesWritten).toBeGreaterThan(0);
+      expect(fs.readFileSync(recPath, "utf8")).toContain('"version":2');
+
+      // pane.metadata + pane.split + pane.resizeSplit + pane.zoom + client.attach(vt, readOnly, resume) + client.setMode
+      const meta = await client.setMetadata({
+        paneId: created.paneId,
+        set: { agent: "claude", task: "v05-test" },
+      });
+      expect(meta.metadata.agent).toBe("claude");
+      expect(meta.metadata.task).toBe("v05-test");
+
+      const split = await client.splitPane({
+        paneId: created.paneId,
+        axis: "horizontal",
+        command: "/bin/sh",
+      });
+      await client.resizeSplit({ paneId: split.paneId, ratio: 0.65 });
+      const zoomedSnap = await client.zoomPane({ paneId: split.paneId, zoomed: true });
+      const zoomedWin = zoomedSnap.sessions
+        .find((s) => s.id === created.sessionId)
+        ?.windows.find((w) => w.id === created.windowId);
+      expect(zoomedWin?.zoomedPaneId).toBe(split.paneId);
+
+      const attVt = await client.attach({
+        paneId: created.paneId,
+        rows: 20,
+        cols: 70,
+        readOnly: true,
+        replayMode: "vt",
+      });
+      expect(attVt.readOnly).toBe(true);
+      expect(attVt.replayMode).toBe("ansi_restore");
+
+      const modeUpdated = await client.setClientMode({
+        clientId: attVt.clientId,
+        readOnly: false,
+        resizePolicy: "smallest",
+      });
+      expect(modeUpdated.readOnly).toBe(false);
+      expect(modeUpdated.resizePolicy).toBe("smallest");
+
+      const attResume = await client.attach({
+        paneId: created.paneId,
+        readOnly: true,
+        resumeFromOffset: attVt.replayEndOffset,
+        resumeGeneration: attVt.generation,
+      });
+      expect(attResume.resumed).toBe(true);
+      expect(attResume.truncated).toBe(false);
+
+      // pane.close + window.close
+      await client.closePane(split.paneId);
+      const afterWinClose = await client.closeWindow(created.windowId);
+      expect(afterWinClose.sessions.find((s) => s.id === created.sessionId)).toBeUndefined();
+      expect(titleEvents).toContain("ts-v05-title");
+    } finally {
+      fs.rmSync(recPath, { force: true });
+      client.close();
     }
   });
 });

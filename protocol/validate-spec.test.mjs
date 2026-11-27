@@ -26,8 +26,8 @@ test("canonical protocol/openrpc.json validates cleanly against Zig server sourc
   assert.equal(result.ok, true, `unexpected validation errors:\n${result.errors.join("\n")}`);
   assert.ok(result.stats.methods >= 39);
   assert.ok(result.stats.notifications >= 13);
-  assert.equal(result.stats.serverMethodsChecked, 28);
-  assert.equal(result.stats.sourceNotificationsChecked, 9);
+  assert.equal(result.stats.serverMethodsChecked, 39);
+  assert.equal(result.stats.sourceNotificationsChecked, 13);
   assert.equal(result.stats.sourceErrorKindsChecked, 11);
 });
 
@@ -123,7 +123,8 @@ test("extractProtocolNotifications and extractErrorKinds read real Zig sources a
   const notifs = extractProtocolNotifications(repoRoot);
   assert.ok(notifs.includes("pane_output"));
   assert.ok(notifs.includes("client_switched"));
-  assert.equal(notifs.length, 9);
+  assert.ok(notifs.includes("pane_title_changed"));
+  assert.equal(notifs.length, 13);
 
   const kinds = extractErrorKinds(repoRoot);
   assert.ok(kinds.includes("not_found"));

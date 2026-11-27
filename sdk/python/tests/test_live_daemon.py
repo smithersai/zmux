@@ -110,7 +110,7 @@ class SyncLiveDaemonTests(LiveDaemonBase):
             idle_seconds=60,
         ) as client:
             pong = client.ping()
-            self.assertEqual(pong.version, "0.4.0")
+            self.assertEqual(pong.version, "0.5.0")
             self.assertGreater(pong.pid, 0)
             self.assertEqual(pong.socket_path, self.socket_path)
             self.assertEqual(pong.sessions, 0)
@@ -305,7 +305,7 @@ class AsyncLiveDaemonTests(LiveDaemonBase):
                 idle_seconds=60,
             ) as client:
                 pong = await client.ping()
-                self.assertEqual(pong.version, "0.4.0")
+                self.assertEqual(pong.version, "0.5.0")
                 self.assertEqual(pong.socket_path, self.socket_path)
 
                 created = await client.create_session("async-work", command="/bin/sh", rows=24, cols=80)

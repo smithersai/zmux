@@ -2,8 +2,8 @@
   "openrpc": "1.3.2",
   "info": {
     "title": "zmux JSON-RPC Protocol",
-    "version": "0.4.0",
-    "description": "Canonical OpenRPC 1.3.2 specification for zmux. Covers all 28 v0.4.0 D1-D6 JSON-RPC methods, 9 server-to-client notifications, 6 error codes, 11 error kinds, and additive v0.5.0 and v0.6.0 extensions.",
+    "version": "0.5.0",
+    "description": "Canonical OpenRPC 1.3.2 specification for zmux. Covers all 28 v0.4.0 D1-D6 JSON-RPC methods, 9 v0.4.0 notifications, 11 additive v0.5.0/v0.6.0 agent and VT methods, 4 OSC notifications, 6 error codes, and 11 error kinds.",
     "license": {
       "name": "MIT",
       "url": "https://github.com/smithersai/zmux/blob/main/LICENSE"
@@ -13,7 +13,7 @@
       "url": "https://github.com/smithersai/zmux"
     }
   },
-  "x-zmux-protocol-version": "0.4.0",
+  "x-zmux-protocol-version": "0.5.0",
   "x-zmux-extensions-through": "0.6.0",
   "x-zmux-framing": {
     "transport": "ndjson-unix-socket",

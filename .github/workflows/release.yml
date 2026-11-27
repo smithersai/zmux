@@ -121,14 +121,24 @@ jobs:
 
       - name: Package assets
         run: |
+          cp zig-out/bin/zmux zmux
           cp zig-out/bin/zmuxd zmuxd
           cp zig-out/bin/zmux-connect zmux-connect
+          cp zig-out/lib/libzmux.a libzmux.a
+          cp zig-out/include/zmux.h zmux.h
           mkdir -p dist
+          tar -czf "dist/zmux-${{ matrix.name }}.tar.gz" zmux zmuxd zmux-connect LICENSE
           tar -czf "dist/zmuxd-${{ matrix.name }}.tar.gz" zmuxd LICENSE
           tar -czf "dist/zmux-connect-${{ matrix.name }}.tar.gz" zmux-connect LICENSE
+          tar -czf "dist/libzmux-${{ matrix.name }}.tar.gz" libzmux.a zmux.h LICENSE
           cd dist
-          shasum -a 256 "zmuxd-${{ matrix.name }}.tar.gz" > "zmuxd-${{ matrix.name }}.tar.gz.sha256"
-          shasum -a 256 "zmux-connect-${{ matrix.name }}.tar.gz" > "zmux-connect-${{ matrix.name }}.tar.gz.sha256"
+          for asset in \
+            "zmux-${{ matrix.name }}.tar.gz" \
+            "zmuxd-${{ matrix.name }}.tar.gz" \
+            "zmux-connect-${{ matrix.name }}.tar.gz" \
+            "libzmux-${{ matrix.name }}.tar.gz"; do
+            shasum -a 256 "$asset" > "${asset}.sha256"
+          done
 
       - name: Smoke test and verify release version
         working-directory: dist
@@ -136,7 +146,11 @@ jobs:
           ASSET_TARGET: ${{ matrix.name }}
           RELEASE_TAG: ${{ needs.plan.outputs.tag }}
         run: |
-          shasum -a 256 -c "zmuxd-${ASSET_TARGET}.tar.gz.sha256" "zmux-connect-${ASSET_TARGET}.tar.gz.sha256"
+          shasum -a 256 -c \
+            "zmux-${ASSET_TARGET}.tar.gz.sha256" \
+            "zmuxd-${ASSET_TARGET}.tar.gz.sha256" \
+            "zmux-connect-${ASSET_TARGET}.tar.gz.sha256" \
+            "libzmux-${ASSET_TARGET}.tar.gz.sha256"
           version=$(sed -nE 's/^pub const version = "([^"]+)";$/\1/p' ../src/protocol.zig)
           package_version=$(sed -nE 's/^[[:space:]]*\.version = "([^"]+)",$/\1/p' ../build.zig.zon)
           test -n "$version"
@@ -146,10 +160,14 @@ jobs:
 
           smoke_dir=$(mktemp -d "$RUNNER_TEMP/zmux-smoke.XXXXXX")
           trap 'rm -rf "$smoke_dir"' EXIT
-          tar -xzf "zmuxd-${ASSET_TARGET}.tar.gz" -C "$smoke_dir"
-          tar -xzf "zmux-connect-${ASSET_TARGET}.tar.gz" -C "$smoke_dir"
+          tar -xzf "zmux-${ASSET_TARGET}.tar.gz" -C "$smoke_dir"
+          tar -xzf "libzmux-${ASSET_TARGET}.tar.gz" -C "$smoke_dir"
+          test "$("$smoke_dir/zmux" --version)" = "zmux $version"
           test "$("$smoke_dir/zmuxd" --version)" = "zmuxd $version"
           test "$("$smoke_dir/zmux-connect" --version)" = "zmux-connect $version"
+          "$smoke_dir/zmux" doctor --json | grep -q "\"cliVersion\":\"$version\""
+          test -s "$smoke_dir/libzmux.a"
+          test -s "$smoke_dir/zmux.h"
 
       - name: Upload platform artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -177,7 +195,12 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Verify all platform assets and extract release notes
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "26.4.0"
+
+      - name: Verify all platform assets, generate Homebrew formula, and extract release notes
         env:
           VERSION: ${{ needs.plan.outputs.version }}
         run: |
@@ -185,13 +208,15 @@ jobs:
           (
             cd dist
             for target in linux-x64 linux-arm64 macos-arm64 macos-x64; do
-              for binary in zmuxd zmux-connect; do
+              for binary in zmux zmuxd zmux-connect libzmux; do
                 test -s "$binary-$target.tar.gz"
                 shasum -a 256 -c "$binary-$target.tar.gz.sha256"
               done
             done
             cat *.sha256 | sort -k2 > SHA256SUMS
           )
+          node scripts/generate-homebrew.mjs --version "$VERSION" --checksums dist/SHA256SUMS --out dist/zmux.rb
+          test -s dist/zmux.rb
           awk -v v="## [$VERSION]" 'index($0, v) == 1 { found=1; next } /^## \[/ && found { exit } found { print }' \
             CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
 
@@ -205,6 +230,7 @@ jobs:
             dist/*.tar.gz
             dist/*.tar.gz.sha256
             dist/SHA256SUMS
+            dist/zmux.rb
           fail_on_unmatched_files: true
 
   docs-build:

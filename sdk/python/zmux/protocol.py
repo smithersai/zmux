@@ -9,7 +9,7 @@ from typing import Any, Literal, Union
 
 from .errors import ZmuxProtocolError
 
-PROTOCOL_VERSION: str = "0.4.0"
+PROTOCOL_VERSION: str = "0.5.0"
 MAX_FRAME_BYTES: int = 16 * 1024 * 1024
 MAX_REQUEST_BYTES: int = 1024 * 1024
 

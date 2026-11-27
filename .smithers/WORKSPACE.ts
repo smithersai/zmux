@@ -20,7 +20,7 @@ export const Workspace = S.Workspace("smithersai-zmux", {
   // jdx/mise-action). Targets resolve zig as a host binary whose bytes key
   // every Zig action, so bumping the pin invalidates exactly those targets.
   toolchains: [S.Mise({ config: S.file("//mise.toml") })],
-  host: S.Host({ bins: ["zig", "node"] }),
+  host: S.Host({ bins: ["zig", "node", "bun", "python3", "sh"] }),
   sandboxes: S.Sandboxes({
     default: S.Sandbox.None()
   }),

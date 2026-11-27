@@ -19,7 +19,6 @@ const fuzz_hooks = fuzz_hooks_mod.fuzz_hooks;
 const max_response_bytes = server_mod.max_response_bytes;
 const readLineTimeout = test_support_mod.readLineTimeout;
 const resultOf = test_support_mod.resultOf;
-const sessionIdParam = params_mod.sessionIdParam;
 const test_io = test_support_mod.test_io;
 
 /// Route one request to its method handler. Fails with `InvalidParams` for non-object params.
@@ -172,10 +171,13 @@ pub fn writeErrorFor(self: *Server, connection: *ClientConnection, id_json: []co
     };
 }
 
-/// Get a required session by ID. Caller MUST call release() on the
-/// returned session.
+/// Get a required session or pane by ID/name (`sessionId`, `id`, `paneId`, `targetPaneId`, or `target`).
+/// Caller MUST call release() on the returned session.
 pub fn requiredSession(self: *Server, req: *const protocol.Request) !*NativeSession {
-    const id = try sessionIdParam(req.params()) orelse return error.InvalidParams;
+    const id = try params_mod.firstStringParam(
+        req.params(),
+        &.{ "sessionId", "id", "paneId", "targetPaneId", "target" },
+    ) orelse return error.InvalidParams;
     return self.manager.find(id) orelse error.SessionNotFound;
 }
 
