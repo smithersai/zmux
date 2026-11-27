@@ -494,8 +494,9 @@ ${renderMarkdown(mythicalMd)}
   ]
   for (const cat of auditJson.categories ?? []) {
     const metrics = Array.isArray(cat.metrics) ? cat.metrics : []
-    const passing = metrics.filter((m) => typeof m.score === "number" && m.score >= 90).length
-    mdLines.push(`| ${cat.title} | ${cat.score}/100 | ${passing}/${metrics.length} |`)
+    const scored = metrics.filter((m) => typeof m.score === "number")
+    const passing = scored.filter((m) => m.score >= 90).length
+    mdLines.push(`| ${cat.title} | ${cat.score}/100 | ${passing}/${scored.length} |`)
   }
   if (Array.isArray(auditJson.opportunities) && auditJson.opportunities.length > 0) {
     mdLines.push(

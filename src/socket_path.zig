@@ -110,7 +110,12 @@ pub fn isDefaultManaged(path: []const u8, getenv: GetEnv) bool {
     if (parent.len == 0) return false;
     if (nonEmpty(getenv("HOME"))) |home| {
         var buf: [std.posix.PATH_MAX]u8 = undefined;
-        const managed = std.fmt.bufPrint(&buf, "{s}/.smithers", .{trimTrailingSlashes(home)}) catch return false;
+        const home_dir = trimTrailingSlashes(home);
+        // A root HOME ("/") must join as "/.smithers", not "//.smithers".
+        const prefix = if (std.mem.eql(u8, home_dir, "/")) "" else home_dir;
+        assert(prefix.len == 0 or prefix[prefix.len - 1] != '/');
+        const managed = std.fmt.bufPrint(&buf, "{s}/.smithers", .{prefix}) catch return false;
+        assert(managed.len >= "/.smithers".len);
         if (std.mem.eql(u8, parent, managed)) return true;
     }
     var buf: [64]u8 = undefined;
@@ -300,6 +305,17 @@ test "isDefaultManaged is true only for HOME/.smithers and /tmp/zmux-<euid>" {
     try std.testing.expect(!isDefaultManaged("/tmp/explicit.sock", TestEnv.get));
     try std.testing.expect(!isDefaultManaged("/run/user/7/smithers-sessions.sock", TestEnv.get));
     try std.testing.expect(!isDefaultManaged("relative.sock", TestEnv.get));
+}
+
+test "isDefaultManaged joins a root HOME without a double slash" {
+    defer TestEnv.reset();
+    TestEnv.reset();
+    TestEnv.home = "/";
+    try std.testing.expect(isDefaultManaged("/.smithers/sessions.sock", TestEnv.get));
+    try std.testing.expect(!isDefaultManaged("//.smithers/sessions.sock", TestEnv.get));
+    try std.testing.expect(!isDefaultManaged("/sessions.sock", TestEnv.get));
+    TestEnv.home = "///";
+    try std.testing.expect(isDefaultManaged("/.smithers/sessions.sock", TestEnv.get));
 }
 
 test "processEnv reads the process environment" {

@@ -13,19 +13,114 @@ const benchHarness = ["bench/bench.zig"] as const
 
 const files = (paths: ReadonlyArray<string>) => [...new Set(paths)].sort().map((path) => S.file(path))
 
-const bufferSrcs = ["src/buffer.zig"] as const
-const protocolSrcs = ["src/protocol.zig"] as const
-const logSrcs = ["src/log.zig"] as const
-const sysSrcs = ["src/sys.zig"] as const
-const foregroundSrcs = ["src/foreground.zig", ...protocolSrcs, ...sysSrcs] as const
+const bufferSrcs = ["src/buffer.zig", "src/buffer/capture.zig"] as const
+const protocolSrcs = [
+  "src/protocol.zig",
+  "src/protocol/errors.zig",
+  "src/protocol/frames.zig",
+  "src/protocol/request.zig",
+  "src/protocol/text.zig"
+] as const
+const logSrcs = ["src/log.zig", "src/log/format.zig"] as const
+const sysSrcs = [
+  "src/sys.zig",
+  "src/sys/child.zig",
+  "src/sys/fd.zig",
+  "src/sys/fs.zig",
+  "src/sys/private.zig",
+  "src/sys/socket.zig"
+] as const
+const foregroundSrcs = [
+  "src/foreground.zig",
+  "src/foreground/argv.zig",
+  "src/foreground/darwin.zig",
+  "src/foreground/linux.zig",
+  ...protocolSrcs,
+  ...sysSrcs
+] as const
 const socketPathSrcs = ["src/socket_path.zig", ...sysSrcs] as const
-const rpcLineReaderSrcs = ["src/rpc_line_reader.zig", ...sysSrcs] as const
-const ptySrcs = ["src/pty.zig", ...sysSrcs] as const
-const nativeSrcs = ["src/native.zig", ...bufferSrcs, ...foregroundSrcs, ...ptySrcs, ...protocolSrcs] as const
-const muxSrcs = ["src/mux.zig", ...bufferSrcs, ...nativeSrcs] as const
-const connectSrcs = ["src/connect.zig", ...rpcLineReaderSrcs, ...protocolSrcs, ...socketPathSrcs, ...sysSrcs] as const
+const rpcLineReaderSrcs = [
+  "src/rpc_line_reader.zig",
+  "src/rpc_line_reader/wait.zig",
+  ...sysSrcs
+] as const
+const ptySrcs = [
+  "src/pty.zig",
+  "src/pty/child.zig",
+  "src/pty/env.zig",
+  "src/pty/proc.zig",
+  "src/pty/session.zig",
+  "src/pty/signal.zig",
+  "src/pty/spawn.zig",
+  ...sysSrcs
+] as const
+const nativeSrcs = [
+  "src/native.zig",
+  "src/native/control.zig",
+  "src/native/events.zig",
+  "src/native/harness.zig",
+  "src/native/keys.zig",
+  "src/native/reader.zig",
+  "src/native/session.zig",
+  ...bufferSrcs,
+  ...foregroundSrcs,
+  ...logSrcs,
+  ...ptySrcs,
+  ...protocolSrcs
+] as const
+const muxSrcs = [
+  "src/mux.zig",
+  "src/mux/attach.zig",
+  "src/mux/commands.zig",
+  "src/mux/creation.zig",
+  "src/mux/events.zig",
+  "src/mux/invariants.zig",
+  "src/mux/json.zig",
+  "src/mux/layout.zig",
+  "src/mux/lookup.zig",
+  "src/mux/removal.zig",
+  "src/mux/respawn.zig",
+  "src/mux/types.zig",
+  ...bufferSrcs,
+  ...nativeSrcs
+] as const
+const connectSrcs = [
+  "src/connect.zig",
+  "src/connect/cli.zig",
+  "src/connect/events.zig",
+  "src/connect/rpc.zig",
+  "src/connect/run_loop.zig",
+  "src/connect/spawn.zig",
+  "src/connect/terminal.zig",
+  "src/connect/verbs.zig",
+  "src/connect/wire.zig",
+  ...rpcLineReaderSrcs,
+  ...protocolSrcs,
+  ...socketPathSrcs,
+  ...sysSrcs
+] as const
 const serverSrcs = [
   "src/server.zig",
+  "src/server/accept.zig",
+  "src/server/conn_queue.zig",
+  "src/server/conn_routes.zig",
+  "src/server/conn_writer.zig",
+  "src/server/connection.zig",
+  "src/server/dispatch.zig",
+  "src/server/events.zig",
+  "src/server/fuzz_hooks.zig",
+  "src/server/lifecycle.zig",
+  "src/server/limits.zig",
+  "src/server/params.zig",
+  "src/server/payload.zig",
+  "src/server/rpc_client.zig",
+  "src/server/rpc_layout.zig",
+  "src/server/rpc_session.zig",
+  "src/server/socket_bind.zig",
+  "src/server/socket_dir.zig",
+  "src/server/socket_io.zig",
+  "src/server/startup.zig",
+  "src/server/test_support.zig",
   ...logSrcs,
   ...muxSrcs,
   ...nativeSrcs,
@@ -35,7 +130,18 @@ const serverSrcs = [
   ...sysSrcs,
   ...bufferSrcs
 ] as const
-const daemonSrcs = ["src/daemon.zig", ...logSrcs, ...protocolSrcs, ...serverSrcs, ...socketPathSrcs, ...sysSrcs] as const
+const daemonSrcs = [
+  "src/daemon.zig",
+  "src/daemon/cli.zig",
+  "src/daemon/lock.zig",
+  "src/daemon/paths.zig",
+  "src/daemon/pidfile.zig",
+  ...logSrcs,
+  ...protocolSrcs,
+  ...serverSrcs,
+  ...socketPathSrcs,
+  ...sysSrcs
+] as const
 const mainSrcs = ["src/main.zig", ...daemonSrcs, ...connectSrcs] as const
 
 const unitTest = (step: string, cacheKey: string, srcs: ReadonlyArray<string>) =>

@@ -6,12 +6,14 @@
 
 ```text
   client A (zmux-connect / IDE / agent)  \
-  client B (web terminal / dashboard)     >── UNIX socket (JSON-RPC 2.0) ──▶ zmuxd (src/server.zig)
-  client C (headless CI / test harness)  /                                      ├── src/mux.zig (sessions, windows, panes, clients)
-                                                                                ├── src/native.zig (NativeSession + reader loop)
-                                                                                ├── src/buffer.zig (bounded scrollback ring)
-                                                                                └── src/pty.zig + src/foreground.zig (OS PTY & jobs)
+  client B (web terminal / dashboard)     >--> UNIX socket (JSON-RPC 2.0) --> zmuxd (src/server.zig + src/server/*)
+  client C (headless CI / test harness)  /                                      |-- src/mux.zig + src/mux/* (sessions, windows, panes)
+                                                                                |-- src/native.zig + src/native/* (NativeSession + reader)
+                                                                                |-- src/buffer.zig + src/buffer/* (bounded scrollback)
+                                                                                `-- src/pty.zig + src/foreground.zig (OS PTY and jobs)
 ```
+
+Every subsystem is organized as a public root facade (`src/<module>.zig`) backed by focused internal submodules (`src/<module>/*.zig`), keeping all 84 Zig source files under 600 production lines and 24 kB for auditability and sharp incremental cache keys.
 
 ## Module ownership map
 

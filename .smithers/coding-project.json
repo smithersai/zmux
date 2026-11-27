@@ -41,9 +41,14 @@
       "document": ".smithers/wiki/pages/pty-and-process-lifecycle.md",
       "inputs": [
         "src/pty.zig",
+        "src/pty/spawn.zig",
+        "src/pty/signal.zig",
         "src/foreground.zig",
+        "src/foreground/linux.zig",
+        "src/foreground/darwin.zig",
         "src/sys.zig",
-        "src/native.zig"
+        "src/native.zig",
+        "src/native/control.zig"
       ],
       "related": [
         "start-here",
@@ -60,8 +65,12 @@
       "document": ".smithers/wiki/pages/protocol-and-framing.md",
       "inputs": [
         "src/protocol.zig",
+        "src/protocol/frames.zig",
+        "src/protocol/request.zig",
+        "src/protocol/errors.zig",
         "src/rpc_line_reader.zig",
         "src/connect.zig",
+        "src/connect/wire.zig",
         "CHANGELOG.md"
       ],
       "related": [
@@ -79,7 +88,13 @@
       "document": ".smithers/wiki/pages/daemon-and-security.md",
       "inputs": [
         "src/daemon.zig",
+        "src/daemon/lock.zig",
+        "src/daemon/pidfile.zig",
         "src/server.zig",
+        "src/server/socket_bind.zig",
+        "src/server/socket_dir.zig",
+        "src/server/dispatch.zig",
+        "src/server/conn_queue.zig",
         "src/socket_path.zig",
         "src/log.zig"
       ],
@@ -98,7 +113,12 @@
       "document": ".smithers/wiki/pages/mux-model-and-scrollback.md",
       "inputs": [
         "src/mux.zig",
+        "src/mux/layout.zig",
+        "src/mux/attach.zig",
+        "src/mux/commands.zig",
+        "src/mux/invariants.zig",
         "src/buffer.zig",
+        "src/buffer/capture.zig",
         "src/native.zig"
       ],
       "related": [

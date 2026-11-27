@@ -13,7 +13,6 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const log = @import("log.zig");
 
 const assert = std.debug.assert;
 const c = std.c;
@@ -28,170 +27,22 @@ pub const uid_t = c.uid_t;
 /// Platform file mode type.
 pub const mode_t = c.mode_t;
 
+const fd_io = @import("sys/fd.zig");
+const socket = @import("sys/socket.zig");
+const fs = @import("sys/fs.zig");
+const private = @import("sys/private.zig");
+const child = @import("sys/child.zig");
+
 const is_darwin = builtin.os.tag.isDarwin();
+const unexpected = fd_io.unexpected;
 
 /// An errno this layer does not map to a named error.
 pub const UnexpectedError = error{Unexpected};
 
-/// Async-signal-safe: unlike `std.posix.unexpectedErrno` this never prints or
-/// captures a stack trace, so wrappers stay usable between `fork` and `exec`.
-fn unexpected(err: posix.E) UnexpectedError {
-    _ = err;
-    return error.Unexpected;
-}
-
-/// Async-signal-safe sleep that needs no `std.Io`.
-pub fn sleepMs(ms: i64) void {
-    if (ms <= 0) return;
-    var none: [1]c.pollfd = undefined;
-    _ = c.poll(&none, 0, @intCast(@min(ms, std.math.maxInt(c_int))));
-}
-
-/// Guards the Darwin-only windows where a descriptor exists without
-/// `FD_CLOEXEC` (`socket`, `accept`, `pipe`, `openpty` have no atomic
-/// close-on-exec form there). Descriptor creators hold it shared; `fork`
-/// holds it exclusive, so a forked child never observes a half-initialised
-/// descriptor. The exclusive side waits a bounded time: `closeFrom` in the
-/// child is the backstop, so `fork` must never deadlock behind a reader.
-pub const ForkLock = struct {
-    /// > 0: number of shared holders; -1: exclusive holder.
-    state: std.atomic.Value(i32) = .init(0),
-
-    pub fn lockShared(self: *ForkLock) void {
-        while (true) {
-            const current = self.state.load(.seq_cst);
-            if (current >= 0 and self.state.cmpxchgWeak(current, current + 1, .seq_cst, .seq_cst) == null) return;
-            std.atomic.spinLoopHint();
-        }
-    }
-
-    pub fn unlockShared(self: *ForkLock) void {
-        const previous = self.state.fetchSub(1, .seq_cst);
-        assert(previous > 0);
-    }
-
-    /// Returns false when shared holders did not drain within `budget_ms`.
-    pub fn lockExclusiveBounded(self: *ForkLock, budget_ms: i64) bool {
-        assert(budget_ms >= 0);
-        const deadline = monotonicMs() + budget_ms;
-        while (true) {
-            if (self.state.cmpxchgStrong(0, -1, .seq_cst, .seq_cst) == null) return true;
-            if (monotonicMs() >= deadline) return false;
-            sleepMs(1);
-        }
-    }
-
-    pub fn unlockExclusive(self: *ForkLock) void {
-        assert(self.state.load(.seq_cst) == -1);
-        self.state.store(0, .seq_cst);
-    }
-};
-
+/// The process-wide Darwin fork lock. Test seam: defined here because a
+/// mutable global cannot be re-exported through a `pub const` alias.
 pub var fork_lock: ForkLock = .{};
 const fork_lock_budget_ms: i64 = 100;
-
-inline fn forkLockShared() void {
-    if (is_darwin) fork_lock.lockShared();
-}
-
-inline fn forkUnlockShared() void {
-    if (is_darwin) fork_lock.unlockShared();
-}
-
-/// Close `fd`, ignoring errors. Matches the Zig 0.15 `std.posix.close` contract:
-/// EINTR still releases the descriptor, so retrying would be a bug.
-pub fn close(fd: fd_t) void {
-    _ = c.close(fd);
-}
-
-/// Errors from `write` and `send`.
-pub const WriteError = error{
-    WouldBlock,
-    BrokenPipe,
-    ConnectionResetByPeer,
-    InputOutput,
-    NoSpaceLeft,
-    AccessDenied,
-} || UnexpectedError;
-
-/// `write(2)`, retrying `EINTR`. Returns the bytes written, which may be
-/// fewer than `bytes.len`. Writes nothing and returns 0 for an empty slice.
-pub fn write(fd: fd_t, bytes: []const u8) WriteError!usize {
-    if (bytes.len == 0) return 0;
-    const max_count: usize = if (is_darwin) std.math.maxInt(i32) else 0x7ffff000;
-    while (true) {
-        const rc = c.write(fd, bytes.ptr, @min(bytes.len, max_count));
-        switch (posix.errno(rc)) {
-            .SUCCESS => return @intCast(rc),
-            .INTR => continue,
-            .AGAIN => return error.WouldBlock,
-            .PIPE => return error.BrokenPipe,
-            .CONNRESET => return error.ConnectionResetByPeer,
-            .IO => return error.InputOutput,
-            .NOSPC => return error.NoSpaceLeft,
-            .ACCES, .PERM => return error.AccessDenied,
-            else => |err| return unexpected(err),
-        }
-    }
-}
-
-/// Write every byte, retrying short writes. A zero-length write is reported as
-/// `error.WriteZero` instead of spinning.
-pub fn writeAll(fd: fd_t, bytes: []const u8) (WriteError || error{WriteZero})!void {
-    var offset: usize = 0;
-    while (offset < bytes.len) {
-        const n = try write(fd, bytes[offset..]);
-        if (n == 0) return error.WriteZero;
-        offset += n;
-    }
-}
-
-/// Send bytes on a connected socket with `MSG_NOSIGNAL` so a closed peer
-/// reports `error.BrokenPipe` instead of raising `SIGPIPE` in an embedding
-/// process that leaves `SIGPIPE` at its default disposition.
-pub fn send(fd: fd_t, bytes: []const u8) WriteError!usize {
-    if (bytes.len == 0) return 0;
-    const max_count: usize = if (is_darwin) std.math.maxInt(i32) else 0x7ffff000;
-    while (true) {
-        const rc = c.send(fd, bytes.ptr, @min(bytes.len, max_count), c.MSG.NOSIGNAL);
-        switch (posix.errno(rc)) {
-            .SUCCESS => return @intCast(rc),
-            .INTR => continue,
-            .AGAIN => return error.WouldBlock,
-            .PIPE => return error.BrokenPipe,
-            .CONNRESET => return error.ConnectionResetByPeer,
-            .IO => return error.InputOutput,
-            .NOSPC => return error.NoSpaceLeft,
-            .ACCES, .PERM => return error.AccessDenied,
-            else => |err| return unexpected(err),
-        }
-    }
-}
-
-/// Send every byte on a socket with `MSG_NOSIGNAL`, retrying short writes.
-pub fn sendAll(fd: fd_t, bytes: []const u8) (WriteError || error{WriteZero})!void {
-    var offset: usize = 0;
-    while (offset < bytes.len) {
-        const n = try send(fd, bytes[offset..]);
-        if (n == 0) return error.WriteZero;
-        offset += n;
-    }
-}
-
-/// `dup2(2)`: make `new_fd` refer to the same open file as `old_fd`.
-/// Async-signal-safe; suitable for use between `fork` and `exec`.
-/// When `old_fd == new_fd`, clears `FD_CLOEXEC` instead so the descriptor
-/// survives `exec`.
-pub fn dup2(old_fd: fd_t, new_fd: fd_t) UnexpectedError!void {
-    if (old_fd == new_fd) return clearCloseOnExec(new_fd);
-    while (true) {
-        switch (posix.errno(c.dup2(old_fd, new_fd))) {
-            .SUCCESS => return,
-            .INTR, .BUSY => continue,
-            else => |err| return unexpected(err),
-        }
-    }
-}
 
 /// `read(2)` with the `std.posix` error vocabulary.
 pub const read = posix.read;
@@ -200,96 +51,8 @@ pub const ReadError = posix.ReadError;
 /// `poll(2)` with the `std.posix` error vocabulary.
 pub const poll = posix.poll;
 
-/// Errors from `pipe` and `pipeCloexec`.
-pub const PipeError = error{ ProcessFdQuotaExceeded, SystemFdQuotaExceeded } || UnexpectedError;
-
-/// Create a pipe. Both ends are blocking and inherited across exec, like the
-/// Zig 0.15 `std.posix.pipe()`.
-pub fn pipe() PipeError![2]fd_t {
-    var fds: [2]fd_t = undefined;
-    switch (posix.errno(c.pipe(&fds))) {
-        .SUCCESS => return fds,
-        .MFILE => return error.ProcessFdQuotaExceeded,
-        .NFILE => return error.SystemFdQuotaExceeded,
-        else => |err| return unexpected(err),
-    }
-}
-
 /// Errors from `setCloseOnExec`.
 pub const SetCloexecError = UnexpectedError;
-
-/// Create a pipe whose ends are both close-on-exec, with no window in which a
-/// concurrent `fork` could inherit them.
-pub fn pipeCloexec() PipeError![2]fd_t {
-    if (builtin.os.tag == .linux) {
-        var fds: [2]fd_t = undefined;
-        switch (posix.errno(c.pipe2(&fds, .{ .CLOEXEC = true }))) {
-            .SUCCESS => return fds,
-            .MFILE => return error.ProcessFdQuotaExceeded,
-            .NFILE => return error.SystemFdQuotaExceeded,
-            else => |err| return unexpected(err),
-        }
-    }
-    forkLockShared();
-    defer forkUnlockShared();
-    const fds = try pipe();
-    errdefer {
-        close(fds[0]);
-        close(fds[1]);
-    }
-    try setCloseOnExec(fds[0]);
-    try setCloseOnExec(fds[1]);
-    return fds;
-}
-
-/// Set `FD_CLOEXEC` on `fd`.
-pub fn setCloseOnExec(fd: fd_t) SetCloexecError!void {
-    const flags = c.fcntl(fd, c.F.GETFD);
-    if (flags < 0) return unexpected(posix.errno(flags));
-    if (c.fcntl(fd, c.F.SETFD, flags | c.FD_CLOEXEC) < 0) return unexpected(posix.errno(@as(c_int, -1)));
-}
-
-/// Async-signal-safe.
-pub fn clearCloseOnExec(fd: fd_t) UnexpectedError!void {
-    const flags = c.fcntl(fd, c.F.GETFD);
-    if (flags < 0) return unexpected(posix.errno(flags));
-    if (c.fcntl(fd, c.F.SETFD, flags & ~@as(c_int, c.FD_CLOEXEC)) < 0) return unexpected(posix.errno(@as(c_int, -1)));
-}
-
-/// Set `O_NONBLOCK` on `fd`.
-pub fn setNonBlocking(fd: fd_t) UnexpectedError!void {
-    const flags = c.fcntl(fd, c.F.GETFL);
-    if (flags < 0) return unexpected(posix.errno(flags));
-    const nonblock: c_int = @bitCast(c.O{ .NONBLOCK = true });
-    if (c.fcntl(fd, c.F.SETFL, flags | nonblock) < 0) return unexpected(posix.errno(@as(c_int, -1)));
-}
-
-/// Clear `O_NONBLOCK` on `fd`.
-pub fn clearNonBlocking(fd: fd_t) UnexpectedError!void {
-    const flags = c.fcntl(fd, c.F.GETFL);
-    if (flags < 0) return unexpected(posix.errno(flags));
-    const nonblock: c_int = @bitCast(c.O{ .NONBLOCK = true });
-    if (c.fcntl(fd, c.F.SETFL, flags & ~nonblock) < 0) return unexpected(posix.errno(@as(c_int, -1)));
-}
-
-/// True when `fd` has `O_NONBLOCK`; false also when `fcntl` fails.
-pub fn isNonBlocking(fd: fd_t) bool {
-    const flags = c.fcntl(fd, c.F.GETFL);
-    const nonblock: c_int = @bitCast(c.O{ .NONBLOCK = true });
-    return flags >= 0 and (flags & nonblock) != 0;
-}
-
-/// True when `fd` has `FD_CLOEXEC`.
-pub fn isCloseOnExec(fd: fd_t) UnexpectedError!bool {
-    const flags = c.fcntl(fd, c.F.GETFD);
-    if (flags < 0) return unexpected(posix.errno(flags));
-    return (flags & c.FD_CLOEXEC) != 0;
-}
-
-/// True when `fd` refers to a terminal.
-pub fn isatty(fd: fd_t) bool {
-    return c.isatty(fd) == 1;
-}
 
 /// Effective user id of the calling process.
 pub fn geteuid() uid_t {
@@ -328,645 +91,14 @@ pub fn ioctl(fd: fd_t, request: c_ulong, arg: usize) c_int {
 }
 
 // ---------------------------------------------------------------------------
-// Sockets
-
-/// Byte capacity of `sockaddr_un.sun_path`, excluding the NUL terminator.
-pub const max_unix_path_len: usize = @field(@as(c.sockaddr.un, undefined), "path").len - 1;
-
-/// A `sockaddr_un` for a filesystem `AF_UNIX` socket path.
-pub const UnixAddress = struct {
-    sockaddr: c.sockaddr.un,
-    len: c.socklen_t,
-
-    pub fn init(path: []const u8) error{NameTooLong}!UnixAddress {
-        if (path.len > max_unix_path_len) return error.NameTooLong;
-        var addr: c.sockaddr.un = .{ .family = c.AF.UNIX, .path = undefined };
-        @memset(&addr.path, 0);
-        @memcpy(addr.path[0..path.len], path);
-        assert(path.len < addr.path.len);
-        assert(addr.path[path.len] == 0);
-        return .{ .sockaddr = addr, .len = @intCast(@sizeOf(c.sockaddr.un)) };
-    }
-
-    pub fn any(self: *const UnixAddress) *const c.sockaddr {
-        return @ptrCast(&self.sockaddr);
-    }
-};
-
-/// Errors from creating a socket or socket pair.
-pub const SocketError = error{
-    ProcessFdQuotaExceeded,
-    SystemFdQuotaExceeded,
-    SystemResources,
-    AccessDenied,
-    AddressFamilyNotSupported,
-} || UnexpectedError;
-
-/// Create a close-on-exec AF_UNIX stream socket.
-pub fn unixStreamSocket() SocketError!fd_t {
-    // Darwin has no SOCK_CLOEXEC; set FD_CLOEXEC right after creation.
-    const flags: c_uint = if (is_darwin) c.SOCK.STREAM else c.SOCK.STREAM | c.SOCK.CLOEXEC;
-    forkLockShared();
-    defer forkUnlockShared();
-    const rc = c.socket(c.AF.UNIX, flags, 0);
-    switch (posix.errno(rc)) {
-        .SUCCESS => {},
-        .MFILE => return error.ProcessFdQuotaExceeded,
-        .NFILE => return error.SystemFdQuotaExceeded,
-        .NOBUFS, .NOMEM => return error.SystemResources,
-        .ACCES => return error.AccessDenied,
-        .AFNOSUPPORT => return error.AddressFamilyNotSupported,
-        else => |err| return unexpected(err),
-    }
-    const fd: fd_t = @intCast(rc);
-    assert(fd >= 0);
-    if (is_darwin) {
-        setCloseOnExec(fd) catch |err| {
-            close(fd);
-            return err;
-        };
-        setNoSigPipe(fd);
-    }
-    return fd;
-}
-
-/// Suppress `SIGPIPE` on Darwin sockets via `SO_NOSIGPIPE` (best effort;
-/// `send()` also passes `MSG_NOSIGNAL`).
-fn setNoSigPipe(fd: fd_t) void {
-    if (!is_darwin) return;
-    const one: c_int = 1;
-    _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.NOSIGPIPE, &one, @sizeOf(c_int));
-}
-
-/// Raise `SO_SNDBUF` and `SO_RCVBUF` on local UNIX stream sockets (best effort).
-/// macOS defaults `AF_UNIX` buffers to 8 KiB, forcing dozens of blocking thread
-/// wakeups on 64–256 KiB scrollback replays and PTY output bursts; 256 KiB lets
-/// typical frames complete in 1–2 syscalls.
-pub fn tuneUnixSocketBuffers(fd: fd_t) void {
-    const size: c_int = 256 * 1024;
-    _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.SNDBUF, &size, @sizeOf(c_int));
-    _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.RCVBUF, &size, @sizeOf(c_int));
-}
-
-/// Errors from `bind`.
-pub const BindError = error{
-    AccessDenied,
-    AddressInUse,
-    AddressNotAvailable,
-    SymLinkLoop,
-    NameTooLong,
-    FileNotFound,
-    NotDir,
-    ReadOnlyFileSystem,
-    SystemResources,
-} || UnexpectedError;
-
-/// `bind(2)` `fd` to the UNIX socket `address`.
-pub fn bind(fd: fd_t, address: *const UnixAddress) BindError!void {
-    switch (posix.errno(c.bind(fd, address.any(), address.len))) {
-        .SUCCESS => {},
-        .ACCES, .PERM => return error.AccessDenied,
-        .ADDRINUSE => return error.AddressInUse,
-        .ADDRNOTAVAIL => return error.AddressNotAvailable,
-        .LOOP => return error.SymLinkLoop,
-        .NAMETOOLONG => return error.NameTooLong,
-        .NOENT => return error.FileNotFound,
-        .NOTDIR => return error.NotDir,
-        .ROFS => return error.ReadOnlyFileSystem,
-        .NOMEM, .NOBUFS => return error.SystemResources,
-        else => |err| return unexpected(err),
-    }
-}
-
-/// Errors from `listen`.
-pub const ListenError = error{ AddressInUse, OperationNotSupported } || UnexpectedError;
-
-/// `listen(2)` on `fd` with at most `backlog` pending connections.
-pub fn listen(fd: fd_t, backlog: u31) ListenError!void {
-    switch (posix.errno(c.listen(fd, backlog))) {
-        .SUCCESS => {},
-        .ADDRINUSE => return error.AddressInUse,
-        .OPNOTSUPP => return error.OperationNotSupported,
-        else => |err| return unexpected(err),
-    }
-}
-
-/// Errors from `accept`.
-pub const AcceptError = error{
-    WouldBlock,
-    ConnectionAborted,
-    ProcessFdQuotaExceeded,
-    SystemFdQuotaExceeded,
-    SystemResources,
-    SocketNotListening,
-    ProtocolFailure,
-    BlockedByFirewall,
-} || UnexpectedError;
-
-/// Accept one connection; the returned descriptor is close-on-exec.
-pub fn accept(fd: fd_t) AcceptError!fd_t {
-    while (true) {
-        if (builtin.os.tag != .linux and !isNonBlocking(fd)) {
-            // Wait for a connection outside the fork lock so a blocking
-            // listener never holds it across an idle `accept`.
-            var fds = [_]c.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-            _ = c.poll(&fds, 1, -1);
-        }
-        forkLockShared();
-        const rc = if (builtin.os.tag == .linux)
-            std.c.accept4(fd, null, null, c.SOCK.CLOEXEC)
-        else
-            c.accept(fd, null, null);
-        const accept_errno = posix.errno(rc);
-        const cloexec_ok = if (accept_errno == .SUCCESS and builtin.os.tag != .linux)
-            (if (setCloseOnExec(@intCast(rc))) |_| true else |_| false)
-        else
-            true;
-        forkUnlockShared();
-        switch (accept_errno) {
-            .SUCCESS => {
-                const client: fd_t = @intCast(rc);
-                assert(client >= 0);
-                if (!cloexec_ok) {
-                    close(client);
-                    return error.Unexpected;
-                }
-                if (is_darwin) setNoSigPipe(client);
-                return client;
-            },
-            .INTR => continue,
-            .AGAIN => return error.WouldBlock,
-            .CONNABORTED => return error.ConnectionAborted,
-            .MFILE => return error.ProcessFdQuotaExceeded,
-            .NFILE => return error.SystemFdQuotaExceeded,
-            .NOBUFS, .NOMEM => return error.SystemResources,
-            .INVAL => return error.SocketNotListening,
-            .PROTO => return error.ProtocolFailure,
-            .PERM => return error.BlockedByFirewall,
-            else => |err| return unexpected(err),
-        }
-    }
-}
-
-/// Errors from `connect` and the `connectUnix*` helpers.
-pub const ConnectError = error{
-    AccessDenied,
-    AddressInUse,
-    ConnectionRefused,
-    ConnectionResetByPeer,
-    FileNotFound,
-    WouldBlock,
-    ConnectionTimedOut,
-    NotDir,
-    SystemResources,
-} || UnexpectedError;
-
-fn connectErr(err: posix.E) ConnectError {
-    return switch (err) {
-        .ACCES, .PERM => error.AccessDenied,
-        .ADDRINUSE => error.AddressInUse,
-        .CONNREFUSED => error.ConnectionRefused,
-        .CONNRESET => error.ConnectionResetByPeer,
-        .NOENT => error.FileNotFound,
-        .AGAIN, .INPROGRESS => error.WouldBlock,
-        .TIMEDOUT => error.ConnectionTimedOut,
-        .NOTDIR => error.NotDir,
-        .NOMEM, .NOBUFS => error.SystemResources,
-        else => unexpected(err),
-    };
-}
-
-/// `connect(2)` `fd` to the UNIX socket `address`, retrying `EINTR`.
-pub fn connect(fd: fd_t, address: *const UnixAddress) ConnectError!void {
-    while (true) {
-        switch (posix.errno(c.connect(fd, address.any(), address.len))) {
-            .SUCCESS => return,
-            .INTR => continue,
-            else => |err| return connectErr(err),
-        }
-    }
-}
-
-/// Create a close-on-exec socket and connect it to the UNIX socket at `path`.
-pub fn connectUnix(path: []const u8) (SocketError || ConnectError || error{NameTooLong})!fd_t {
-    const address = try UnixAddress.init(path);
-    const fd = try unixStreamSocket();
-    errdefer close(fd);
-    try connect(fd, &address);
-    tuneUnixSocketBuffers(fd);
-    return fd;
-}
-
-/// A connected pair of `AF_UNIX` stream sockets. Both ends are inherited
-/// across exec.
-pub fn socketPair() (SocketError)![2]fd_t {
-    var fds: [2]fd_t = undefined;
-    switch (posix.errno(c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &fds))) {
-        .SUCCESS => return fds,
-        .MFILE => return error.ProcessFdQuotaExceeded,
-        .NFILE => return error.SystemFdQuotaExceeded,
-        .NOBUFS, .NOMEM => return error.SystemResources,
-        else => |err| return unexpected(err),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Filesystem metadata that `std.Io.File.Stat` does not carry (owner, device).
-
-/// The file metadata zmux checks: device, inode, mode and owner.
-pub const Stat = struct {
-    dev: u64,
-    ino: u64,
-    mode: u32,
-    uid: uid_t,
-
-    pub fn kind(self: Stat) u32 {
-        return self.mode & posix.S.IFMT;
-    }
-
-    pub fn isDir(self: Stat) bool {
-        return self.kind() == posix.S.IFDIR;
-    }
-
-    pub fn isSocket(self: Stat) bool {
-        return self.kind() == posix.S.IFSOCK;
-    }
-
-    /// Permission bits including setuid/setgid/sticky.
-    pub fn permissions(self: Stat) u32 {
-        return self.mode & 0o7777;
-    }
-
-    pub fn sameFile(self: Stat, other: Stat) bool {
-        return self.dev == other.dev and self.ino == other.ino;
-    }
-};
-
-/// Errors from `statAt` and `fstat`.
-pub const StatError = error{
-    AccessDenied,
-    FileNotFound,
-    NameTooLong,
-    NotDir,
-    SymLinkLoop,
-    SystemResources,
-    StatFieldsUnavailable,
-} || UnexpectedError;
-
-/// `AT_FDCWD`: resolve relative paths against the current directory.
-pub const cwd_fd: fd_t = c.AT.FDCWD;
-
-/// `fstatat(2)`. `follow_symlinks = false` maps to `AT_SYMLINK_NOFOLLOW`.
-pub fn statAt(dir_fd: fd_t, path: []const u8, follow_symlinks: bool) (StatError)!Stat {
-    var path_buf: [posix.PATH_MAX]u8 = undefined;
-    const path_z = try toPathZ(&path_buf, path);
-    return statAtZ(dir_fd, path_z, if (follow_symlinks) 0 else c.AT.SYMLINK_NOFOLLOW);
-}
-
-/// `fstat(2)`.
-pub fn fstat(fd: fd_t) StatError!Stat {
-    if (builtin.os.tag == .linux) return statAtZ(fd, "", std.os.linux.AT.EMPTY_PATH);
-    var st: c.Stat = undefined;
-    switch (posix.errno(c.fstat(fd, &st))) {
-        .SUCCESS => return fromCStat(&st),
-        .ACCES => return error.AccessDenied,
-        .NOMEM => return error.SystemResources,
-        else => |err| return unexpected(err),
-    }
-}
-
-/// Set once `statx(2)` reports `ENOSYS`/`EPERM` (old kernels, seccomp
-/// sandboxes); later calls go straight to `newfstatat(2)`.
-var statx_unavailable: std.atomic.Value(bool) = .init(false);
+// Test seams read by the submodules
 
 /// Test seam: route every stat through the `newfstatat` fallback.
 pub var force_stat_fallback: bool = false;
 
-/// The kernel's `struct stat` for `newfstatat(2)`; `std.c.Stat` is not
-/// available on Linux in this Zig version.
-const KernelStat = switch (builtin.cpu.arch) {
-    .x86_64 => extern struct {
-        dev: u64,
-        ino: u64,
-        nlink: u64,
-        mode: u32,
-        uid: u32,
-        gid: u32,
-        __pad0: u32,
-        rdev: u64,
-        size: i64,
-        blksize: i64,
-        blocks: i64,
-        times: [6]i64,
-        __unused: [3]i64,
-    },
-    .aarch64, .riscv64 => extern struct {
-        dev: u64,
-        ino: u64,
-        mode: u32,
-        nlink: u32,
-        uid: u32,
-        gid: u32,
-        rdev: u64,
-        __pad1: u64,
-        size: i64,
-        blksize: i32,
-        __pad2: i32,
-        blocks: i64,
-        times: [6]i64,
-        __unused: [2]u32,
-    },
-    else => void,
-};
-
-const have_stat_fallback = builtin.os.tag == .linux and KernelStat != void and
-    @hasField(std.os.linux.SYS, "newfstatat");
-
-fn statErr(err: posix.E) StatError {
-    return switch (err) {
-        .ACCES => error.AccessDenied,
-        .NOENT => error.FileNotFound,
-        .NAMETOOLONG => error.NameTooLong,
-        .NOTDIR => error.NotDir,
-        .LOOP => error.SymLinkLoop,
-        .NOMEM => error.SystemResources,
-        else => unexpected(err),
-    };
-}
-
-fn statAtFallback(dir_fd: fd_t, path: [*:0]const u8, flags: u32) StatError!Stat {
-    if (!have_stat_fallback) return error.StatFieldsUnavailable;
-    const linux = std.os.linux;
-    var st: KernelStat = undefined;
-    const rc = linux.syscall4(
-        .newfstatat,
-        @as(usize, @bitCast(@as(isize, dir_fd))),
-        @intFromPtr(path),
-        @intFromPtr(&st),
-        flags,
-    );
-    switch (linux.errno(rc)) {
-        .SUCCESS => {},
-        else => |err| return statErr(err),
-    }
-    // Decode the kernel's `new_encode_dev` layout into the same
-    // (major << 32) | minor form the statx path produces.
-    const major: u64 = (st.dev >> 8) & 0xfff;
-    const minor: u64 = (st.dev & 0xff) | ((st.dev >> 12) & 0xfff00);
-    assert(major <= 0xfff);
-    assert(minor <= 0xfffff);
-    return .{
-        .dev = (major << 32) | minor,
-        .ino = st.ino,
-        .mode = st.mode,
-        .uid = st.uid,
-    };
-}
-
-fn statAtZ(dir_fd: fd_t, path: [*:0]const u8, flags: u32) StatError!Stat {
-    if (builtin.os.tag == .linux) {
-        const linux = std.os.linux;
-        if (force_stat_fallback or statx_unavailable.load(.monotonic)) {
-            return statAtFallback(dir_fd, path, flags);
-        }
-        var stx = std.mem.zeroes(linux.Statx);
-        const mask: linux.STATX = .{ .TYPE = true, .MODE = true, .UID = true, .INO = true };
-        const rc = linux.statx(dir_fd, path, flags, mask, &stx);
-        switch (linux.errno(rc)) {
-            .SUCCESS => {
-                if (!stx.mask.TYPE or !stx.mask.MODE or !stx.mask.UID or !stx.mask.INO) {
-                    return error.StatFieldsUnavailable;
-                }
-                return .{
-                    .dev = (@as(u64, stx.dev_major) << 32) | stx.dev_minor,
-                    .ino = stx.ino,
-                    .mode = stx.mode,
-                    .uid = stx.uid,
-                };
-            },
-            .NOSYS, .PERM => {
-                if (!have_stat_fallback) return error.StatFieldsUnavailable;
-                statx_unavailable.store(true, .monotonic);
-                return statAtFallback(dir_fd, path, flags);
-            },
-            else => |err| return statErr(err),
-        }
-    }
-    var st: c.Stat = undefined;
-    switch (posix.errno(c.fstatat(dir_fd, path, &st, flags))) {
-        .SUCCESS => return fromCStat(&st),
-        .ACCES => return error.AccessDenied,
-        .NOENT => return error.FileNotFound,
-        .NAMETOOLONG => return error.NameTooLong,
-        .NOTDIR => return error.NotDir,
-        .LOOP => return error.SymLinkLoop,
-        .NOMEM => return error.SystemResources,
-        else => |err| return unexpected(err),
-    }
-}
-
-fn fromCStat(st: *const c.Stat) Stat {
-    return .{
-        .dev = @bitCast(@as(i64, st.dev)),
-        .ino = @intCast(st.ino),
-        .mode = @intCast(st.mode),
-        .uid = st.uid,
-    };
-}
-
-fn toPathZ(buf: *[posix.PATH_MAX]u8, path: []const u8) error{NameTooLong}![*:0]const u8 {
-    if (path.len >= buf.len) return error.NameTooLong;
-    @memcpy(buf[0..path.len], path);
-    buf[path.len] = 0;
-    assert(path.len < buf.len);
-    assert(buf[path.len] == 0);
-    return buf[0..path.len :0].ptr;
-}
-
-// ---------------------------------------------------------------------------
-// Filesystem mutation on raw paths and directory descriptors. The socket
-// binding protocol needs fd-relative operations (`fchmodat`, `unlinkat`) and
-// `fchmod` on a socket, none of which `std.Io.Dir` exposes.
-
-/// Errors from `fchmod` and `fchmodat`.
-pub const ChmodError = error{
-    AccessDenied,
-    FileNotFound,
-    NotDir,
-    ReadOnlyFileSystem,
-    NameTooLong,
-    SymLinkLoop,
-    /// Darwin rejects `fchmod` on sockets.
-    OperationNotSupported,
-} || UnexpectedError;
-
-fn chmodErr(err: posix.E) ChmodError {
-    return switch (err) {
-        .ACCES, .PERM => error.AccessDenied,
-        .NOENT => error.FileNotFound,
-        .NOTDIR => error.NotDir,
-        .ROFS => error.ReadOnlyFileSystem,
-        .NAMETOOLONG => error.NameTooLong,
-        .LOOP => error.SymLinkLoop,
-        .INVAL, .OPNOTSUPP => error.OperationNotSupported,
-        else => unexpected(err),
-    };
-}
-
-/// `fchmod(2)`, retrying `EINTR`.
-pub fn fchmod(fd: fd_t, mode: mode_t) ChmodError!void {
-    while (true) switch (posix.errno(c.fchmod(fd, mode))) {
-        .SUCCESS => return,
-        .INTR => continue,
-        else => |err| return chmodErr(err),
-    };
-}
-
-/// `fchmodat(2)` relative to `dir_fd`, following symlinks; retries `EINTR`.
-pub fn fchmodat(dir_fd: fd_t, path: []const u8, mode: mode_t) ChmodError!void {
-    var path_buf: [posix.PATH_MAX]u8 = undefined;
-    const path_z = try toPathZ(&path_buf, path);
-    while (true) switch (posix.errno(c.fchmodat(dir_fd, path_z, mode, 0))) {
-        .SUCCESS => return,
-        .INTR => continue,
-        else => |err| return chmodErr(err),
-    };
-}
-
-/// Errors from `mkdir`.
-pub const MkdirError = error{
-    AccessDenied,
-    PathAlreadyExists,
-    FileNotFound,
-    NotDir,
-    NoSpaceLeft,
-    ReadOnlyFileSystem,
-    NameTooLong,
-    SymLinkLoop,
-} || UnexpectedError;
-
-/// `mkdir(2)`. Unlike `std.Io.Dir.createDir`, this fails with
-/// `PathAlreadyExists` for any existing name, which the socket staging
-/// protocol depends on.
-pub fn mkdir(path: []const u8, mode: mode_t) MkdirError!void {
-    var path_buf: [posix.PATH_MAX]u8 = undefined;
-    const path_z = try toPathZ(&path_buf, path);
-    switch (posix.errno(c.mkdir(path_z, mode))) {
-        .SUCCESS => {},
-        .ACCES, .PERM => return error.AccessDenied,
-        .EXIST => return error.PathAlreadyExists,
-        .NOENT => return error.FileNotFound,
-        .NOTDIR => return error.NotDir,
-        .NOSPC => return error.NoSpaceLeft,
-        .ROFS => return error.ReadOnlyFileSystem,
-        .NAMETOOLONG => return error.NameTooLong,
-        .LOOP => return error.SymLinkLoop,
-        else => |err| return unexpected(err),
-    }
-}
-
-/// `rmdir(2)`. `EEXIST` is reported as `DirNotEmpty`.
-pub fn rmdir(path: []const u8) (error{ NameTooLong, DirNotEmpty, FileNotFound, AccessDenied } || UnexpectedError)!void {
-    var path_buf: [posix.PATH_MAX]u8 = undefined;
-    const path_z = try toPathZ(&path_buf, path);
-    switch (posix.errno(c.rmdir(path_z))) {
-        .SUCCESS => {},
-        .NOTEMPTY, .EXIST => return error.DirNotEmpty,
-        .NOENT => return error.FileNotFound,
-        .ACCES, .PERM => return error.AccessDenied,
-        else => |err| return unexpected(err),
-    }
-}
-
-/// `unlinkat(2)` of a non-directory `path` relative to `dir_fd`.
-pub fn unlinkAt(
-    dir_fd: fd_t,
-    path: []const u8,
-) (error{ NameTooLong, FileNotFound, AccessDenied } || UnexpectedError)!void {
-    var path_buf: [posix.PATH_MAX]u8 = undefined;
-    const path_z = try toPathZ(&path_buf, path);
-    switch (posix.errno(c.unlinkat(dir_fd, path_z, 0))) {
-        .SUCCESS => {},
-        .NOENT => return error.FileNotFound,
-        .ACCES, .PERM => return error.AccessDenied,
-        else => |err| return unexpected(err),
-    }
-}
-
-/// `rename(2)`: atomically replace `new_path` with `old_path`.
-pub fn rename(
-    old_path: []const u8,
-    new_path: []const u8,
-) (error{ NameTooLong, FileNotFound, AccessDenied, NotDir, IsDir } || UnexpectedError)!void {
-    var old_buf: [posix.PATH_MAX]u8 = undefined;
-    var new_buf: [posix.PATH_MAX]u8 = undefined;
-    const old_z = try toPathZ(&old_buf, old_path);
-    const new_z = try toPathZ(&new_buf, new_path);
-    switch (posix.errno(c.rename(old_z, new_z))) {
-        .SUCCESS => {},
-        .NOENT => return error.FileNotFound,
-        .ACCES, .PERM => return error.AccessDenied,
-        .NOTDIR => return error.NotDir,
-        .ISDIR => return error.IsDir,
-        else => |err| return unexpected(err),
-    }
-}
-
-/// Errors from `open`, `openZ` and the open helpers.
-pub const OpenError = error{
-    AccessDenied,
-    FileNotFound,
-    NotDir,
-    SymLinkLoop,
-    NameTooLong,
-    ProcessFdQuotaExceeded,
-    SystemFdQuotaExceeded,
-} || UnexpectedError;
-
-/// Open `path` with raw `O_*` flags. Used for the staging-directory descriptor
-/// (`O_DIRECTORY|O_NOFOLLOW`) and for wiring `/dev/null` and log files into a
-/// forked child, where `std.Io` cannot run.
-pub fn open(path: []const u8, flags: c.O, mode: mode_t) OpenError!fd_t {
-    var path_buf: [posix.PATH_MAX]u8 = undefined;
-    const path_z = try toPathZ(&path_buf, path);
-    return openZ(path_z, flags, mode);
-}
-
-/// Async-signal-safe `open(2)` on a NUL-terminated path, safe between `fork`
-/// and `exec`.
-pub fn openZ(path: [*:0]const u8, flags: c.O, mode: mode_t) OpenError!fd_t {
-    while (true) {
-        const rc = c.open(path, flags, @as(c_uint, mode));
-        switch (posix.errno(rc)) {
-            .SUCCESS => {
-                const fd: fd_t = @intCast(rc);
-                assert(fd >= 0);
-                return fd;
-            },
-            .INTR => continue,
-            .ACCES, .PERM => return error.AccessDenied,
-            .NOENT => return error.FileNotFound,
-            .NOTDIR => return error.NotDir,
-            .LOOP => return error.SymLinkLoop,
-            .NAMETOOLONG => return error.NameTooLong,
-            .MFILE => return error.ProcessFdQuotaExceeded,
-            .NFILE => return error.SystemFdQuotaExceeded,
-            else => |err| return unexpected(err),
-        }
-    }
-}
-
-/// Open a directory read-only, close-on-exec, refusing a symlink in the final
-/// component. Uses `O_RDONLY` (never `O_PATH`) so `fchmod(2)` succeeds on the
-/// returned descriptor on Linux.
-pub fn openDirNoFollow(path: []const u8) OpenError!fd_t {
-    return open(path, .{
-        .ACCMODE = .RDONLY,
-        .DIRECTORY = true,
-        .NOFOLLOW = true,
-        .CLOEXEC = true,
-    }, 0);
-}
+/// Test seam: skip `close_range(2)` so the enumeration fallback of
+/// `closeFrom` runs on Linux too.
+pub var force_close_from_fallback: bool = false;
 
 // ---------------------------------------------------------------------------
 // Processes
@@ -979,11 +111,15 @@ pub const ForkError = error{ SystemResources, ProcessLimitReached } || Unexpecte
 /// close-on-exec.
 pub fn fork() ForkError!pid_t {
     const locked = is_darwin and fork_lock.lockExclusiveBounded(fork_lock_budget_ms);
+    assert(!locked or is_darwin);
     const rc = c.fork();
     // Runs in both parent and child; each owns its own copy of the lock.
     if (locked) fork_lock.unlockExclusive();
     switch (posix.errno(rc)) {
-        .SUCCESS => return @intCast(rc),
+        .SUCCESS => {
+            assert(rc >= 0);
+            return @intCast(rc);
+        },
         .AGAIN => return error.ProcessLimitReached,
         .NOMEM => return error.SystemResources,
         else => |err| return unexpected(err),
@@ -1065,421 +201,7 @@ pub fn currentEnviron() [*:null]const ?[*:0]const u8 {
 }
 
 // ---------------------------------------------------------------------------
-// Private directories, owned files, peer credentials, deadlines, and the
-// async-signal-safe child helpers (review round-1 contract §1.7).
-
-/// Errors from `ensurePrivateDir`.
-pub const PrivateDirError = error{
-    NotDirectory,
-    ForeignOwner,
-    InsecurePermissions,
-    SymlinkParent,
-    NameTooLong,
-    AccessDenied,
-    FileNotFound,
-    Unexpected,
-};
-
-const MkdirOutcome = union(enum) { created, exists, failed: posix.E };
-
-/// Best-effort `chmod(0700)` for a directory this call just created under a
-/// restrictive umask (e.g. `0777`, where `mkdir` yields mode `0000` and
-/// `open(O_RDONLY)` returns `EACCES`). Verifies `lstat` shows a directory
-/// owned by euid before touching permissions; `ensurePrivateDir` still
-/// validates ownership and final mode on the pinned `O_NOFOLLOW` fd.
-fn chmodCreatedDir(path_z: [*:0]const u8, path: []const u8, mode: mode_t) void {
-    const st = statAt(cwd_fd, path, false) catch return;
-    if (!st.isDir() or st.uid != geteuid() or st.permissions() == mode) return;
-    if (c.fchmodat(cwd_fd, path_z, mode, c.AT.SYMLINK_NOFOLLOW) == 0) return;
-    switch (posix.errno(@as(c_int, -1))) {
-        // Linux kernels/libcs reject AT_SYMLINK_NOFOLLOW on fchmodat.
-        .OPNOTSUPP, .INVAL, .NOSYS => _ = c.fchmodat(cwd_fd, path_z, mode, 0),
-        else => {},
-    }
-}
-
-/// `mkdir(path, 0700)`. When this call created the directory and its mode is
-/// missing owner rwx (e.g. under `umask 0777`), repair to `0700` via fd-pinned
-/// `fchmod` when openable, falling back to `chmodCreatedDir` only when
-/// `openDirNoFollow` fails with `AccessDenied`.
-fn mkdirPrivateZ(path_z: [*:0]const u8, path: []const u8, repair_mode: bool) MkdirOutcome {
-    assert(path.len > 0);
-    switch (posix.errno(c.mkdir(path_z, 0o700))) {
-        .SUCCESS => {
-            if (repair_mode) {
-                if (openDirNoFollow(path)) |fd| {
-                    defer close(fd);
-                    if (fstat(fd)) |st| {
-                        if (st.isDir() and st.uid == geteuid() and st.permissions() != 0o700) {
-                            fchmod(fd, 0o700) catch |err| {
-                                log.debug("private_dir_fchmod_failed", .{ .err = err });
-                            };
-                        }
-                    } else |_| {}
-                } else |err| switch (err) {
-                    error.AccessDenied => chmodCreatedDir(path_z, path, 0o700),
-                    else => {},
-                }
-            }
-            return .created;
-        },
-        .EXIST => return .exists,
-        else => |err| return .{ .failed = err },
-    }
-}
-
-fn privateDirErr(err: posix.E) PrivateDirError {
-    return switch (err) {
-        .ACCES, .PERM, .ROFS => error.AccessDenied,
-        .NOENT => error.FileNotFound,
-        .NOTDIR => error.NotDirectory,
-        .LOOP => error.SymlinkParent,
-        .NAMETOOLONG => error.NameTooLong,
-        else => error.Unexpected,
-    };
-}
-
-/// mkdir 0700 if missing (after creating missing ancestors 0700), then open
-/// `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC` and require owner == euid and
-/// `mode & 0o077 == 0`. Permissions are repaired with `fchmod` only on a
-/// directory this call created; an existing loose directory is rejected with
-/// `InsecurePermissions`. Works at umask 0777. Returns the pinned dir fd; the
-/// caller closes it.
-pub fn ensurePrivateDir(path: []const u8) PrivateDirError!fd_t {
-    var trimmed = path;
-    while (trimmed.len > 1 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
-    if (trimmed.len == 0) return error.FileNotFound;
-
-    var buf: [posix.PATH_MAX]u8 = undefined;
-    if (trimmed.len >= buf.len) return error.NameTooLong;
-    assert(trimmed.len > 0);
-    assert(trimmed.len < buf.len);
-    @memcpy(buf[0..trimmed.len], trimmed);
-    buf[trimmed.len] = 0;
-    const path_z: [*:0]const u8 = buf[0..trimmed.len :0].ptr;
-
-    var outcome = mkdirPrivateZ(path_z, trimmed, false);
-    if (outcome == .failed and outcome.failed == .NOENT) {
-        // Create missing ancestors front to back, like `mkdir -p`. Errors on
-        // ancestors are ignored: the final mkdir reports what matters.
-        var index: usize = 1;
-        while (index < trimmed.len) : (index += 1) {
-            if (buf[index] != '/') continue;
-            buf[index] = 0;
-            _ = mkdirPrivateZ(path_z, buf[0..index], true);
-            buf[index] = '/';
-        }
-        outcome = mkdirPrivateZ(path_z, trimmed, false);
-    }
-    switch (outcome) {
-        .failed => |err| return privateDirErr(err),
-        .created, .exists => {},
-    }
-
-    const fd = openDirNoFollow(trimmed) catch |err| switch (err) {
-        error.AccessDenied => if (outcome == .created) blk: {
-            // Under `umask 0777` the directory we just created has mode 0000
-            // and cannot be opened until owner rwx is restored.
-            chmodCreatedDir(path_z, trimmed, 0o700);
-            break :blk openDirNoFollow(trimmed) catch return error.AccessDenied;
-        } else return error.AccessDenied,
-        error.NameTooLong => return error.NameTooLong,
-        error.FileNotFound => return error.FileNotFound,
-        // Linux reports ENOTDIR, Darwin ELOOP, for a symlink opened with
-        // O_DIRECTORY|O_NOFOLLOW; lstat tells the two cases apart.
-        error.NotDir, error.SymLinkLoop => {
-            const st = statAt(cwd_fd, trimmed, false) catch return error.NotDirectory;
-            return if (st.kind() == posix.S.IFLNK) error.SymlinkParent else error.NotDirectory;
-        },
-        else => return error.Unexpected,
-    };
-    assert(fd >= 0);
-    errdefer close(fd);
-
-    var st = fstat(fd) catch return error.Unexpected;
-    if (!st.isDir()) return error.NotDirectory;
-    if (st.uid != geteuid()) return error.ForeignOwner;
-    if (outcome == .created and st.permissions() != 0o700) {
-        fchmod(fd, 0o700) catch return error.AccessDenied;
-        st = fstat(fd) catch return error.Unexpected;
-    }
-    if (st.permissions() & 0o077 != 0) return error.InsecurePermissions;
-    assert(st.isDir());
-    assert(st.uid == geteuid());
-    return fd;
-}
-
-/// `openat(dir_fd, name, flags|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC, mode)`, then
-/// require a regular file owned by euid and clear `O_NONBLOCK`. `O_NONBLOCK`
-/// keeps a planted FIFO from hanging the open; `O_NOFOLLOW` rejects a symlink
-/// with `SymLinkLoop`.
-pub fn openOwnedRegularAt(
-    dir_fd: fd_t,
-    name: []const u8,
-    flags: c.O,
-    mode: mode_t,
-) (OpenError || error{ NotRegularFile, ForeignOwner })!fd_t {
-    var path_buf: [posix.PATH_MAX]u8 = undefined;
-    const name_z = try toPathZ(&path_buf, name);
-    var open_flags = flags;
-    open_flags.NOFOLLOW = true;
-    open_flags.NONBLOCK = true;
-    open_flags.CLOEXEC = true;
-    // Darwin can fail a creating open with ENOENT when another thread or
-    // process creates the same name at the same moment (APFS race, especially
-    // with O_NOFOLLOW). The directory is held open, so a bounded retry opens
-    // or creates it while a genuinely removed directory still returns FileNotFound.
-    var create_races_left: u8 = if (flags.CREAT and !flags.EXCL) 16 else 0;
-    const fd: fd_t = while (true) {
-        const rc = c.openat(dir_fd, name_z, open_flags, @as(c_uint, mode));
-        switch (posix.errno(rc)) {
-            .SUCCESS => break @intCast(rc),
-            .INTR => continue,
-            .ACCES, .PERM => return error.AccessDenied,
-            .NOENT => {
-                if (create_races_left == 0) return error.FileNotFound;
-                create_races_left -= 1;
-                continue;
-            },
-            .NOTDIR => return error.NotDir,
-            // Darwin reports EMLINK-free ELOOP; FreeBSD-style EMLINK is
-            // treated the same way.
-            .LOOP, .MLINK => return error.SymLinkLoop,
-            .NAMETOOLONG => return error.NameTooLong,
-            .MFILE => return error.ProcessFdQuotaExceeded,
-            .NFILE => return error.SystemFdQuotaExceeded,
-            // A write-only open of a FIFO with no reader, a socket, or a
-            // directory opened for writing.
-            .NXIO, .ISDIR, .OPNOTSUPP => return error.NotRegularFile,
-            else => |err| return unexpected(err),
-        }
-    };
-    assert(fd >= 0);
-    errdefer close(fd);
-    const st = fstat(fd) catch return error.Unexpected;
-    if (st.kind() != posix.S.IFREG) return error.NotRegularFile;
-    if (st.uid != geteuid()) return error.ForeignOwner;
-    assert(st.kind() == posix.S.IFREG);
-    try clearNonBlocking(fd);
-    return fd;
-}
-
-extern "c" fn getpeereid(fd: fd_t, euid: *uid_t, egid: *c.gid_t) c_int;
-
-/// Effective uid of the peer on a connected `AF_UNIX` socket.
-pub fn peerEuid(fd: fd_t) error{ PeerCredentialsUnavailable, Unexpected }!uid_t {
-    if (builtin.os.tag == .linux) {
-        const Ucred = extern struct { pid: pid_t, uid: uid_t, gid: c.gid_t };
-        var cred: Ucred = undefined;
-        var len: c.socklen_t = @sizeOf(Ucred);
-        if (c.getsockopt(fd, c.SOL.SOCKET, c.SO.PEERCRED, &cred, &len) != 0) return error.PeerCredentialsUnavailable;
-        if (len != @sizeOf(Ucred)) return error.PeerCredentialsUnavailable;
-        return cred.uid;
-    }
-    if (is_darwin) {
-        var uid: uid_t = undefined;
-        var gid: c.gid_t = undefined;
-        if (getpeereid(fd, &uid, &gid) != 0) return error.PeerCredentialsUnavailable;
-        return uid;
-    }
-    return error.PeerCredentialsUnavailable;
-}
-
-/// Non-blocking connect + poll(POLLOUT) + SO_ERROR against the monotonic
-/// `deadline_ms` (see `monotonicMs`). A listener with a full backlog makes a
-/// non-blocking AF_UNIX connect fail with `EAGAIN` on Linux; that is retried
-/// until the deadline. The returned socket is blocking.
-pub fn connectUnixDeadline(
-    path: []const u8,
-    deadline_ms: i64,
-) (SocketError || ConnectError || error{ NameTooLong, Timeout })!fd_t {
-    const address = try UnixAddress.init(path);
-    if (monotonicMs() >= deadline_ms) return error.Timeout;
-    const fd = try unixStreamSocket();
-    errdefer close(fd);
-    try setNonBlocking(fd);
-
-    attempt: while (true) {
-        switch (posix.errno(c.connect(fd, address.any(), address.len))) {
-            .SUCCESS, .ISCONN => break :attempt,
-            // The connection continues asynchronously (EINTR included).
-            .INTR, .INPROGRESS, .ALREADY => {
-                while (true) {
-                    const remaining = deadline_ms - monotonicMs();
-                    if (remaining <= 0) return error.Timeout;
-                    var fds = [_]c.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
-                    const ready = c.poll(&fds, 1, @intCast(@min(remaining, std.math.maxInt(c_int))));
-                    if (ready > 0) break;
-                    if (ready < 0 and posix.errno(ready) != .INTR) return error.Unexpected;
-                }
-                var so_error: c_int = 0;
-                var len: c.socklen_t = @sizeOf(c_int);
-                if (c.getsockopt(fd, c.SOL.SOCKET, c.SO.ERROR, &so_error, &len) != 0) return error.Unexpected;
-                if (so_error != 0) return connectErr(@fromBackingInt(@intCast(so_error)));
-                break :attempt;
-            },
-            .AGAIN => {
-                const remaining = deadline_ms - monotonicMs();
-                if (remaining <= 0) return error.Timeout;
-                sleepMs(@min(remaining, 5));
-            },
-            else => |err| return connectErr(err),
-        }
-    }
-
-    try clearNonBlocking(fd);
-    assert(fd >= 0);
-    return fd;
-}
-
-/// `flock(LOCK_EX)` polled with `LOCK_NB` until the monotonic `deadline_ms`
-/// or until `stop` becomes true, so a contended lock never blocks shutdown.
-pub fn flockExclusiveDeadline(
-    fd: fd_t,
-    deadline_ms: i64,
-    stop: ?*const std.atomic.Value(bool),
-) error{ Timeout, Interrupted, Unexpected }!void {
-    while (true) {
-        if (stop) |flag| if (flag.load(.seq_cst)) return error.Interrupted;
-        switch (posix.errno(c.flock(fd, posix.LOCK.EX | posix.LOCK.NB))) {
-            .SUCCESS => return,
-            .INTR, .AGAIN => {},
-            else => return error.Unexpected,
-        }
-        const remaining = deadline_ms - monotonicMs();
-        if (remaining <= 0) return error.Timeout;
-        sleepMs(@min(remaining, 10));
-    }
-}
-
-/// Milliseconds on the monotonic (awake) clock.
-pub fn monotonicMs() i64 {
-    return std.Io.Clock.awake.now(std.Options.debug_io).toMilliseconds();
-}
-
-/// Test seam: skip `close_range(2)` so the enumeration fallback of
-/// `closeFrom` runs on Linux too.
-pub var force_close_from_fallback: bool = false;
-
-/// Upper bound of the last-resort descriptor scan of `closeFrom`.
-const close_from_scan_cap: fd_t = 65536;
-
-/// Async-signal-safe. Close every descriptor `>= low_fd`.
-///
-/// `close_range(2)` on Linux. Otherwise (Darwin, and Linux kernels without
-/// `close_range`) the open descriptors are enumerated from the kernel
-/// (`proc_pidinfo` on Darwin, `/proc/self/fd` on Linux), so a descriptor that
-/// was opened before `RLIMIT_NOFILE` was lowered is closed even though it
-/// lies above the current soft limit. Only when enumeration fails does this
-/// fall back to a numeric scan, bounded by the larger of the soft and hard
-/// limits and capped so an unlimited rlimit cannot stall the child.
-pub fn closeFrom(low_fd: fd_t) void {
-    assert(low_fd >= 0);
-    if (builtin.os.tag == .linux) {
-        if (!force_close_from_fallback) {
-            const rc = std.os.linux.close_range(low_fd, std.math.maxInt(fd_t), .{ .UNSHARE = false, .CLOEXEC = false });
-            if (std.os.linux.errno(rc) == .SUCCESS) return;
-        }
-        if (closeFromProcSelfFd(low_fd)) return;
-    } else if (is_darwin) {
-        if (closeFromDarwinFdList(low_fd)) return;
-    }
-    var limit: c.rlimit = undefined;
-    const max_fd: fd_t = if (c.getrlimit(.NOFILE, &limit) == 0)
-        @intCast(@min(@max(limit.cur, limit.max), close_from_scan_cap))
-    else
-        close_from_scan_cap;
-    var fd = low_fd;
-    while (fd < max_fd) : (fd += 1) _ = c.close(fd);
-}
-
-const darwin = struct {
-    const proc_pidlistfds: c_int = 1;
-    const ProcFdInfo = extern struct { proc_fd: i32, proc_fdtype: u32 };
-    extern "c" fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: ?*anyopaque, buffersize: c_int) c_int;
-};
-
-/// Async-signal-safe: `proc_pidinfo` is a bare system call and the list
-/// lives on the stack. Returns false when the kernel list is unavailable.
-fn closeFromDarwinFdList(low_fd: fd_t) bool {
-    if (!is_darwin) return false;
-    var entries: [1024]darwin.ProcFdInfo = undefined;
-    const pid = c.getpid();
-    // Each pass closes every listed descriptor at or above the floor, so a
-    // table larger than the buffer drains over several passes. The cap only
-    // guards against a kernel that keeps reporting descriptors that cannot
-    // be closed.
-    var pass: usize = 0;
-    while (pass < 4096) : (pass += 1) {
-        const bytes = darwin.proc_pidinfo(pid, darwin.proc_pidlistfds, 0, &entries, @sizeOf(@TypeOf(entries)));
-        if (bytes <= 0) return false;
-        const count = @as(usize, @intCast(bytes)) / @sizeOf(darwin.ProcFdInfo);
-        var closed: usize = 0;
-        for (entries[0..count]) |entry| {
-            if (entry.proc_fd < low_fd) continue;
-            if (c.close(entry.proc_fd) == 0) closed += 1;
-        }
-        // A short list is the whole table: nothing at or above the floor
-        // is left once this pass closed nothing.
-        if (closed == 0) return count < entries.len;
-    }
-    return false;
-}
-
-/// Async-signal-safe: raw `open`/`getdents64` with a stack buffer, no
-/// `opendir`. Returns false when `/proc/self/fd` cannot be read.
-fn closeFromProcSelfFd(low_fd: fd_t) bool {
-    if (builtin.os.tag != .linux) return false;
-    const linux = std.os.linux;
-    const dir_flags: c.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true };
-    const dir_fd = c.open("/proc/self/fd", dir_flags, @as(c.mode_t, 0));
-    if (dir_fd < 0) return false;
-    defer _ = c.close(dir_fd);
-
-    var buf: [4096]u8 align(@alignOf(linux.dirent64)) = undefined;
-    // Closing entries invalidates the directory position, so every pass
-    // restarts from the top until one closes nothing.
-    var pass: usize = 0;
-    while (pass < 4096) : (pass += 1) {
-        if (linux.errno(linux.lseek(dir_fd, 0, 0)) != .SUCCESS) return false;
-        var closed: usize = 0;
-        while (true) {
-            const rc = linux.getdents64(dir_fd, &buf, buf.len);
-            switch (linux.errno(rc)) {
-                .SUCCESS => {},
-                .INTR => continue,
-                else => return false,
-            }
-            if (rc == 0) break;
-            var offset: usize = 0;
-            while (offset < rc) {
-                const entry: *align(1) const linux.dirent64 = @ptrCast(&buf[offset]);
-                const name: [*:0]const u8 = @ptrCast(&buf[offset + @offsetOf(linux.dirent64, "name")]);
-                offset += entry.reclen;
-                const fd = parseFdName(name) orelse continue;
-                if (fd < low_fd or fd == dir_fd) continue;
-                if (c.close(fd) == 0) closed += 1;
-            }
-        }
-        if (closed == 0) return true;
-    }
-    return false;
-}
-
-/// Decimal descriptor number, or null for `.`, `..` and anything else.
-fn parseFdName(name: [*:0]const u8) ?fd_t {
-    var value: u32 = 0;
-    var index: usize = 0;
-    while (name[index] != 0) : (index += 1) {
-        const digit = name[index];
-        if (digit < '0' or digit > '9' or index >= 9) return null;
-        value = value * 10 + (digit - '0');
-    }
-    if (index == 0) return null;
-    assert(index <= 9);
-    assert(value <= 999_999_999);
-    return @intCast(value);
-}
+// Process groups and sessions
 
 /// Linux `pidfd_send_signal(2)`: signal the exact process `pid_fd` refers
 /// to. Unlike `kill(2)` it can never reach a process that reused the PID.
@@ -1487,6 +209,7 @@ fn parseFdName(name: [*:0]const u8) ?fd_t {
 /// descriptor. Counted in `kill_call_count`. Async-signal-safe.
 pub fn pidfdSendSignal(pid_fd: fd_t, sig: posix.SIG) bool {
     if (builtin.os.tag != .linux or pid_fd < 0) return false;
+    assert(pid_fd >= 0);
     _ = kill_call_count.fetchAdd(1, .seq_cst);
     const rc = std.os.linux.pidfd_send_signal(pid_fd, sig, null, 0);
     return std.os.linux.errno(rc) == .SUCCESS;
@@ -1496,182 +219,160 @@ pub fn pidfdSendSignal(pid_fd: fd_t, sig: posix.SIG) bool {
 /// Never delivers a signal and is not counted in `kill_call_count`.
 pub fn processGroupExists(pgid: pid_t) bool {
     if (pgid <= 1) return false;
+    assert(pgid > 1);
     return c.kill(-pgid, @fromBackingInt(@intCast(0))) == 0;
 }
 
 /// `getsid(2)`: the session id of `pid`, or null when it cannot be read.
 pub fn sessionOf(pid: pid_t) ?pid_t {
     const sid = libc.getsid(pid);
+    assert(sid >= -1);
     return if (sid < 0) null else sid;
 }
 
-/// Signals `resetChildSignals` restores to `SIG_DFL`.
-pub const child_reset_signals = [_]posix.SIG{ .HUP, .INT, .QUIT, .TERM, .PIPE, .CHLD, .TSTP, .TTIN, .TTOU, .WINCH };
+// ---------------------------------------------------------------------------
+// Re-exports
 
-/// Async-signal-safe. Restore default dispositions for job-control and
-/// termination signals and clear the signal mask, so a pane child does not
-/// inherit the daemon's ignored `SIGHUP`/`SIGPIPE` or a blocked mask.
-pub fn resetChildSignals() void {
-    const act: posix.Sigaction = .{
-        .handler = .{ .handler = posix.SIG.DFL },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
-    };
-    for (child_reset_signals) |sig| posix.sigaction(sig, &act, null);
-    const empty = posix.sigemptyset();
-    posix.sigprocmask(posix.SIG.SETMASK, &empty, null);
-}
+/// Async-signal-safe sleep that needs no `std.Io`.
+pub const sleepMs = fd_io.sleepMs;
+/// Milliseconds on the monotonic (awake) clock.
+pub const monotonicMs = fd_io.monotonicMs;
+/// Guards the Darwin-only windows where a descriptor exists without `FD_CLOEXEC` (`socket`,
+/// `accept`, `pipe`, `openpty` have no atomic close-on-exec form there).
+pub const ForkLock = fd_io.ForkLock;
+/// Close `fd`, ignoring errors.
+pub const close = fd_io.close;
+/// Errors from `write` and `send`.
+pub const WriteError = fd_io.WriteError;
+/// `write(2)`, retrying `EINTR`.
+pub const write = fd_io.write;
+/// Write every byte, retrying short writes.
+pub const writeAll = fd_io.writeAll;
+/// Send bytes on a connected socket with `MSG_NOSIGNAL` so a closed peer reports `error.BrokenPipe`
+/// instead of raising `SIGPIPE` in an embedding process that leaves `SIGPIPE` at its default
+/// disposition.
+pub const send = fd_io.send;
+/// Send every byte on a socket with `MSG_NOSIGNAL`, retrying short writes.
+pub const sendAll = fd_io.sendAll;
+/// `dup2(2)`: make `new_fd` refer to the same open file as `old_fd`.
+pub const dup2 = fd_io.dup2;
+/// Errors from `pipe` and `pipeCloexec`.
+pub const PipeError = fd_io.PipeError;
+/// Create a pipe.
+pub const pipe = fd_io.pipe;
+/// Create a pipe whose ends are both close-on-exec, with no window in which a concurrent `fork`
+/// could inherit them.
+pub const pipeCloexec = fd_io.pipeCloexec;
+/// Set `FD_CLOEXEC` on `fd`.
+pub const setCloseOnExec = fd_io.setCloseOnExec;
+/// Clear `FD_CLOEXEC` on `fd`. Async-signal-safe.
+pub const clearCloseOnExec = fd_io.clearCloseOnExec;
+/// Set `O_NONBLOCK` on `fd`.
+pub const setNonBlocking = fd_io.setNonBlocking;
+/// Clear `O_NONBLOCK` on `fd`.
+pub const clearNonBlocking = fd_io.clearNonBlocking;
+/// True when `fd` has `O_NONBLOCK`; false also when `fcntl` fails.
+pub const isNonBlocking = fd_io.isNonBlocking;
+/// True when `fd` has `FD_CLOEXEC`.
+pub const isCloseOnExec = fd_io.isCloseOnExec;
+/// True when `fd` refers to a terminal.
+pub const isatty = fd_io.isatty;
+/// Byte capacity of `sockaddr_un.sun_path`, excluding the NUL terminator.
+pub const max_unix_path_len = socket.max_unix_path_len;
+/// A `sockaddr_un` for a filesystem `AF_UNIX` socket path.
+pub const UnixAddress = socket.UnixAddress;
+/// Errors from creating a socket or socket pair.
+pub const SocketError = socket.SocketError;
+/// Create a close-on-exec AF_UNIX stream socket.
+pub const unixStreamSocket = socket.unixStreamSocket;
+/// Raise `SO_SNDBUF` and `SO_RCVBUF` on local UNIX stream sockets (best effort).
+pub const tuneUnixSocketBuffers = socket.tuneUnixSocketBuffers;
+/// Errors from `bind`.
+pub const BindError = socket.BindError;
+/// `bind(2)` `fd` to the UNIX socket `address`.
+pub const bind = socket.bind;
+/// Errors from `listen`.
+pub const ListenError = socket.ListenError;
+/// `listen(2)` on `fd` with at most `backlog` pending connections.
+pub const listen = socket.listen;
+/// Errors from `accept`.
+pub const AcceptError = socket.AcceptError;
+/// Accept one connection; the returned descriptor is close-on-exec.
+pub const accept = socket.accept;
+/// Errors from `connect` and the `connectUnix*` helpers.
+pub const ConnectError = socket.ConnectError;
+/// `connect(2)` `fd` to the UNIX socket `address`, retrying `EINTR`.
+pub const connect = socket.connect;
+/// Create a close-on-exec socket and connect it to the UNIX socket at `path`.
+pub const connectUnix = socket.connectUnix;
+/// A connected pair of `AF_UNIX` stream sockets.
+pub const socketPair = socket.socketPair;
+/// Effective uid of the peer on a connected `AF_UNIX` socket.
+pub const peerEuid = socket.peerEuid;
+/// Non-blocking connect + poll(POLLOUT).
+pub const connectUnixDeadline = socket.connectUnixDeadline;
+/// The file metadata zmux checks: device, inode, mode and owner.
+pub const Stat = fs.Stat;
+/// Errors from `statAt` and `fstat`.
+pub const StatError = fs.StatError;
+/// `AT_FDCWD`: resolve relative paths against the current directory.
+pub const cwd_fd = fs.cwd_fd;
+/// `fstatat(2)`.
+pub const statAt = fs.statAt;
+/// `fstat(2)`.
+pub const fstat = fs.fstat;
+/// Errors from `fchmod` and `fchmodat`.
+pub const ChmodError = fs.ChmodError;
+/// `fchmod(2)`, retrying `EINTR`.
+pub const fchmod = fs.fchmod;
+/// `fchmodat(2)` relative to `dir_fd`, following symlinks; retries `EINTR`.
+pub const fchmodat = fs.fchmodat;
+/// Errors from `mkdir`.
+pub const MkdirError = fs.MkdirError;
+/// `mkdir(2)`.
+pub const mkdir = fs.mkdir;
+/// `rmdir(2)`.
+pub const rmdir = fs.rmdir;
+/// `unlinkat(2)` of a non-directory `path` relative to `dir_fd`.
+pub const unlinkAt = fs.unlinkAt;
+/// `rename(2)`: atomically replace `new_path` with `old_path`.
+pub const rename = fs.rename;
+/// Errors from `open`, `openZ` and the open helpers.
+pub const OpenError = fs.OpenError;
+/// Open `path` with raw `O_*` flags.
+pub const open = fs.open;
+/// Async-signal-safe `open(2)` on a NUL-terminated path, safe between `fork` and `exec`.
+pub const openZ = fs.openZ;
+/// Open a directory read-only, close-on-exec, refusing a symlink in the final component.
+pub const openDirNoFollow = fs.openDirNoFollow;
+/// Errors from `ensurePrivateDir`.
+pub const PrivateDirError = private.PrivateDirError;
+/// mkdir 0700 if missing (after creating missing ancestors 0700), then open
+/// `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC` and require owner == euid and `mode & 0o077 == 0`.
+pub const ensurePrivateDir = private.ensurePrivateDir;
+/// `openat(dir_fd, name, flags|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC, mode)`, then require a regular file
+/// owned by euid and clear `O_NONBLOCK`.
+pub const openOwnedRegularAt = private.openOwnedRegularAt;
+/// `flock(LOCK_EX)` polled with `LOCK_NB` until the monotonic `deadline_ms` or until `stop` becomes
+/// true, so a contended lock never blocks shutdown.
+pub const flockExclusiveDeadline = private.flockExclusiveDeadline;
+/// Close every descriptor `>= low_fd`. Async-signal-safe.
+pub const closeFrom = child.closeFrom;
+/// Signals `resetChildSignals` restores to `SIG_DFL`.
+pub const child_reset_signals = child.child_reset_signals;
+/// Restore default signal dispositions and clear the signal mask. Async-signal-safe.
+pub const resetChildSignals = child.resetChildSignals;
 
 // ---------------------------------------------------------------------------
 // Tests
 
-const TestDir = struct {
-    buf: [128]u8 = undefined,
-    len: usize = 0,
-
-    var counter: std.atomic.Value(u32) = .init(0);
-
-    /// Create a fresh 0700 directory under /tmp owned by the test process.
-    fn create(tag: []const u8) !TestDir {
-        var dir: TestDir = .{};
-        const created = try std.fmt.bufPrint(&dir.buf, "/tmp/zmux-sys-{s}-{d}-{d}-{d}", .{
-            tag, getpid(), monotonicMs(), counter.fetchAdd(1, .seq_cst),
-        });
-        dir.len = created.len;
-        assert(dir.len <= dir.buf.len);
-        try mkdir(created, 0o700);
-        try fchmodat(cwd_fd, created, 0o700);
-        return dir;
-    }
-
-    fn path(self: *const TestDir) []const u8 {
-        return self.buf[0..self.len];
-    }
-
-    /// `<dir>/<name>` in `buf`. Test callers pass a buffer sized for the
-    /// fixed-length test directory plus their short names.
-    fn join(self: *const TestDir, buf: []u8, name: []const u8) []const u8 {
-        const base = self.path();
-        const len = base.len + 1 + name.len;
-        assert(len <= buf.len);
-        @memcpy(buf[0..base.len], base);
-        buf[base.len] = '/';
-        @memcpy(buf[base.len + 1 ..][0..name.len], name);
-        return buf[0..len];
-    }
-
-    fn remove(self: *const TestDir, names: []const []const u8) void {
-        var buf: [256]u8 = undefined;
-        for (names) |name| {
-            const child = self.join(&buf, name);
-            // Each child is either a file or a directory, so one of these two
-            // calls is expected to fail.
-            unlinkAt(cwd_fd, child) catch |err| log.debug("test_dir_unlink_failed", .{ .err = err });
-            rmdir(child) catch |err| log.debug("test_dir_rmdir_failed", .{ .err = err });
-        }
-        rmdir(self.path()) catch |err| log.debug("test_dir_rmdir_failed", .{ .err = err });
-    }
-};
-
-fn testSymlink(target: []const u8, link_path: []const u8) !void {
-    var target_buf: [posix.PATH_MAX]u8 = undefined;
-    var link_buf: [posix.PATH_MAX]u8 = undefined;
-    const target_z = try toPathZ(&target_buf, target);
-    const link_z = try toPathZ(&link_buf, link_path);
-    if (c.symlink(target_z, link_z) != 0) return error.SymlinkFailed;
-}
-
-extern "c" fn mkfifo(path: [*:0]const u8, mode: mode_t) c_int;
-
-test "unix address rejects paths longer than sun_path" {
-    const too_long: [max_unix_path_len + 1]u8 = @splat('x');
-    try std.testing.expectError(error.NameTooLong, UnixAddress.init(&too_long));
-    const at_limit: [max_unix_path_len]u8 = @splat('x');
-    _ = try UnixAddress.init(&at_limit);
-}
-
-test "stat reports directory kind, owner and permissions" {
-    // Assert against a directory this test created, not the cwd, which may be
-    // owned by another user in CI checkouts.
-    const dir = try TestDir.create("stat");
-    defer dir.remove(&.{});
-    const st = try statAt(cwd_fd, dir.path(), true);
-    try std.testing.expect(st.isDir());
-    try std.testing.expectEqual(geteuid(), st.uid);
-    try std.testing.expectEqual(@as(u32, 0o700), st.permissions());
-}
-
-test "stat fallback matches statx for file, dir, socket and symlink" {
-    if (!have_stat_fallback) return error.SkipZigTest;
-
-    const dir = try TestDir.create("statfb");
-    defer dir.remove(&.{ "file", "sub", "sock", "link" });
-    var buf: [256]u8 = undefined;
-    var buf2: [256]u8 = undefined;
-
-    const file_fd = try open(dir.join(&buf, "file"), .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true }, 0o600);
-    defer close(file_fd);
-    try mkdir(dir.join(&buf, "sub"), 0o700);
-    const sock = try unixStreamSocket();
-    defer close(sock);
-    const address = try UnixAddress.init(dir.join(&buf, "sock"));
-    try bind(sock, &address);
-    try testSymlink(dir.join(&buf, "file"), dir.join(&buf2, "link"));
-
-    defer force_stat_fallback = false;
-    for ([_][]const u8{ "file", "sub", "sock", "link" }) |name| {
-        const target = dir.join(&buf, name);
-        for ([_]bool{ true, false }) |follow| {
-            force_stat_fallback = false;
-            const via_statx = try statAt(cwd_fd, target, follow);
-            force_stat_fallback = true;
-            const via_fallback = try statAt(cwd_fd, target, follow);
-            try std.testing.expectEqual(via_statx, via_fallback);
-        }
-    }
-    // The symlink itself is reported only when not following.
-    force_stat_fallback = true;
-    const link_stat = try statAt(cwd_fd, dir.join(&buf, "link"), false);
-    try std.testing.expectEqual(@as(u32, posix.S.IFLNK), link_stat.kind());
-
-    // fstat goes through the same fallback (AT_EMPTY_PATH).
-    const fd_fallback = try fstat(file_fd);
-    force_stat_fallback = false;
-    try std.testing.expectEqual(try fstat(file_fd), fd_fallback);
-}
-
-test "unix stream sockets are close-on-exec" {
-    const fd = try unixStreamSocket();
-    defer close(fd);
-    try std.testing.expect(try isCloseOnExec(fd));
-}
-
-test "pipeCloexec marks both ends close-on-exec" {
-    const fds = try pipeCloexec();
-    defer close(fds[0]);
-    defer close(fds[1]);
-    try std.testing.expect(try isCloseOnExec(fds[0]));
-    try std.testing.expect(try isCloseOnExec(fds[1]));
-}
-
-test "pipe round-trips bytes and reports end of stream" {
-    const fds = try pipe();
-    defer close(fds[0]);
-    try writeAll(fds[1], "ping");
-    close(fds[1]);
-
-    var buffer: [8]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 4), try read(fds[0], &buffer));
-    try std.testing.expectEqualStrings("ping", buffer[0..4]);
-    try std.testing.expectEqual(@as(usize, 0), try read(fds[0], &buffer));
-}
-
-test "sendAll returns BrokenPipe without SIGPIPE on a closed socket" {
-    const sockets = try socketPair();
-    defer close(sockets[0]);
-    close(sockets[1]);
-
-    try std.testing.expectError(error.BrokenPipe, sendAll(sockets[0], "hello"));
+test {
+    std.testing.refAllDecls(@This());
+    _ = @import("sys/fd.zig");
+    _ = @import("sys/socket.zig");
+    _ = @import("sys/fs.zig");
+    _ = @import("sys/private.zig");
+    _ = @import("sys/child.zig");
 }
 
 test "execvpeZ reports a missing program without replacing the process" {
@@ -1681,457 +382,11 @@ test "execvpeZ reports a missing program without replacing the process" {
     try std.testing.expectEqual(error.FileNotFound, execvpeZ("/zmux/no/such/program", &argv, &envp));
 }
 
-test "dup2 onto the same descriptor clears close-on-exec" {
-    const fds = try pipeCloexec();
-    defer close(fds[0]);
-    defer close(fds[1]);
-    try std.testing.expect(try isCloseOnExec(fds[0]));
-    try dup2(fds[0], fds[0]);
-    try std.testing.expect(!(try isCloseOnExec(fds[0])));
-
-    // A distinct target is a plain dup2 and never inherits FD_CLOEXEC.
-    try dup2(fds[1], fds[0]);
-    try std.testing.expect(!(try isCloseOnExec(fds[0])));
-    try std.testing.expectError(error.Unexpected, dup2(-1, fds[0]));
-}
-
-test "clearCloseOnExec and setCloseOnExec round-trip" {
-    const fds = try pipe();
-    defer close(fds[0]);
-    defer close(fds[1]);
-    try setCloseOnExec(fds[0]);
-    try std.testing.expect(try isCloseOnExec(fds[0]));
-    try clearCloseOnExec(fds[0]);
-    try std.testing.expect(!(try isCloseOnExec(fds[0])));
-}
-
-test "ensurePrivateDir creates a missing path with ancestors at 0700" {
-    const dir = try TestDir.create("priv");
-    var buf: [256]u8 = undefined;
-    var buf_a: [256]u8 = undefined;
-    var buf_ab: [256]u8 = undefined;
-    const nested = dir.join(&buf, "a/b/c");
-    defer {
-        rmdir(nested) catch {};
-        rmdir(dir.join(&buf_ab, "a/b")) catch {};
-        dir.remove(&.{"a"});
-    }
-
-    const fd = try ensurePrivateDir(nested);
-    defer close(fd);
-    const pinned = try fstat(fd);
-    try std.testing.expect(pinned.isDir());
-    try std.testing.expectEqual(@as(u32, 0o700), pinned.permissions());
-    try std.testing.expectEqual(geteuid(), pinned.uid);
-    try std.testing.expect(try isCloseOnExec(fd));
-    try std.testing.expect(pinned.sameFile(try statAt(cwd_fd, nested, false)));
-    try std.testing.expectEqual(@as(u32, 0o700), (try statAt(cwd_fd, dir.join(&buf_a, "a"), false)).permissions());
-    try std.testing.expectEqual(@as(u32, 0o700), (try statAt(cwd_fd, dir.join(&buf_ab, "a/b"), false)).permissions());
-
-    // Idempotent on an existing private directory, with a trailing slash too.
-    var slash_buf: [256]u8 = undefined;
-    const with_slash = try std.fmt.bufPrint(&slash_buf, "{s}/", .{nested});
-    const again = try ensurePrivateDir(with_slash);
-    defer close(again);
-    try std.testing.expect(pinned.sameFile(try fstat(again)));
-}
-
-test "ensurePrivateDir succeeds under umask 0777" {
-    const dir = try TestDir.create("umask");
-    var buf: [256]u8 = undefined;
-    var buf_x: [256]u8 = undefined;
-    const nested = dir.join(&buf, "x/y");
-    defer {
-        rmdir(nested) catch {};
-        dir.remove(&.{"x"});
-    }
-
-    const previous = c.umask(0o777);
-    const result = ensurePrivateDir(nested);
-    _ = c.umask(previous);
-
-    const fd = try result;
-    defer close(fd);
-    try std.testing.expectEqual(@as(u32, 0o700), (try fstat(fd)).permissions());
-    try std.testing.expectEqual(@as(u32, 0o700), (try statAt(cwd_fd, dir.join(&buf_x, "x"), false)).permissions());
-}
-
-test "ensurePrivateDir rejects loose, symlinked, foreign and non-directory paths" {
-    const dir = try TestDir.create("reject");
-    defer dir.remove(&.{ "loose", "link", "target", "file" });
-    var buf: [256]u8 = undefined;
-    var buf2: [256]u8 = undefined;
-
-    // An existing directory we own with group/other bits is rejected, not
-    // silently repaired.
-    const loose = dir.join(&buf, "loose");
-    try mkdir(loose, 0o755);
-    try fchmodat(cwd_fd, loose, 0o755);
-    try std.testing.expectError(error.InsecurePermissions, ensurePrivateDir(loose));
-    try std.testing.expectEqual(@as(u32, 0o755), (try statAt(cwd_fd, loose, false)).permissions());
-
-    // A symlink to a perfectly private directory is still refused.
-    const target = dir.join(&buf, "target");
-    try mkdir(target, 0o700);
-    try fchmodat(cwd_fd, target, 0o700);
-    const link_path = dir.join(&buf2, "link");
-    try testSymlink(target, link_path);
-    try std.testing.expectError(error.SymlinkParent, ensurePrivateDir(link_path));
-
-    // A regular file is not a directory, as a final or middle component.
-    const file_path = dir.join(&buf, "file");
-    close(try open(file_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true }, 0o600));
-    try std.testing.expectError(error.NotDirectory, ensurePrivateDir(file_path));
-    try std.testing.expectError(error.NotDirectory, ensurePrivateDir(dir.join(&buf2, "file/child")));
-
-    try std.testing.expectError(error.FileNotFound, ensurePrivateDir(""));
-    const too_long: [posix.PATH_MAX + 8]u8 = @splat('p');
-    try std.testing.expectError(error.NameTooLong, ensurePrivateDir(&too_long));
-
-    // The filesystem root belongs to root.
-    if (geteuid() != 0) try std.testing.expectError(error.ForeignOwner, ensurePrivateDir("/"));
-}
-
-test "openOwnedRegularAt opens owned regular files in blocking mode" {
-    const dir = try TestDir.create("own");
-    defer dir.remove(&.{"file"});
-    const dir_fd = try openDirNoFollow(dir.path());
-    defer close(dir_fd);
-
-    const fd = try openOwnedRegularAt(dir_fd, "file", .{ .ACCMODE = .RDWR, .CREAT = true }, 0o600);
-    defer close(fd);
-    try std.testing.expect(!isNonBlocking(fd));
-    try std.testing.expect(try isCloseOnExec(fd));
-    try writeAll(fd, "x");
-    try std.testing.expectError(error.FileNotFound, openOwnedRegularAt(dir_fd, "missing", .{ .ACCMODE = .RDONLY }, 0));
-}
-
-test "openOwnedRegularAt creates under concurrent starters without spurious FileNotFound" {
-    // Regression: concurrent daemon starters racing O_CREAT on the lock file
-    // saw ENOENT on Darwin. Forked creators race on one name per round.
-    var path_buf: [128]u8 = undefined;
-    const dir_path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/zmx-ocreat-race-{d}", .{c.getpid()}, 0);
-    mkdir(dir_path, 0o700) catch {};
-    defer rmdir(dir_path) catch {};
-    const dir_fd = try openDirNoFollow(dir_path);
-    defer close(dir_fd);
-    for (0..1000) |_| {
-        var children: [4]pid_t = undefined;
-        for (&children) |*child| {
-            child.* = try fork();
-            if (child.* == 0) {
-                const fd = openOwnedRegularAt(dir_fd, "race.lock", .{ .ACCMODE = .RDWR, .CREAT = true }, 0o600) catch c._exit(1);
-                close(fd);
-                c._exit(0);
-            }
-        }
-        for (children) |child| {
-            var status: c_int = 0;
-            while (c.waitpid(child, &status, 0) < 0) {}
-            try std.testing.expectEqual(@as(c_int, 0), status);
-        }
-        try unlinkAt(dir_fd, "race.lock");
-    }
-}
-
-test "openOwnedRegularAt rejects symlinks, FIFOs and directories without hanging" {
-    const dir = try TestDir.create("ownrej");
-    defer dir.remove(&.{ "file", "link", "fifo", "sub" });
-    var buf: [256]u8 = undefined;
-    var buf2: [256]u8 = undefined;
-    const dir_fd = try openDirNoFollow(dir.path());
-    defer close(dir_fd);
-
-    close(try openOwnedRegularAt(dir_fd, "file", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o600));
-    try testSymlink(dir.join(&buf, "file"), dir.join(&buf2, "link"));
-    try std.testing.expectError(error.SymLinkLoop, openOwnedRegularAt(dir_fd, "link", .{ .ACCMODE = .RDONLY }, 0));
-    try std.testing.expectError(error.SymLinkLoop, openOwnedRegularAt(dir_fd, "link", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o600));
-
-    var fifo_buf: [posix.PATH_MAX]u8 = undefined;
-    const fifo_z = try toPathZ(&fifo_buf, dir.join(&buf, "fifo"));
-    try std.testing.expectEqual(@as(c_int, 0), mkfifo(fifo_z, 0o600));
-    // A blocking open of a reader-less FIFO would hang forever; both access
-    // modes must return promptly.
-    const started = monotonicMs();
-    try std.testing.expectError(error.NotRegularFile, openOwnedRegularAt(dir_fd, "fifo", .{ .ACCMODE = .RDONLY }, 0));
-    try std.testing.expectError(error.NotRegularFile, openOwnedRegularAt(dir_fd, "fifo", .{ .ACCMODE = .WRONLY }, 0));
-    try std.testing.expect(monotonicMs() - started < 1000);
-
-    try mkdir(dir.join(&buf, "sub"), 0o700);
-    try std.testing.expectError(error.NotRegularFile, openOwnedRegularAt(dir_fd, "sub", .{ .ACCMODE = .RDONLY }, 0));
-}
-
-test "peerEuid reports the euid of a socketpair peer" {
-    const sockets = try socketPair();
-    defer close(sockets[0]);
-    defer close(sockets[1]);
-    try std.testing.expectEqual(geteuid(), try peerEuid(sockets[0]));
-    try std.testing.expectEqual(geteuid(), try peerEuid(sockets[1]));
-
-    const fds = try pipe();
-    defer close(fds[0]);
-    defer close(fds[1]);
-    try std.testing.expectError(error.PeerCredentialsUnavailable, peerEuid(fds[0]));
-}
-
-test "connectUnixDeadline connects, reports missing sockets, and honours an expired deadline" {
-    const dir = try TestDir.create("conn");
-    defer dir.remove(&.{"sock"});
-    var buf: [256]u8 = undefined;
-    const path = dir.join(&buf, "sock");
-
-    try std.testing.expectError(error.FileNotFound, connectUnixDeadline(path, monotonicMs() + 500));
-
-    const listener = try unixStreamSocket();
-    defer close(listener);
-    const address = try UnixAddress.init(path);
-    try bind(listener, &address);
-    try listen(listener, 8);
-
-    const client = try connectUnixDeadline(path, monotonicMs() + 1000);
-    defer close(client);
-    try std.testing.expect(!isNonBlocking(client));
-    try std.testing.expect(try isCloseOnExec(client));
-    const accepted = try accept(listener);
-    defer close(accepted);
-    try sendAll(client, "hi");
-    var byte: [2]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 2), try read(accepted, &byte));
-
-    try std.testing.expectError(error.Timeout, connectUnixDeadline(path, monotonicMs() - 1));
-    const too_long: [max_unix_path_len + 1]u8 = @splat('x');
-    try std.testing.expectError(error.NameTooLong, connectUnixDeadline(&too_long, monotonicMs() + 1000));
-}
-
-test "connectUnixDeadline times out against a full backlog" {
-    // Linux queues backlog+1 connections and then makes a non-blocking
-    // connect report EAGAIN; Darwin refuses instead, so the timing assertion
-    // is Linux-only.
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-
-    const dir = try TestDir.create("backlog");
-    defer dir.remove(&.{"sock"});
-    var buf: [256]u8 = undefined;
-    const path = dir.join(&buf, "sock");
-
-    const listener = try unixStreamSocket();
-    defer close(listener);
-    const address = try UnixAddress.init(path);
-    try bind(listener, &address);
-    try listen(listener, 0);
-
-    var held: [8]fd_t = undefined;
-    var held_count: usize = 0;
-    defer for (held[0..held_count]) |fd| close(fd);
-
-    var timed_out = false;
-    while (held_count < held.len) {
-        const started = monotonicMs();
-        if (connectUnixDeadline(path, started + 150)) |fd| {
-            held[held_count] = fd;
-            held_count += 1;
-        } else |err| {
-            try std.testing.expectEqual(error.Timeout, err);
-            const elapsed = monotonicMs() - started;
-            try std.testing.expect(elapsed >= 150);
-            try std.testing.expect(elapsed <= 200);
-            timed_out = true;
-            break;
-        }
-    }
-    try std.testing.expect(timed_out);
-}
-
-const FlockReleaser = struct {
-    fd: fd_t,
-    delay_ms: i64,
-    stop: ?*std.atomic.Value(bool) = null,
-
-    fn run(self: *FlockReleaser) void {
-        sleepMs(self.delay_ms);
-        if (self.stop) |flag| {
-            flag.store(true, .seq_cst);
-        } else {
-            _ = c.flock(self.fd, posix.LOCK.UN);
-        }
-    }
-};
-
-test "flockExclusiveDeadline times out, is interruptible, and acquires after release" {
-    const dir = try TestDir.create("flock");
-    defer dir.remove(&.{"lock"});
-    var buf: [256]u8 = undefined;
-    const path = dir.join(&buf, "lock");
-
-    // flock locks belong to the open file description, so two opens contend
-    // even inside one process.
-    const holder = try open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o600);
-    defer close(holder);
-    const waiter = try open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
-    defer close(waiter);
-
-    try flockExclusiveDeadline(holder, monotonicMs() + 100, null);
-
-    const started = monotonicMs();
-    try std.testing.expectError(error.Timeout, flockExclusiveDeadline(waiter, started + 120, null));
-    const elapsed = monotonicMs() - started;
-    try std.testing.expect(elapsed >= 120 and elapsed <= 200);
-
-    // A stop flag raised from another thread interrupts the wait early.
-    var stop = std.atomic.Value(bool).init(false);
-    var stopper = FlockReleaser{ .fd = holder, .delay_ms = 30, .stop = &stop };
-    const stop_thread = try std.Thread.spawn(.{}, FlockReleaser.run, .{&stopper});
-    const stop_started = monotonicMs();
-    try std.testing.expectError(error.Interrupted, flockExclusiveDeadline(waiter, stop_started + 5000, &stop));
-    stop_thread.join();
-    try std.testing.expect(monotonicMs() - stop_started < 1000);
-
-    // Once the holder releases, the waiter acquires before its deadline.
-    stop.store(false, .seq_cst);
-    var releaser = FlockReleaser{ .fd = holder, .delay_ms = 30 };
-    const release_thread = try std.Thread.spawn(.{}, FlockReleaser.run, .{&releaser});
-    try flockExclusiveDeadline(waiter, monotonicMs() + 5000, &stop);
-    release_thread.join();
-    try std.testing.expectError(error.Timeout, flockExclusiveDeadline(holder, monotonicMs() + 30, null));
-    try std.testing.expectError(error.Unexpected, flockExclusiveDeadline(-1, monotonicMs() + 30, null));
-}
-
-test "monotonicMs never goes backwards and sleepMs waits" {
-    const before = monotonicMs();
-    sleepMs(20);
-    const after = monotonicMs();
-    try std.testing.expect(after - before >= 19);
-}
-
-test "fork lock excludes exclusive holders while shared holders exist" {
-    var lock: ForkLock = .{};
-    lock.lockShared();
-    lock.lockShared();
-    try std.testing.expect(!lock.lockExclusiveBounded(20));
-    lock.unlockShared();
-    lock.unlockShared();
-    try std.testing.expect(lock.lockExclusiveBounded(20));
-    try std.testing.expect(!lock.lockExclusiveBounded(5));
-    lock.unlockExclusive();
-    lock.lockShared();
-    lock.unlockShared();
-}
-
 test "kill wrapper counts calls and reports failures" {
     const before = kill_call_count.load(.seq_cst);
     // Signal 0 probes for existence without delivering anything.
     try std.testing.expect(kill(getpid(), @fromBackingInt(@intCast(0))));
     try std.testing.expectEqual(before + 1, kill_call_count.load(.seq_cst));
-}
-
-/// Fork a child that runs `body` and reports one status byte via `_exit`.
-fn forkAndCollect(comptime body: fn () u8) !u8 {
-    const pid = try fork();
-    if (pid == 0) c._exit(body());
-    var status: c_int = 0;
-    while (true) {
-        const rc = c.waitpid(pid, &status, 0);
-        if (rc == pid) break;
-        if (posix.errno(rc) != .INTR) return error.WaitFailed;
-    }
-    const raw: u32 = @bitCast(status);
-    if (!posix.W.IFEXITED(raw)) return error.ChildCrashed;
-    return posix.W.EXITSTATUS(raw);
-}
-
-fn closeFromChildBody() u8 {
-    // Fds 40 and 60 were opened by the parent; after closeFrom(41) only 40
-    // may survive.
-    closeFrom(41);
-    if (c.fcntl(40, c.F.GETFD) < 0) return 1;
-    if (c.fcntl(60, c.F.GETFD) >= 0) return 2;
-    if (c.fcntl(41, c.F.GETFD) >= 0) return 3;
-    closeFrom(3);
-    if (c.fcntl(40, c.F.GETFD) >= 0) return 4;
-    if (c.fcntl(2, c.F.GETFD) < 0) return 5;
-    return 0;
-}
-
-test "closeFrom closes every descriptor at or above the floor" {
-    const fds = try pipe();
-    defer close(fds[0]);
-    defer close(fds[1]);
-    try dup2(fds[0], 40);
-    defer close(40);
-    try dup2(fds[0], 41);
-    defer close(41);
-    try dup2(fds[1], 60);
-    defer close(60);
-
-    try std.testing.expectEqual(@as(u8, 0), try forkAndCollect(closeFromChildBody));
-    // The parent's descriptors are untouched.
-    try std.testing.expect(c.fcntl(60, c.F.GETFD) >= 0);
-}
-
-fn closeFromAboveLimitChildBody() u8 {
-    // Fd 200 was opened under the original limit. Lower the soft and hard
-    // limits beneath it: a scan bounded by RLIMIT_NOFILE would miss it.
-    const lowered: c.rlimit = .{ .cur = 64, .max = 64 };
-    if (c.setrlimit(.NOFILE, &lowered) != 0) return 10;
-    if (c.fcntl(200, c.F.GETFD) < 0) return 11;
-    closeFrom(3);
-    if (c.fcntl(200, c.F.GETFD) >= 0) return 1;
-    if (c.fcntl(40, c.F.GETFD) >= 0) return 2;
-    if (c.fcntl(2, c.F.GETFD) < 0) return 3;
-    return 0;
-}
-
-test "closeFrom closes descriptors above a lowered descriptor limit" {
-    const fds = try pipe();
-    defer close(fds[0]);
-    defer close(fds[1]);
-    try dup2(fds[0], 40);
-    defer close(40);
-    try dup2(fds[1], 200);
-    defer close(200);
-
-    try std.testing.expectEqual(@as(u8, 0), try forkAndCollect(closeFromAboveLimitChildBody));
-
-    // The enumeration path, which Linux otherwise reaches only on kernels
-    // without close_range(2).
-    force_close_from_fallback = true;
-    defer force_close_from_fallback = false;
-    try std.testing.expectEqual(@as(u8, 0), try forkAndCollect(closeFromAboveLimitChildBody));
-    try std.testing.expectEqual(@as(u8, 0), try forkAndCollect(closeFromChildBody));
-    try std.testing.expect(c.fcntl(200, c.F.GETFD) >= 0);
-}
-
-fn closeFromManyChildBody() u8 {
-    // More descriptors than one enumeration buffer holds.
-    var made: usize = 0;
-    while (made < 1500) : (made += 1) {
-        if (c.dup(0) < 0) break;
-    }
-    if (made < 1100) return 20;
-    closeFrom(3);
-    var fd: fd_t = 3;
-    while (fd < 2000) : (fd += 1) {
-        if (c.fcntl(fd, c.F.GETFD) >= 0) return 1;
-    }
-    return 0;
-}
-
-test "closeFrom drains a descriptor table larger than its enumeration buffer" {
-    var limit: c.rlimit = undefined;
-    if (c.getrlimit(.NOFILE, &limit) != 0 or limit.cur < 1600) return error.SkipZigTest;
-    force_close_from_fallback = true;
-    defer force_close_from_fallback = false;
-    try std.testing.expectEqual(@as(u8, 0), try forkAndCollect(closeFromManyChildBody));
-}
-
-test "parseFdName accepts only decimal descriptor numbers" {
-    try std.testing.expectEqual(@as(?fd_t, 0), parseFdName("0"));
-    try std.testing.expectEqual(@as(?fd_t, 1234), parseFdName("1234"));
-    try std.testing.expectEqual(@as(?fd_t, null), parseFdName("."));
-    try std.testing.expectEqual(@as(?fd_t, null), parseFdName(".."));
-    try std.testing.expectEqual(@as(?fd_t, null), parseFdName(""));
-    try std.testing.expectEqual(@as(?fd_t, null), parseFdName("12a"));
-    try std.testing.expectEqual(@as(?fd_t, null), parseFdName("12345678901"));
 }
 
 test "pidfdSendSignal signals exactly the process behind the descriptor" {
@@ -2172,43 +427,6 @@ test "processGroupExists and sessionOf describe the current process" {
     try std.testing.expect(!processGroupExists(0x7fff_fff0));
     try std.testing.expect(sessionOf(getpid()) != null);
     try std.testing.expectEqual(@as(?pid_t, null), sessionOf(0x7fff_fff0));
-}
-
-fn signalResetChildBody() u8 {
-    resetChildSignals();
-    for (child_reset_signals, 0..) |sig, index| {
-        var current: posix.Sigaction = undefined;
-        posix.sigaction(sig, null, &current);
-        if (current.handler.handler != posix.SIG.DFL) return @intCast(10 + index);
-    }
-    var mask: posix.sigset_t = undefined;
-    posix.sigprocmask(posix.SIG.SETMASK, null, &mask);
-    if (!std.mem.eql(u8, std.mem.asBytes(&mask), std.mem.asBytes(&posix.sigemptyset()))) return 1;
-    return 0;
-}
-
-test "resetChildSignals restores default dispositions and an empty mask" {
-    // Give the forked child something to undo: ignored HUP/PIPE and a blocked
-    // TERM, as a daemon would have.
-    const ignore: posix.Sigaction = .{
-        .handler = .{ .handler = posix.SIG.IGN },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
-    };
-    var old_hup: posix.Sigaction = undefined;
-    var old_pipe: posix.Sigaction = undefined;
-    posix.sigaction(.HUP, &ignore, &old_hup);
-    defer posix.sigaction(.HUP, &old_hup, null);
-    posix.sigaction(.PIPE, &ignore, &old_pipe);
-    defer posix.sigaction(.PIPE, &old_pipe, null);
-
-    var blocked = posix.sigemptyset();
-    posix.sigaddset(&blocked, .TERM);
-    var old_mask: posix.sigset_t = undefined;
-    posix.sigprocmask(posix.SIG.BLOCK, &blocked, &old_mask);
-    defer posix.sigprocmask(posix.SIG.SETMASK, &old_mask, null);
-
-    try std.testing.expectEqual(@as(u8, 0), try forkAndCollect(signalResetChildBody));
 }
 
 test "ioctl wrapper reports ENOTTY for a non-terminal" {

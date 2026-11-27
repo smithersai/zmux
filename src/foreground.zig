@@ -1,7 +1,13 @@
+//! Foreground process tracking for a pane's PTY: which process group owns
+//! the terminal, and the name and argv of its leader.
+
 const std = @import("std");
 const builtin = @import("builtin");
 
 const protocol = @import("protocol.zig");
+const argv_mod = @import("foreground/argv.zig");
+const darwin = @import("foreground/darwin.zig");
+const linux = @import("foreground/linux.zig");
 
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
@@ -12,28 +18,20 @@ pub const poll_interval_ms: i64 = 500;
 /// Bound on the serialized argv, measured after JSON escaping.
 pub const max_serialized_argv_bytes: usize = 64 * 1024;
 
-/// Name and argv of a foreground process. Owns `comm` and every `argv` entry;
-/// release them with `deinit`.
-pub const ProcessInfo = struct {
-    allocator: Allocator,
-    pid: posix.pid_t,
-    comm: []u8,
-    argv: [][]u8,
-    /// True when argv was cut: by the kernel buffer, the /proc read bound,
-    /// or `max_serialized_argv_bytes`.
-    argv_truncated: bool = false,
-    /// True when the OS lookup failed and `comm`/`argv` are the `pid-<n>`
-    /// fallback. Callers should not `Tracker.commit` such a result, so a later
-    /// poll retries the lookup.
-    degraded: bool = false,
-
-    pub fn deinit(self: *ProcessInfo) void {
-        self.allocator.free(self.comm);
-        for (self.argv) |arg| self.allocator.free(arg);
-        self.allocator.free(self.argv);
-        self.* = undefined;
-    }
-};
+/// Name and argv of a foreground process. See `argv.ProcessInfo`.
+pub const ProcessInfo = argv_mod.ProcessInfo;
+/// Owned argv parsed from a process-arguments buffer.
+pub const ParsedArgv = argv_mod.ParsedArgv;
+/// Parse a Darwin `KERN_PROCARGS2` buffer.
+pub const parseProcArgs = argv_mod.parseProcArgs;
+/// Parse a `KERN_PROCARGS2` buffer and return only the argv slice.
+pub const parseProcArgsBuffer = argv_mod.parseProcArgsBuffer;
+/// Free every argument in `argv` and the slice itself.
+pub const freeArgv = argv_mod.freeArgv;
+/// Trim a raw `/proc/<pid>/comm` read.
+pub const parseLinuxProcComm = linux.parseLinuxProcComm;
+/// Split a raw `/proc/<pid>/cmdline` read into owned argv strings.
+pub const parseLinuxProcCmdline = linux.parseLinuxProcCmdline;
 
 /// Tracks the last reported foreground process group of one PTY, so only
 /// changes are reported.
@@ -81,8 +79,8 @@ pub const Tracker = struct {
 /// `max_serialized_argv_bytes`.
 pub fn resolveProcessInfo(allocator: Allocator, io: std.Io, pid: posix.pid_t) Allocator.Error!ProcessInfo {
     var info = switch (builtin.os.tag) {
-        .macos, .ios, .tvos, .watchos, .visionos => try resolveDarwinProcessInfo(allocator, pid),
-        .linux => try resolveLinuxProcessInfo(allocator, io, pid),
+        .macos, .ios, .tvos, .watchos, .visionos => try darwin.resolveDarwinProcessInfo(allocator, pid),
+        .linux => try linux.resolveLinuxProcessInfo(allocator, io, pid),
         else => try resolveFallbackProcessInfo(allocator, pid),
     };
     errdefer info.deinit();
@@ -171,177 +169,6 @@ fn argvCut(argv: []const []const u8, max_bytes: usize) ?ArgvCut {
     return null;
 }
 
-fn resolveDarwinProcessInfo(allocator: Allocator, pid: posix.pid_t) Allocator.Error!ProcessInfo {
-    var path_buffer: [4 * std.posix.PATH_MAX]u8 = undefined;
-    const path = procPath(pid, &path_buffer);
-    var degraded = false;
-    const parsed: ParsedArgv = procArgsDarwin(allocator, pid, path) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => blk: {
-            degraded = true;
-            break :blk .{ .argv = try fallbackArgv(allocator, path) };
-        },
-    };
-    const argv = parsed.argv;
-    errdefer freeArgv(allocator, argv);
-
-    const comm_source = if (path.len > 0)
-        path
-    else if (argv.len > 0)
-        argv[0]
-    else
-        "";
-    const comm = if (comm_source.len > 0)
-        try allocator.dupe(u8, std.fs.path.basename(comm_source))
-    else
-        try std.fmt.allocPrint(allocator, "pid-{d}", .{pid});
-    errdefer allocator.free(comm);
-
-    return .{
-        .allocator = allocator,
-        .pid = pid,
-        .comm = comm,
-        .argv = argv,
-        .argv_truncated = parsed.truncated,
-        .degraded = degraded,
-    };
-}
-
-const linux_comm_max_bytes: usize = 4 * 1024;
-const linux_cmdline_max_bytes: usize = 256 * 1024;
-
-/// Resolves the process name and argv from /proc/<pid>/{comm,cmdline}.
-/// Unreadable or empty /proc entries (kernel threads, processes that exited
-/// between tcgetpgrp and this call, hidepid mounts) degrade to a
-/// `pid-<pid>` name and an empty argv. Only allocation failure propagates,
-/// so a foreground poll never fails because a process vanished. `degraded`
-/// is set when neither file yielded a name, which is the transient case a
-/// caller should retry instead of committing.
-fn resolveLinuxProcessInfo(allocator: Allocator, io: std.Io, pid: posix.pid_t) Allocator.Error!ProcessInfo {
-    var path_buffer: [linux_proc_path_max]u8 = undefined;
-
-    var argv_truncated = false;
-    const argv = argv: {
-        const path = linuxProcPath(&path_buffer, pid, "cmdline");
-        const raw = try readProcFileBounded(allocator, io, path, linux_cmdline_max_bytes) orelse
-            break :argv try allocator.alloc([]u8, 0);
-        defer allocator.free(raw.bytes);
-        argv_truncated = raw.truncated;
-        break :argv try parseLinuxProcCmdline(allocator, raw.bytes);
-    };
-    errdefer freeArgv(allocator, argv);
-
-    var degraded = false;
-    const comm = comm: {
-        const path = linuxProcPath(&path_buffer, pid, "comm");
-        if (try readProcFileBounded(allocator, io, path, linux_comm_max_bytes)) |raw| {
-            defer allocator.free(raw.bytes);
-            const name = parseLinuxProcComm(raw.bytes);
-            if (name.len > 0) break :comm try allocator.dupe(u8, name);
-        }
-        if (argv.len > 0) {
-            const base = std.fs.path.basename(argv[0]);
-            if (base.len > 0) break :comm try allocator.dupe(u8, base);
-        }
-        degraded = true;
-        break :comm try std.fmt.allocPrint(allocator, "pid-{d}", .{pid});
-    };
-
-    return .{
-        .allocator = allocator,
-        .pid = pid,
-        .comm = comm,
-        .argv = argv,
-        .argv_truncated = argv_truncated,
-        .degraded = degraded,
-    };
-}
-
-/// Longest `/proc/<pid>/<leaf>` path `linuxProcPath` builds: the widest
-/// `pid_t`, including its sign, plus the longest leaf.
-const linux_proc_path_max = "/proc/".len + std.fmt.count("{d}", .{std.math.minInt(posix.pid_t)}) + "/cmdline".len;
-
-/// Format `/proc/<pid>/<leaf>` into `buffer`. Cannot fail: `buffer` is sized
-/// for the widest `pid_t` and the longest leaf this module reads.
-fn linuxProcPath(buffer: *[linux_proc_path_max]u8, pid: posix.pid_t, comptime leaf: []const u8) []const u8 {
-    const prefix = "/proc/";
-    const tail = "/" ++ leaf;
-    comptime assert(tail.len <= "/cmdline".len);
-    @memcpy(buffer[0..prefix.len], prefix);
-    var pos: usize = prefix.len;
-    pos += std.fmt.printInt(buffer[pos..], pid, 10, .lower, .{});
-    @memcpy(buffer[pos..][0..tail.len], tail);
-    pos += tail.len;
-    assert(pos <= buffer.len);
-    return buffer[0..pos];
-}
-
-const ProcFile = struct { bytes: []u8, truncated: bool };
-
-/// Reads at most `max_bytes` from a /proc file. procfs reports a size of 0,
-/// so this reads until EOF instead of trusting stat. Content past
-/// `max_bytes` is dropped and reported through `truncated`. Returns null when
-/// the file cannot be opened or read; returns error.OutOfMemory only on
-/// allocation failure.
-fn readProcFileBounded(allocator: Allocator, io: std.Io, path: []const u8, max_bytes: usize) Allocator.Error!?ProcFile {
-    var file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
-    defer file.close(io);
-
-    var buffer = std.ArrayList(u8).empty;
-    errdefer buffer.deinit(allocator);
-
-    var chunk: [4096]u8 = undefined;
-    // Read one byte past the bound to learn whether anything was cut.
-    while (buffer.items.len <= max_bytes) {
-        const want = @min(chunk.len, max_bytes + 1 - buffer.items.len);
-        assert(want > 0);
-        const n = file.readStreaming(io, &.{chunk[0..want]}) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => {
-                buffer.deinit(allocator);
-                return null;
-            },
-        };
-        if (n == 0) break;
-        try buffer.appendSlice(allocator, chunk[0..n]);
-    }
-
-    const truncated = buffer.items.len > max_bytes;
-    if (truncated) buffer.shrinkRetainingCapacity(max_bytes);
-    assert(buffer.items.len <= max_bytes);
-    return .{ .bytes = try buffer.toOwnedSlice(allocator), .truncated = truncated };
-}
-
-/// Trims the trailing newline, carriage return, NUL, and blank padding from a
-/// raw /proc/<pid>/comm read. Returns an empty slice when nothing remains.
-pub fn parseLinuxProcComm(raw: []const u8) []const u8 {
-    return std.mem.trimEnd(u8, raw, "\n\r\x00 \t");
-}
-
-/// Splits a raw /proc/<pid>/cmdline read into owned argv strings. Every
-/// argument is NUL-terminated, so only the single final NUL is stripped:
-/// `a\0\0` is `["a", ""]`. A missing final NUL (a truncated read or a
-/// setproctitle rewrite) keeps the last argument.
-pub fn parseLinuxProcCmdline(allocator: Allocator, raw: []const u8) ![][]u8 {
-    if (raw.len == 0) return allocator.alloc([]u8, 0);
-    const trimmed = if (raw[raw.len - 1] == 0) raw[0 .. raw.len - 1] else raw;
-
-    const count = std.mem.count(u8, trimmed, "\x00") + 1;
-    const argv = try allocator.alloc([]u8, count);
-    var filled: usize = 0;
-    errdefer {
-        for (argv[0..filled]) |arg| allocator.free(arg);
-        allocator.free(argv);
-    }
-
-    var it = std.mem.splitScalar(u8, trimmed, 0);
-    while (it.next()) |arg| : (filled += 1) {
-        argv[filled] = try allocator.dupe(u8, arg);
-    }
-    std.debug.assert(filled == count);
-    return argv;
-}
-
 fn resolveFallbackProcessInfo(allocator: Allocator, pid: posix.pid_t) !ProcessInfo {
     const comm = try std.fmt.allocPrint(allocator, "pid-{d}", .{pid});
     errdefer allocator.free(comm);
@@ -355,192 +182,6 @@ fn resolveFallbackProcessInfo(allocator: Allocator, pid: posix.pid_t) !ProcessIn
     };
 }
 
-fn procPath(pid: posix.pid_t, buffer: []u8) []const u8 {
-    if (!builtin.os.tag.isDarwin()) return "";
-
-    const rc = proc_pidpath(@intCast(pid), buffer.ptr, @intCast(buffer.len));
-    if (rc <= 0) return "";
-
-    const used: usize = @intCast(rc);
-    const path_slice = buffer[0..used];
-    const nul_index = std.mem.indexOfScalar(u8, path_slice, 0) orelse path_slice.len;
-    return path_slice[0..nul_index];
-}
-
-var cached_darwin_argmax = std.atomic.Value(usize).init(0);
-
-fn darwinArgMax() !usize {
-    const cached = cached_darwin_argmax.load(.acquire);
-    if (cached != 0) return cached;
-
-    var argmax: c_int = 0;
-    var argmax_len: usize = @sizeOf(c_int);
-    try posix.sysctl(&.{ ctl_kern, kern_argmax }, &argmax, &argmax_len, null, 0);
-    if (argmax <= 0) return 0;
-    const size: usize = @intCast(argmax);
-    assert(size > 0);
-    cached_darwin_argmax.store(size, .release);
-    return size;
-}
-
-fn procArgsDarwin(allocator: Allocator, pid: posix.pid_t, fallback_path: []const u8) !ParsedArgv {
-    // Most processes fit well within 64 KiB of procargs2 (exec path + argv + env).
-    // Probing a stack buffer first avoids a 1 MiB (ARG_MAX) heap allocation on
-    // every foreground transition; if the buffer is too small (macOS returns
-    // EINVAL/ENOMEM), fall back to the full cached KERN_ARGMAX buffer.
-    var stack_buf: [64 * 1024]u8 = undefined;
-    var procargs_len: usize = stack_buf.len;
-    if (posix.sysctl(
-        &.{ ctl_kern, kern_procargs2, @as(c_int, @intCast(pid)) },
-        &stack_buf,
-        &procargs_len,
-        null,
-        0,
-    )) {
-        return try parseProcArgs(allocator, stack_buf[0..procargs_len], fallback_path);
-    } else |_| {}
-
-    const argmax = try darwinArgMax();
-    if (argmax == 0) return .{ .argv = try fallbackArgv(allocator, fallback_path) };
-
-    const buffer = try allocator.alloc(u8, argmax);
-    defer allocator.free(buffer);
-
-    procargs_len = buffer.len;
-    try posix.sysctl(
-        &.{ ctl_kern, kern_procargs2, @as(c_int, @intCast(pid)) },
-        buffer.ptr,
-        &procargs_len,
-        null,
-        0,
-    );
-
-    return try parseProcArgs(allocator, buffer[0..@min(procargs_len, buffer.len)], fallback_path);
-}
-
-/// Parse a `KERN_PROCARGS2` buffer and return only the argv slice.
-/// See `parseProcArgs` for the format and the truncation flag.
-pub fn parseProcArgsBuffer(allocator: Allocator, buffer: []const u8, fallback_path: []const u8) Allocator.Error![][]u8 {
-    return (try parseProcArgs(allocator, buffer, fallback_path)).argv;
-}
-
-/// Owned argv parsed from a process-arguments buffer.
-pub const ParsedArgv = struct {
-    argv: [][]u8,
-    /// The buffer ended before `argc` arguments were read.
-    truncated: bool = false,
-};
-
-/// Pointer size of every process Darwin still runs. XNU pads the saved exec
-/// path to this alignment (`exec_extract_strings`).
-const procargs_pointer_size: usize = 8;
-
-/// Parse a Darwin `KERN_PROCARGS2` buffer:
-///
-///     argc:u32 | exec_path NUL | NUL padding | argv[0] NUL ... argv[argc-1] NUL | envp ...
-///
-/// The environment follows argv with no separator and may hold secrets, so
-/// the parser must consume exactly `argc` strings starting at the true argv
-/// boundary. That boundary is established independently of the argv bytes:
-/// XNU pads `exec_path NUL` with NULs to a pointer-size multiple, so the
-/// length of the padding follows from the path length alone. NULs past the
-/// padding are empty leading arguments (`argv[0] == ""`) and each consumes
-/// one of the `argc` slots. Inside the argv area each NUL ends exactly one
-/// argument, so an empty argument (`git commit -m ""`) also consumes a slot.
-///
-/// When the NUL run is shorter than the padding the layout is not the one
-/// described here and the boundary is ambiguous: only `fallback_path` is
-/// reported, with `truncated = true`, and nothing after the path is read. A
-/// buffer that ends before `argc` arguments returns what was parsed with
-/// `truncated = true`.
-pub fn parseProcArgs(allocator: Allocator, buffer: []const u8, fallback_path: []const u8) Allocator.Error!ParsedArgv {
-    if (buffer.len < @sizeOf(u32)) return .{ .argv = try fallbackArgv(allocator, fallback_path) };
-
-    const argc_u32 = std.mem.readInt(u32, buffer[0..@sizeOf(u32)], builtin.cpu.arch.endian());
-    const argc = @as(usize, @intCast(argc_u32));
-    if (argc == 0) return .{ .argv = try fallbackArgv(allocator, fallback_path) };
-
-    var offset: usize = @sizeOf(u32);
-    while (offset < buffer.len and buffer[offset] != 0) : (offset += 1) {}
-    const path_len = offset - @sizeOf(u32);
-    const run_start = offset;
-    while (offset < buffer.len and buffer[offset] == 0) : (offset += 1) {}
-    const nul_run = offset - run_start;
-
-    // Terminator plus padding up to the pointer-size boundary.
-    const pad = (procargs_pointer_size - (path_len + 1) % procargs_pointer_size) % procargs_pointer_size;
-    const expected_run = 1 + pad;
-    assert(expected_run <= procargs_pointer_size);
-    // The buffer ends inside the NUL run (no argument is visible), or the
-    // run is too short for the documented layout: the argv boundary cannot
-    // be established, so report the executable alone.
-    if (offset >= buffer.len or nul_run < expected_run) {
-        return .{ .argv = try fallbackArgv(allocator, fallback_path), .truncated = true };
-    }
-    assert(nul_run >= expected_run);
-    assert(offset < buffer.len);
-
-    // The list is the single owner of every argument until `toOwnedSlice`.
-    var argv = std.ArrayList([]u8).empty;
-    errdefer {
-        for (argv.items) |arg| allocator.free(arg);
-        argv.deinit(allocator);
-    }
-    try argv.ensureTotalCapacity(allocator, @min(argc, 64));
-
-    var remaining = argc;
-    var leading_empty = @min(nul_run - expected_run, argc);
-    while (leading_empty > 0) : (leading_empty -= 1) {
-        const arg = try allocator.dupe(u8, "");
-        errdefer allocator.free(arg);
-        try argv.append(allocator, arg);
-        remaining -= 1;
-    }
-
-    var cut = false;
-    while (remaining > 0 and offset < buffer.len) {
-        const start = offset;
-        while (offset < buffer.len and buffer[offset] != 0) : (offset += 1) {}
-        // An argument cut off by the end of the buffer is still reported,
-        // but marks the result truncated below.
-        const terminated = offset < buffer.len;
-
-        const arg = try allocator.dupe(u8, buffer[start..offset]);
-        errdefer allocator.free(arg);
-        try argv.append(allocator, arg);
-        remaining -= 1;
-
-        if (!terminated) {
-            cut = true;
-            break;
-        }
-        offset += 1;
-    }
-    assert(argv.items.len + remaining == argc);
-    assert(offset <= buffer.len);
-    return .{ .argv = try argv.toOwnedSlice(allocator), .truncated = remaining > 0 or cut };
-}
-
-fn fallbackArgv(allocator: Allocator, fallback_path: []const u8) Allocator.Error![][]u8 {
-    if (fallback_path.len == 0) return allocator.alloc([]u8, 0);
-
-    var argv = try allocator.alloc([]u8, 1);
-    errdefer allocator.free(argv);
-    argv[0] = try allocator.dupe(u8, fallback_path);
-    return argv;
-}
-
-/// Free every argument in `argv` and the slice itself.
-pub fn freeArgv(allocator: Allocator, argv: [][]u8) void {
-    for (argv) |arg| allocator.free(arg);
-    allocator.free(argv);
-}
-
-const ctl_kern: c_int = 1;
-const kern_argmax: c_int = 8;
-const kern_procargs2: c_int = 49;
-
-extern "c" fn proc_pidpath(pid: c_int, buffer: [*]u8, buffersize: u32) c_int;
 extern "c" fn tcgetpgrp(fd: c_int) c_int;
 
 /// Errors from reading a PTY's foreground process group.
@@ -566,245 +207,6 @@ fn pgrpFromErrno(rc: c_int, e: posix.E) (ForegroundPgrpError || error{Interrupte
         .NOTTY => error.NotATerminal,
         else => error.Unexpected,
     };
-}
-
-test "parse proc args buffer extracts argv after exec path" {
-    // "/bin/zsh" is 8 bytes: its terminator plus 7 padding NULs reach the
-    // next pointer boundary.
-    const buffer = procArgsFixture(3, "/bin/zsh" ++ fixtureBytes(0, 8) ++ "git\x00status\x00--short\x00HOME=/\x00");
-    const parsed = try parseProcArgs(std.testing.allocator, &buffer, "/bin/zsh");
-    const argv = parsed.argv;
-    defer freeArgv(std.testing.allocator, argv);
-    try std.testing.expect(!parsed.truncated);
-
-    try std.testing.expectEqual(@as(usize, 3), argv.len);
-    try std.testing.expectEqualStrings("git", argv[0]);
-    try std.testing.expectEqualStrings("status", argv[1]);
-    try std.testing.expectEqualStrings("--short", argv[2]);
-}
-
-test "parseLinuxProcComm trims line endings, NULs, and blank padding" {
-    try std.testing.expectEqualStrings("bash", parseLinuxProcComm("bash\n"));
-    try std.testing.expectEqualStrings("bash", parseLinuxProcComm("bash\r\n"));
-    try std.testing.expectEqualStrings("bash", parseLinuxProcComm("bash\x00"));
-    try std.testing.expectEqualStrings("bash", parseLinuxProcComm("bash"));
-    try std.testing.expectEqualStrings("kworker/0:1", parseLinuxProcComm("kworker/0:1\n"));
-    try std.testing.expectEqualStrings("my prog", parseLinuxProcComm("my prog\n"));
-    try std.testing.expectEqualStrings("", parseLinuxProcComm(""));
-    try std.testing.expectEqualStrings("", parseLinuxProcComm("\n"));
-    try std.testing.expectEqualStrings("", parseLinuxProcComm("  \t \r\n"));
-}
-
-fn expectCmdline(raw: []const u8, expected: []const []const u8) !void {
-    const argv = try parseLinuxProcCmdline(std.testing.allocator, raw);
-    defer freeArgv(std.testing.allocator, argv);
-    try std.testing.expectEqual(expected.len, argv.len);
-    for (expected, argv) |want, got| try std.testing.expectEqualStrings(want, got);
-}
-
-test "parseLinuxProcCmdline splits NUL-delimited argv" {
-    try expectCmdline("git\x00status\x00--short\x00", &.{ "git", "status", "--short" });
-}
-
-test "parseLinuxProcCmdline keeps last arg without trailing NUL" {
-    try expectCmdline("vim\x00README.md", &.{ "vim", "README.md" });
-    try expectCmdline("top", &.{"top"});
-}
-
-test "parseLinuxProcCmdline strips only the final NUL and keeps trailing empty args" {
-    try expectCmdline("a\x00\x00", &.{ "a", "" });
-    try expectCmdline("nginx: worker\x00\x00\x00", &.{ "nginx: worker", "", "" });
-}
-
-test "parseLinuxProcCmdline preserves internal empty args" {
-    try expectCmdline("echo\x00\x00x\x00", &.{ "echo", "", "x" });
-}
-
-test "parseLinuxProcCmdline returns empty argv for empty input" {
-    try expectCmdline("", &.{});
-    try expectCmdline("\x00", &.{""});
-}
-
-fn parseCmdlineForAllocTest(allocator: Allocator, raw: []const u8) !void {
-    const argv = try parseLinuxProcCmdline(allocator, raw);
-    freeArgv(allocator, argv);
-}
-
-test "parseLinuxProcCmdline frees partial results on allocation failure" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        parseCmdlineForAllocTest,
-        .{"ssh\x00-p\x002222\x00\x00host\x00"},
-    );
-}
-
-test "resolveLinuxProcessInfo reads the current process" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-
-    var info = try resolveLinuxProcessInfo(std.testing.allocator, std.testing.io, std.c.getpid());
-    defer info.deinit();
-    try std.testing.expect(info.comm.len > 0);
-    try std.testing.expect(info.argv.len > 0);
-    try std.testing.expect(info.argv[0].len > 0);
-}
-
-test "resolveLinuxProcessInfo falls back for a missing pid" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-
-    // Above the kernel's PID_MAX_LIMIT (4194304), so /proc/<pid> never exists.
-    const missing: posix.pid_t = 0x7fff_fff0;
-    var info = try resolveLinuxProcessInfo(std.testing.allocator, std.testing.io, missing);
-    defer info.deinit();
-    try std.testing.expectEqualStrings("pid-2147483632", info.comm);
-    try std.testing.expectEqual(@as(usize, 0), info.argv.len);
-}
-
-fn fixtureBytes(comptime byte: u8, comptime count: usize) [count]u8 {
-    return @splat(byte);
-}
-
-fn procArgsFixture(comptime argc: u32, comptime body: []const u8) [4 + body.len]u8 {
-    var out: [4 + body.len]u8 = undefined;
-    std.mem.writeInt(u32, out[0..4], argc, builtin.cpu.arch.endian());
-    @memcpy(out[4..], body);
-    return out;
-}
-
-fn expectProcArgs(buffer: []const u8, expected: []const []const u8, truncated: bool) !void {
-    const parsed = try parseProcArgs(std.testing.allocator, buffer, "/bin/x");
-    defer freeArgv(std.testing.allocator, parsed.argv);
-    try std.testing.expectEqual(expected.len, parsed.argv.len);
-    for (expected, parsed.argv) |want, got| try std.testing.expectEqualStrings(want, got);
-    try std.testing.expectEqual(truncated, parsed.truncated);
-    for (parsed.argv) |arg| try std.testing.expect(std.mem.indexOf(u8, arg, "SECRET") == null);
-}
-
-// Fixtures use the exec path "/bin/x" (6 bytes): its terminator plus one
-// padding NUL reach the pointer boundary, so argv starts after two NULs.
-
-test "KERN_PROCARGS2 empty argv element never exposes envp" {
-    const buffer = procArgsFixture(3, "/bin/x\x00\x00x\x00\x00y\x00SECRET=1\x00");
-    try expectProcArgs(&buffer, &.{ "x", "", "y" }, false);
-}
-
-test "KERN_PROCARGS2 trailing and repeated empty arguments" {
-    const trailing = procArgsFixture(2, "/bin/x\x00\x00x\x00\x00SECRET=1\x00");
-    try expectProcArgs(&trailing, &.{ "x", "" }, false);
-
-    const repeated = procArgsFixture(4, "/bin/x\x00\x00git\x00\x00\x00z\x00SECRET=1\x00HOME=/\x00");
-    try expectProcArgs(&repeated, &.{ "git", "", "", "z" }, false);
-}
-
-test "KERN_PROCARGS2 empty argv[0] consumes a slot and never exposes envp" {
-    // One NUL beyond the padding: argv[0] is "".
-    const one = procArgsFixture(2, "/bin/x\x00\x00\x00arg\x00SECRET=1\x00HOME=/\x00");
-    try expectProcArgs(&one, &.{ "", "arg" }, false);
-
-    // Two empty leading arguments, then one real one.
-    const two = procArgsFixture(3, "/bin/x\x00\x00\x00\x00arg\x00SECRET=1\x00");
-    try expectProcArgs(&two, &.{ "", "", "arg" }, false);
-
-    // Every argument is empty: the first non-NUL byte is already envp.
-    const all = procArgsFixture(2, "/bin/x\x00\x00\x00\x00SECRET=1\x00SECRET=2\x00");
-    try expectProcArgs(&all, &.{ "", "" }, false);
-
-    // More NULs than argc slots cannot be arguments; nothing past them is read.
-    const excess = procArgsFixture(1, "/bin/x\x00\x00\x00\x00\x00SECRET=1\x00");
-    try expectProcArgs(&excess, &.{""}, false);
-
-    // Every exec path length, with an empty argv[0] and a real argv[1].
-    inline for (1..18) |path_len| {
-        const path = comptime "/" ++ fixtureBytes('p', path_len - 1);
-        const pad = comptime (procargs_pointer_size - (path_len + 1) % procargs_pointer_size) % procargs_pointer_size;
-        const body = comptime path ++ "\x00" ++ fixtureBytes(0, pad) ++ "\x00" ++ "arg\x00SECRET=1\x00SECRET=2\x00";
-        const buffer = comptime procArgsFixture(2, body);
-        try expectProcArgs(&buffer, &.{ "", "arg" }, false);
-    }
-}
-
-test "KERN_PROCARGS2 ambiguous argv boundary reports only the exec path" {
-    // "/bin/zsh" needs 8 NULs before argv. A shorter run does not match the
-    // documented layout, so no string after the path is trusted.
-    const short_run = procArgsFixture(2, "/bin/zsh\x00\x00SECRET=1\x00SECRET=2\x00");
-    try expectProcArgs(&short_run, &.{"/bin/x"}, true);
-
-    const no_padding = procArgsFixture(1, "/bin/zsh\x00SECRET=1\x00");
-    try expectProcArgs(&no_padding, &.{"/bin/x"}, true);
-}
-
-test "KERN_PROCARGS2 truncated buffer reports truncation" {
-    const short = procArgsFixture(3, "/bin/x\x00\x00a\x00b");
-    try expectProcArgs(&short, &.{ "a", "b" }, true);
-
-    const ends_after_nul = procArgsFixture(3, "/bin/x\x00\x00a\x00");
-    try expectProcArgs(&ends_after_nul, &.{"a"}, true);
-}
-
-test "KERN_PROCARGS2 degenerate buffers fall back to the exec path" {
-    try expectProcArgs("ab", &.{"/bin/x"}, false);
-    const zero = procArgsFixture(0, "/bin/x\x00SECRET=1\x00");
-    try expectProcArgs(&zero, &.{"/bin/x"}, false);
-    const path_only = procArgsFixture(2, "/bin/x\x00\x00\x00");
-    try expectProcArgs(&path_only, &.{"/bin/x"}, true);
-    const unterminated_path = procArgsFixture(2, "/bin/x");
-    try expectProcArgs(&unterminated_path, &.{"/bin/x"}, true);
-}
-
-fn parseProcArgsForAllocTest(allocator: Allocator, buffer: []const u8) !void {
-    const parsed = try parseProcArgs(allocator, buffer, "/bin/x");
-    freeArgv(allocator, parsed.argv);
-}
-
-test "parseProcArgs frees partial results on allocation failure" {
-    const buffer = procArgsFixture(3, "/bin/x\x00\x00x\x00\x00y\x00SECRET=1\x00");
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseProcArgsForAllocTest, .{@as([]const u8, &buffer)});
-    const leading_empty = procArgsFixture(3, "/bin/x\x00\x00\x00\x00y\x00SECRET=1\x00");
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseProcArgsForAllocTest, .{@as([]const u8, &leading_empty)});
-}
-
-test "parseProcArgs fallback branches survive every allocation failure" {
-    // Positive argc with no parseable argument used to deinit the argv list
-    // twice when the fallback allocation failed.
-    const path_only = procArgsFixture(2, "/bin/x\x00\x00\x00");
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseProcArgsForAllocTest, .{@as([]const u8, &path_only)});
-    const ambiguous = procArgsFixture(2, "/bin/zsh\x00\x00SECRET=1\x00");
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseProcArgsForAllocTest, .{@as([]const u8, &ambiguous)});
-    const zero = procArgsFixture(0, "/bin/x\x00");
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseProcArgsForAllocTest, .{@as([]const u8, &zero)});
-}
-
-test "a live Darwin process with an empty argv[0] never exposes its environment" {
-    if (!builtin.os.tag.isDarwin()) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-
-    const pid = std.c.fork();
-    try std.testing.expect(pid >= 0);
-    if (pid == 0) {
-        const argv = [_:null]?[*:0]const u8{ "", "30" };
-        const envp = [_:null]?[*:0]const u8{ "SECRET=zmux-envp-marker", "SECRET2=zmux-envp-marker" };
-        _ = std.c.execve("/bin/sleep", &argv, &envp);
-        std.c._exit(127);
-    }
-    defer {
-        _ = std.c.kill(pid, .KILL);
-        _ = std.c.waitpid(pid, null, 0);
-    }
-
-    // Wait for the exec: until then the child still shows the test runner.
-    var attempts: usize = 0;
-    while (attempts < 500) : (attempts += 1) {
-        var path_buf: [posix.PATH_MAX]u8 = undefined;
-        if (std.mem.endsWith(u8, procPath(pid, &path_buf), "/sleep")) break;
-        std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake) catch {};
-    }
-
-    const parsed = try procArgsDarwin(allocator, pid, "/bin/sleep");
-    defer freeArgv(allocator, parsed.argv);
-    for (parsed.argv) |arg| try std.testing.expect(std.mem.indexOf(u8, arg, "SECRET") == null);
-    try std.testing.expect(!parsed.truncated);
-    try std.testing.expectEqual(@as(usize, 2), parsed.argv.len);
-    try std.testing.expectEqualStrings("", parsed.argv[0]);
-    try std.testing.expectEqualStrings("30", parsed.argv[1]);
 }
 
 test "tracker observe reports every change including return to shell" {
@@ -944,24 +346,6 @@ test "resolveProcessInfo never fails for a missing pid" {
     }
 }
 
-test "resolveLinuxProcessInfo is not degraded for the current process" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    var info = try resolveLinuxProcessInfo(std.testing.allocator, std.testing.io, std.c.getpid());
-    defer info.deinit();
-    try std.testing.expect(!info.degraded);
-    try std.testing.expect(!info.argv_truncated);
-}
-
-test "readProcFileBounded reports truncation past the bound" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const raw = (try readProcFileBounded(std.testing.allocator, std.testing.io, "/proc/self/cmdline", 2)).?;
-    defer std.testing.allocator.free(raw.bytes);
-    try std.testing.expectEqual(@as(usize, 2), raw.bytes.len);
-    try std.testing.expect(raw.truncated);
-
-    try std.testing.expect((try readProcFileBounded(std.testing.allocator, std.testing.io, "/proc/0/none", 16)) == null);
-}
-
 test "tcgetpgrp errno mapping never hits unreachable" {
     try std.testing.expectError(error.Unexpected, pgrpFromErrno(-1, .INVAL));
     try std.testing.expectError(error.Unexpected, pgrpFromErrno(-1, .BADF));
@@ -977,4 +361,11 @@ test "terminalForegroundPgrp reports errors for bad descriptors" {
     defer sys.close(fds[0]);
     defer sys.close(fds[1]);
     try std.testing.expectError(error.NotATerminal, terminalForegroundPgrp(fds[0]));
+}
+
+test {
+    std.testing.refAllDecls(@This());
+    _ = @import("foreground/argv.zig");
+    _ = @import("foreground/darwin.zig");
+    _ = @import("foreground/linux.zig");
 }

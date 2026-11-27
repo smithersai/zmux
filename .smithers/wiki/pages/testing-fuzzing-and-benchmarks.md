@@ -25,10 +25,11 @@ Every quality gate in `zmux` is declared as a cacheable target in `PACKAGE.ts` o
 
 ## Incremental benchmarks and Lighthouse backpressure
 
-- Every core module has a benchmark target (`//:benchBuffer` through `//:benchServer`) that writes `.benchmarks/<module>.json` as a cacheable output. `smthrs run //:bench` aggregates all cached and fresh results against `bench/baseline.json`.
-- Uphill (`.agents/uphill/uphill.yaml`) scores five categories from 0 to 100 in a Lighthouse-style audit report:
-  1. **Footprint** (module line count, module byte size, zero external dependencies)
+- Every core subsystem has a benchmark target (`//:benchBuffer` through `//:benchSocketPath`, 13 suites and 96 tracked benchmarks) that writes `.benchmarks/<module>.json` as a cacheable output. `smthrs run //:bench` aggregates all cached and fresh results against `bench/baseline.json`.
+- Uphill (`.agents/uphill/uphill.yaml`) plus the Smithers Cloud factory check score six categories from 0 to 100 in a Lighthouse-style audit report:
+  1. **Footprint** (all 84 Zig files <= 600 production lines and <= 24 kB, zero external dependencies)
   2. **Style and TigerStyle** (`zig fmt`, max function length <= 70 lines, line length <= 120, `std.debug.assert` density >= 15 per kLOC)
   3. **Correctness** (zero production `@panic`/`unreachable`, zero TODOs, zero `std.debug.print`, zero silent `catch {}`)
-  4. **Testing** (unit test density >= 20 per module, fuzz harness parity, benchmark suite parity)
-  5. **Documentation** (`pub` `///` doc coverage >= 90%, valid Markdown links, core root docs)
+  4. **Testing** (subsystem unit test density >= 20, 100% fuzz harness parity, 100% benchmark suite parity)
+  5. **Documentation** (100% top-level `pub` `///` doc coverage, valid Markdown links, core root docs)
+  6. **Factory and Trust** (shared `build.smithers.sh` object store, untrusted PR cache isolation, protected paths, personalized UI, wiki and `llms.txt`, auto releases, and one-time sandbox auth)
