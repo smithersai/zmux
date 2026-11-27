@@ -34,7 +34,7 @@ footprint:
     src/server.zig: { baseline: 254510B }
     src/socket_path.zig: { baseline: 18820B }
     src/sys.zig: { baseline: 85070B }
-  zig-dependencies: { baseline: 1 }
+  zig-dependencies: { baseline: 0 }
 
 style:
   zig-fmt:
