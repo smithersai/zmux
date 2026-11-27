@@ -1,0 +1,86 @@
+# .agents/uphill/uphill.yaml — Continuous metrics for zmux (Zig PTY multiplexer).
+
+footprint:
+  title: Footprint
+  description: Keep Zig modules focused and modular so daemon and client surfaces stay auditable.
+  run: bun .agents/uphill/metrics/footprint.ts
+  # Production (non-test) line count per Zig module in src/. Target of 600 lines encourages decomposing monolithic modules like server.zig and mux.zig.
+  module-prod-lines:
+    poor: 2000
+    description: Keep each Zig source module under 600 production lines by splitting cohesive subsystems into focused modules.
+  # Total file size per Zig module in src/. Target of 24 kB tracks source surface growth alongside line count.
+  module-bytes:
+    poor: 80kB
+    description: Keep each Zig module concise and avoid duplicating framing, protocol, or syscall logic.
+  # Tripwire: number of external dependencies declared in build.zig.zon (zmux aims for zero external runtime deps).
+  zig-dependencies:
+    description: Keep build.zig.zon free of unnecessary external dependencies.
+
+style:
+  title: Style & TigerStyle
+  description: Enforce zig fmt and TigerStyle limits on function length, line length, and assertion density.
+  run: bun .agents/uphill/metrics/style.ts
+  # Every Zig file in src/, bench/, and test/ must pass `zig fmt --check`.
+  zig-fmt:
+    description: Format all Zig source, benchmark, and test files with `zig fmt`.
+  # Longest production function per src/*.zig module. TigerStyle caps functions at 70 lines.
+  max-fn-lines:
+    poor: 160
+    description: Keep every Zig function at or under 70 lines (TigerStyle rule); split state machines and RPC handlers into small helpers.
+  # Every production line in src/*.zig should stay within 120 columns (TigerStyle readability cap).
+  line-length:
+    description: Keep production Zig lines at or under 120 characters.
+  # Runtime `std.debug.assert` calls per 1,000 production lines (TigerStyle invariant checking).
+  assert-density:
+    better: higher
+    poor: 2
+    description: Assert preconditions, postconditions, and ring-buffer/protocol invariants with `std.debug.assert` (target >= 15 per kLOC).
+
+correctness:
+  title: Correctness
+  description: Eliminate panic paths, error swallowing, debug prints, and unresolved TODOs from daemon production code.
+  run: bun .agents/uphill/metrics/correctness.ts
+  # Production code in src/*.zig must return typed Zig errors instead of calling @panic or unreachable.
+  no-panic:
+    description: Return explicit Zig error unions instead of `@panic`, `unreachable`, or `catch unreachable` in production code.
+  # No unresolved TODO/FIXME/XXX/HACK comments left in production src/*.zig files.
+  no-todo:
+    description: Resolve or track TODO/FIXME items instead of leaving them in production Zig modules.
+  # Daemon and client production modules must use src/log.zig instead of std.debug.print.
+  no-debug-print:
+    description: Use structured logging (`src/log.zig`) instead of `std.debug.print` in production code.
+  # Production code must handle or propagate errors instead of silently discarding them with `catch {}`.
+  no-empty-catch:
+    description: Handle or log errors explicitly instead of silently swallowing them with `catch {}`.
+
+testing:
+  title: Testing
+  description: Ensure every core Zig module carries thorough unit tests, fuzz harnesses, and benchmark coverage.
+  run: bun .agents/uphill/metrics/testing.ts
+  # Count of inline `test "..."` blocks per src/*.zig module. Target of 20 encourages broad edge-case coverage.
+  unit-tests:
+    better: higher
+    poor: 5
+    description: Keep comprehensive inline unit tests in every src/*.zig module covering boundaries and error paths.
+  # Each non-main src/*.zig module should have a dedicated fuzz harness under test/fuzz/.
+  fuzz-coverage:
+    description: Pair every core src/*.zig module with a fuzz harness under `test/fuzz/`.
+  # Each non-main src/*.zig module should have a benchmark suite in bench/ recorded in bench/baseline.json.
+  bench-coverage:
+    description: Pair every core src/*.zig module with a benchmark suite in `bench/` and baseline entry in `bench/baseline.json`.
+
+documentation:
+  title: Documentation
+  description: Keep public Zig APIs documented and repository Markdown docs free of broken links.
+  run: bun .agents/uphill/metrics/documentation.ts
+  # Share (%) of top-level `pub fn` and `pub const` declarations in src/*.zig preceded by `///` doc comments.
+  pub-doc-coverage:
+    better: higher
+    poor: 25
+    description: Document public Zig functions and constants with `///` doc comments (target >= 90%).
+  # All relative file links in top-level Markdown files must resolve to existing files.
+  markdown-links:
+    description: Keep relative links in README.md, CHANGELOG.md, and AGENTS.md valid.
+  # Core repository documentation files (README.md, CHANGELOG.md, AGENTS.md) must exist.
+  repo-docs:
+    description: Maintain README.md, CHANGELOG.md, and AGENTS.md at the repository root.
