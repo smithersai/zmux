@@ -20,6 +20,8 @@ const validatorInputs = [
   S.glob("//.smithers/playground/**"),
   S.file("//.smithers/scripts/mint-sandbox-auth.mjs"),
   S.file("//.smithers/scripts/mint-sandbox-auth.test.mjs"),
+  S.file("//.smithers/scripts/render-pr-audit.mjs"),
+  S.file("//.smithers/scripts/render-pr-audit.test.mjs"),
   S.file("//scripts/install.sh"),
   S.file("//scripts/install.test.mjs"),
   S.file("//.github/workflows/ci.yml"),

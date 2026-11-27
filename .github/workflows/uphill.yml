@@ -32,13 +32,23 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
 
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
       - name: Run Uphill
         uses: wevm/uphill@main
 
       - name: Publish Lighthouse audit summary
         if: always()
+        env:
+          SMITHERS_TRUST_LEVEL: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'trusted' || 'untrusted' }}
+          SMITHERS_CACHE_NAMESPACE: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'trunk' }}
         run: |
+          node .smithers/scripts/render-pr-audit.mjs >> "$GITHUB_STEP_SUMMARY" || true
           if [ -f .uphill/report.md ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
             cat .uphill/report.md >> "$GITHUB_STEP_SUMMARY"
           fi
 

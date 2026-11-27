@@ -223,6 +223,7 @@ function checkViews() {
       ".smithers/playground/run.test.mjs",
       ".smithers/views/backpressure/run.test.mjs",
       ".smithers/scripts/mint-sandbox-auth.test.mjs",
+      ".smithers/scripts/render-pr-audit.test.mjs",
       "scripts/install.test.mjs"
     ],
     {
