@@ -48,6 +48,8 @@ pub const SessionManager = mux.Manager;
 comptime {
     // A default-sized pane must fit the ring without being clamped.
     @import("std").debug.assert(buffer.default_capacity <= buffer.max_capacity);
+    @import("std").debug.assert(protocol.max_json_depth >= 16);
+    @import("std").debug.assert(protocol.max_json_nodes >= 1024);
 }
 
 test {
@@ -153,4 +155,176 @@ test "README request and notification examples match the wire types" {
     try std.testing.expectEqualStrings(protocol.pane_output_method, event.value.method);
     try std.testing.expectEqual(@as(u64, 12), event.value.params.offset);
     try std.testing.expectEqual(@as(u64, 1), event.value.params.generation);
+}
+
+test "all top-level public modules are exported" {
+    const std = @import("std");
+    const names = [_][]const u8{
+        "buffer",   "connect",  "daemon", "foreground", "mux",
+        "native",   "protocol", "pty",    "server",     "sys",
+        "internal",
+    };
+    inline for (names) |name| {
+        try std.testing.expect(@hasDecl(@This(), name));
+    }
+}
+
+test "internal namespace exports log, rpc_line_reader, and socket_path" {
+    const std = @import("std");
+    try std.testing.expect(@hasDecl(internal, "log"));
+    try std.testing.expect(@hasDecl(internal, "rpc_line_reader"));
+    try std.testing.expect(@hasDecl(internal, "socket_path"));
+}
+
+test "top-level convenience aliases match module declarations" {
+    const std = @import("std");
+    try std.testing.expect(NativeSession == native.NativeSession);
+    try std.testing.expect(NativeSessionOptions == native.NativeSessionOptions);
+    try std.testing.expect(Server == server.Server);
+    try std.testing.expect(SessionManager == mux.Manager);
+}
+
+test "scrollback default and max capacity bounds are consistent" {
+    const std = @import("std");
+    try std.testing.expect(buffer.default_capacity > 0);
+    try std.testing.expect(buffer.default_capacity <= buffer.max_capacity);
+}
+
+test "scrollback ring preserves newest bytes and endOffset via main re-export" {
+    const std = @import("std");
+    var ring = try buffer.ScrollbackBuffer.init(std.testing.allocator, 8);
+    defer ring.deinit();
+    ring.append("12345");
+    ring.append("67890");
+    try std.testing.expectEqual(@as(u64, 10), ring.endOffset());
+    const snap = try ring.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(snap);
+    try std.testing.expectEqualStrings("34567890", snap);
+}
+
+test "protocol version agrees with build.zig.zon package version" {
+    const std = @import("std");
+    const allocator = std.testing.allocator;
+    const manifest = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "build.zig.zon",
+        allocator,
+        .limited(64 * 1024),
+    );
+    defer allocator.free(manifest);
+    const prefix = ".version = \"";
+    const start = (std.mem.indexOf(u8, manifest, prefix) orelse return error.MissingVersion) + prefix.len;
+    const end = std.mem.indexOfScalar(u8, manifest[start..], '"') orelse return error.MissingVersion;
+    try std.testing.expectEqualStrings(manifest[start..][0..end], protocol.version);
+}
+
+test "protocol JSON-RPC standard error codes match D2 specification" {
+    const std = @import("std");
+    try std.testing.expectEqual(@as(i32, -32700), protocol.ErrorCode.parse_error);
+    try std.testing.expectEqual(@as(i32, -32600), protocol.ErrorCode.invalid_request);
+    try std.testing.expectEqual(@as(i32, -32601), protocol.ErrorCode.method_not_found);
+    try std.testing.expectEqual(@as(i32, -32602), protocol.ErrorCode.invalid_params);
+    try std.testing.expectEqual(@as(i32, -32603), protocol.ErrorCode.internal_error);
+    try std.testing.expectEqual(@as(i32, -32000), protocol.ErrorCode.session_error);
+}
+
+test "protocol notification method constants are stable" {
+    const std = @import("std");
+    try std.testing.expectEqualStrings("pane_output", protocol.pane_output_method);
+    try std.testing.expectEqualStrings("foreground_changed", protocol.foreground_changed_method);
+    try std.testing.expectEqualStrings("session_exited", protocol.session_exited_method);
+    try std.testing.expectEqualStrings("pane_activity", protocol.pane_activity_method);
+    try std.testing.expectEqualStrings("pane_bell", protocol.pane_bell_method);
+    try std.testing.expectEqualStrings("pane_output_dropped", protocol.pane_output_dropped_method);
+    try std.testing.expectEqualStrings("pane_respawned", protocol.pane_respawned_method);
+    try std.testing.expectEqualStrings("client_detached", protocol.client_detached_method);
+}
+
+test "protocol parseRequest handles valid daemon.ping request" {
+    const std = @import("std");
+    var req = try protocol.parseRequest(
+        std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"daemon.ping\"}",
+    );
+    defer req.deinit();
+    try std.testing.expectEqualStrings("daemon.ping", req.method);
+    try std.testing.expect(!protocol.isNotification(&req));
+}
+
+test "protocol parseRequest rejects batch array" {
+    const std = @import("std");
+    try std.testing.expectError(
+        error.BatchUnsupported,
+        protocol.parseRequest(std.testing.allocator, "[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"daemon.ping\"}]"),
+    );
+}
+
+test "protocol parseRequest rejects malformed JSON" {
+    const std = @import("std");
+    try std.testing.expectError(
+        error.ParseError,
+        protocol.parseRequest(std.testing.allocator, "{\"jsonrpc\":\"2.0\""),
+    );
+}
+
+test "protocol errorCodeFor maps DuplicateSessionName to conflict" {
+    const std = @import("std");
+    const mapped = protocol.errorCodeFor(error.DuplicateSessionName);
+    try std.testing.expectEqual(@as(i32, protocol.ErrorCode.session_error), mapped.code);
+    try std.testing.expectEqual(protocol.ErrorKind.conflict, mapped.kind);
+}
+
+test "SessionManager initializes empty and cleans up without leaking" {
+    const std = @import("std");
+    var manager = SessionManager.init(std.testing.allocator, std.testing.io, null);
+    defer manager.deinit();
+    try std.testing.expectEqual(@as(usize, 0), manager.sessionCount());
+}
+
+test "LineReader default state has empty pending buffer and cleans up" {
+    const std = @import("std");
+    var reader = internal.rpc_line_reader.LineReader{};
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(usize, 0), reader.start);
+    try std.testing.expectEqual(@as(usize, 0), reader.end);
+    try std.testing.expect(!reader.discarding);
+}
+
+test "socket path rejects empty input" {
+    const std = @import("std");
+    try std.testing.expectError(error.EmptySocketPath, internal.socket_path.validate(""));
+}
+
+test "socket path accepts short absolute unix socket path" {
+    try internal.socket_path.validate("/tmp/zmux-test.sock");
+}
+
+test "socket path rejects overlong unix socket path" {
+    const std = @import("std");
+    var buf: [256]u8 = undefined;
+    @memset(&buf, 'a');
+    buf[0] = '/';
+    try std.testing.expectError(error.SocketPathTooLong, internal.socket_path.validate(&buf));
+}
+
+test "log level parsing accepts canonical level names" {
+    const std = @import("std");
+    try std.testing.expectEqual(internal.log.Level.err, try internal.log.parseLevel("error"));
+    try std.testing.expectEqual(internal.log.Level.warn, try internal.log.parseLevel("warn"));
+    try std.testing.expectEqual(internal.log.Level.info, try internal.log.parseLevel("info"));
+    try std.testing.expectEqual(internal.log.Level.debug, try internal.log.parseLevel("debug"));
+}
+
+test "log level parsing rejects unknown level names" {
+    const std = @import("std");
+    try std.testing.expectError(error.InvalidLogLevel, internal.log.parseLevel("verbose-invalid"));
+    try std.testing.expectError(error.InvalidLogLevel, internal.log.parseLevel(""));
+}
+
+test "NativeSessionOptions defaults are bounded and non-zero" {
+    const std = @import("std");
+    const opts = NativeSessionOptions{ .id = "smoke" };
+    try std.testing.expectEqualStrings("smoke", opts.id);
+    try std.testing.expect(opts.rows > 0);
+    try std.testing.expect(opts.cols > 0);
 }
