@@ -1,0 +1,595 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>zmux Backpressure Audit Report</title>
+<style>
+:root {
+  --bg: #ffffff;
+  --surface: #f8f9fa;
+  --fg: #1f2328;
+  --muted: #59636e;
+  --line: #d8dee4;
+  --focus: #0969da;
+  --good: #00cc66;
+  --good-fg: #007a3d;
+  --good-bg: rgba(0, 204, 102, 0.14);
+  --avg: #ffa400;
+  --avg-fg: #b25e00;
+  --avg-bg: rgba(255, 164, 0, 0.15);
+  --poor: #ff3333;
+  --poor-fg: #c62828;
+  --poor-bg: rgba(255, 51, 51, 0.14);
+  --none: #8c959f;
+  --none-bg: rgba(140, 149, 159, 0.15);
+  --radius: 12px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --fg: #e6edf3;
+    --muted: #8b949e;
+    --line: #30363d;
+    --focus: #58a6ff;
+    --good-fg: #3fb950;
+    --avg-fg: #f0b429;
+    --poor-fg: #f85149;
+  }
+}
+* { box-sizing: border-box }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+main { max-width: 1040px; margin: 0 auto; padding: 28px 20px 64px }
+header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--line);
+}
+h1 { margin: 0; font-size: 22px; font-weight: 700; letter-spacing: -0.02em }
+.sub { margin: 4px 0 0; color: var(--muted); font-size: 13px }
+.toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap }
+button {
+  font: inherit;
+  font-weight: 600;
+  color: var(--fg);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 14px;
+  cursor: pointer;
+}
+button:hover { border-color: var(--focus) }
+button:disabled { opacity: 0.55; cursor: default }
+.trust-banner {
+  margin-top: 16px;
+  padding: 12px 16px;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: var(--surface);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.trust-banner.trusted { border-color: var(--good); background: var(--good-bg) }
+.trust-banner.untrusted { border-color: var(--avg); background: var(--avg-bg) }
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.badge.good { background: var(--good-bg); color: var(--good-fg) }
+.badge.average { background: var(--avg-bg); color: var(--avg-fg) }
+.badge.poor { background: var(--poor-bg); color: var(--poor-fg) }
+.badge.none { background: var(--none-bg); color: var(--muted) }
+.gauges {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 20px 32px;
+  padding: 28px 0 14px;
+}
+.gauge {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 112px;
+  text-decoration: none;
+  color: inherit;
+}
+.gauge-ring { position: relative; width: 92px; height: 92px }
+.gauge-ring svg { width: 92px; height: 92px; transform: rotate(-90deg) }
+.gauge-ring .track { fill: var(--none-bg); stroke: var(--line); stroke-width: 7 }
+.gauge.good .track { fill: var(--good-bg) }
+.gauge.average .track { fill: var(--avg-bg) }
+.gauge.poor .track { fill: var(--poor-bg) }
+.gauge-ring .arc { fill: none; stroke-width: 7; stroke-linecap: round; stroke: var(--none); transition: stroke-dashoffset 0.5s ease }
+.gauge.good .arc { stroke: var(--good) }
+.gauge.average .arc { stroke: var(--avg) }
+.gauge.poor .arc { stroke: var(--poor) }
+.gauge-num {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 26px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.gauge.good .gauge-num { color: var(--good-fg) }
+.gauge.average .gauge-num { color: var(--avg-fg) }
+.gauge.poor .gauge-num { color: var(--poor-fg) }
+.gauge-label { margin-top: 8px; font-weight: 600; font-size: 13px; text-align: center }
+.legend {
+  display: flex;
+  justify-content: center;
+  gap: 22px;
+  padding: 8px 0 22px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+}
+.dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: middle }
+.dot.good { background: var(--good) }
+.dot.average { background: var(--avg); border-radius: 2px }
+.dot.poor { background: var(--poor); clip-path: polygon(50% 0%, 0% 100%, 100% 100%); border-radius: 0 }
+.tabs {
+  display: flex;
+  gap: 6px;
+  border-bottom: 1px solid var(--line);
+  margin: 22px 0 18px;
+  overflow-x: auto;
+}
+.tabs button {
+  border: 0;
+  border-bottom: 3px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  padding: 10px 14px;
+}
+.tabs button[aria-selected="true"] {
+  color: var(--fg);
+  border-bottom-color: var(--focus);
+}
+.panel[hidden] { display: none }
+.kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.kpi {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+}
+.kpi .val { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums }
+.kpi .lbl { color: var(--muted); font-size: 12px; margin-top: 2px }
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin-bottom: 16px;
+}
+.card h2 { margin: 0 0 6px; font-size: 16px }
+.card p { margin: 0 0 12px; color: var(--muted); font-size: 13px }
+table { width: 100%; border-collapse: collapse; font-size: 13px }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line) }
+th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em }
+code {
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--none-bg);
+  padding: 2px 5px;
+  border-radius: 5px;
+}
+details { border-top: 1px solid var(--line); padding: 10px 0 }
+details:first-of-type { border-top: 0 }
+summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  cursor: pointer;
+  font-weight: 600;
+  list-style: none;
+}
+summary::-webkit-details-marker { display: none }
+.scroll { overflow-x: auto }
+.status-line { color: var(--muted); font-size: 12px; margin-top: 8px }
+.site-nav { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--surface); font-size: 13.5px }
+.site-nav[hidden] { display: none }
+.site-nav a { color: var(--muted); text-decoration: none; font-weight: 500 }
+.site-nav a:hover, .site-nav a.active { color: var(--focus) }
+.site-nav-links { display: flex; flex-wrap: wrap; gap: 14px; align-items: center }
+.mod-search { width: 100%; max-width: 340px; padding: 7px 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--fg); font: inherit; margin-bottom: 12px }
+.gauge { cursor: pointer; transition: transform 0.14s ease }
+.gauge:hover { transform: translateY(-2px) }
+[data-theme="dark"] { --bg: #0d1117; --surface: #161b22; --fg: #e6edf3; --muted: #8b949e; --line: #30363d; --focus: #58a6ff; --good-fg: #3fb950; --avg-fg: #f0b429; --poor-fg: #f85149 }
+[data-theme="light"] { --bg: #ffffff; --surface: #f8f9fa; --fg: #1f2328; --muted: #59636e; --line: #d8dee4; --focus: #0969da; --good-fg: #007a3d; --avg-fg: #b25e00; --poor-fg: #c62828 }
+</style>
+</head>
+<body>
+<nav id="site-nav" class="site-nav" aria-label="zmux documentation">
+  <a href="../index.html" style="font-weight:800;color:var(--fg)">zmux</a>
+  <div class="site-nav-links">
+    <a href="../index.html">Overview</a>
+    <a href="../wiki/index.html">Engineering wiki</a>
+    <a href="../history/index.html">Mythical history</a>
+    <a class="active" href="./index.html">Lighthouse audit</a>
+    <a href="../playground/index.html">Protocol inspector</a>
+    <a href="https://smithers.sh/smithersai/zmux" target="_blank" rel="noopener">Smithers Cloud</a>
+    <button id="theme-toggle" type="button" style="padding:4px 10px;font-size:12px">Theme</button>
+  </div>
+</nav>
+<main>
+  <header>
+    <div>
+      <h1>zmux Backpressure Audit Report</h1>
+      <p class="sub" id="subtitle">Continuous Uphill Lighthouse audit for smithersai/zmux</p>
+    </div>
+    <div class="toolbar">
+      <button id="refresh" type="button">Run live audit</button>
+    </div>
+  </header>
+
+  <section id="trust-banner" class="trust-banner" aria-label="Execution trust provenance">
+    <div>
+      <span id="trust-badge" class="badge none">Loading</span>
+      <span id="trust-note" style="margin-left:8px;font-size:13px">Collecting backpressure metrics...</span>
+    </div>
+    <div id="trust-meta" class="status-line"></div>
+  </section>
+
+  <section id="gauges" class="gauges" aria-label="Category scores"></section>
+  <div class="legend" aria-label="Score bands">
+    <span><i class="dot poor"></i>0 to 49</span>
+    <span><i class="dot average"></i>50 to 89</span>
+    <span><i class="dot good"></i>90 to 100</span>
+  </div>
+
+  <nav class="tabs" role="tablist" aria-label="Audit views">
+    <button role="tab" aria-selected="true" data-tab="overview" type="button">Overview and opportunities</button>
+    <button role="tab" aria-selected="false" data-tab="audits" type="button">Category audits</button>
+    <button role="tab" aria-selected="false" data-tab="modules" type="button">Module matrix</button>
+    <button role="tab" aria-selected="false" data-tab="trust" type="button">Trust and telemetry</button>
+  </nav>
+
+  <section id="panel-overview" class="panel">
+    <div id="kpis" class="kpis"></div>
+    <div class="card">
+      <h2>Top opportunities to raise the score</h2>
+      <p>Ranked by estimated category score gain from Uphill continuous metrics.</p>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Gain</th><th>Category</th><th>Metric</th><th>Target item</th><th>Current</th><th>Target</th></tr></thead>
+          <tbody id="opps-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section id="panel-audits" class="panel" hidden></section>
+
+  <section id="panel-modules" class="panel" hidden>
+    <div class="card">
+      <h2>Per-module Zig audit matrix</h2>
+      <p>Every module in src/ scored against TigerStyle, correctness, fuzzing, benchmarks, and doc coverage.</p>
+      <input id="mod-search" class="mod-search" type="search" placeholder="Filter modules (for example server, protocol, pty)..." aria-label="Filter Zig modules">
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Module</th><th>Prod lines</th><th>Max fn</th><th>Asserts/kLOC</th><th>Unit tests</th><th>Docs %</th><th>Correctness</th></tr></thead>
+          <tbody id="modules-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section id="panel-trust" class="panel" hidden>
+    <div class="card">
+      <h2>Execution trust boundary and shared object store</h2>
+      <p>Non-maintainers are encouraged to run untrusted audits locally or in forks. Only Smithers-controlled sandboxes and maintainer gates write to the shared object store or clear merge gates.</p>
+      <div id="trust-details" class="scroll"></div>
+    </div>
+    <div class="card">
+      <h2>Fuzz harnesses and benchmark suites</h2>
+      <div id="telemetry-details"></div>
+    </div>
+  </section>
+
+  <p id="status" class="status-line" role="status"></p>
+</main>
+<script id="zmux-audit-snapshot" type="application/json">null</script>
+<script>
+const host = "https://smithers.sh"
+const refreshBtn = document.getElementById("refresh")
+const statusEl = document.getElementById("status")
+const nonce = document.documentElement.dataset.smithersNonce
+const initId = "backpressure-audit"
+let port = null
+let pending = null
+let nextId = 0
+
+function el(tag, attrs, ...children) {
+  const node = document.createElement(tag)
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === "class") node.className = v
+    else if (v !== undefined && v !== null) node.setAttribute(k, String(v))
+  }
+  for (const child of children) {
+    if (child === null || child === undefined) continue
+    node.append(typeof child === "string" || typeof child === "number" ? document.createTextNode(String(child)) : child)
+  }
+  return node
+}
+
+function makeGauge(label, score, band) {
+  const r = 38
+  const c = 2 * Math.PI * r
+  const clamped = Math.max(0, Math.min(100, Number(score) || 0))
+  const offset = c * (1 - clamped / 100)
+  const svgNS = "http://www.w3.org/2000/svg"
+  const svg = document.createElementNS(svgNS, "svg")
+  svg.setAttribute("viewBox", "0 0 92 92")
+  const track = document.createElementNS(svgNS, "circle")
+  track.setAttribute("class", "track")
+  track.setAttribute("cx", "46")
+  track.setAttribute("cy", "46")
+  track.setAttribute("r", String(r))
+  const arc = document.createElementNS(svgNS, "circle")
+  arc.setAttribute("class", "arc")
+  arc.setAttribute("cx", "46")
+  arc.setAttribute("cy", "46")
+  arc.setAttribute("r", String(r))
+  arc.setAttribute("stroke-dasharray", c.toFixed(2))
+  arc.setAttribute("stroke-dashoffset", offset.toFixed(2))
+  svg.append(track, arc)
+
+  const ring = el("div", { class: "gauge-ring" }, svg, el("div", { class: "gauge-num" }, String(clamped)))
+  return el("div", { class: `gauge ${band}` }, ring, el("div", { class: "gauge-label" }, label))
+}
+
+function render(report) {
+  if (!report || typeof report !== "object") return
+  document.getElementById("subtitle").textContent =
+    `${report.repository || "smithersai/zmux"} · Overall ${report.overallScore}/100 · Updated ${report.generatedAt || ""}`
+
+  const prov = report.provenance || {}
+  const trusted = prov.trust === "trusted"
+  const banner = document.getElementById("trust-banner")
+  banner.className = `trust-banner ${trusted ? "trusted" : "untrusted"}`
+  const badge = document.getElementById("trust-badge")
+  badge.className = `badge ${trusted ? "good" : "average"}`
+  badge.textContent = trusted ? "Trusted gate execution" : "Untrusted read-only execution"
+  document.getElementById("trust-note").textContent = prov.note || ""
+  document.getElementById("trust-meta").textContent =
+    `Object store: ${prov.objectStore || "https://build.smithers.sh"} (${prov.cacheMode || "read-only"})`
+
+  const gauges = document.getElementById("gauges")
+  gauges.replaceChildren()
+  for (const cat of report.categories || []) {
+    const g = makeGauge(cat.title, cat.score, cat.band)
+    g.addEventListener("click", () => {
+      for (const b of document.querySelectorAll(".tabs button")) {
+        b.setAttribute("aria-selected", String(b.dataset.tab === "audits"))
+      }
+      for (const panel of document.querySelectorAll(".panel")) {
+        panel.hidden = panel.id !== "panel-audits"
+      }
+      const target = document.getElementById(`cat-card-${cat.id}`)
+      if (target) target.scrollIntoView({ behavior: "smooth", block: "start" })
+    })
+    gauges.append(g)
+  }
+
+  const kpis = document.getElementById("kpis")
+  kpis.replaceChildren(
+    el("div", { class: "kpi" }, el("div", { class: "val" }, `${report.overallScore}/100`), el("div", { class: "lbl" }, "Overall audit score")),
+    el("div", { class: "kpi" }, el("div", { class: "val" }, String((report.modules || []).length)), el("div", { class: "lbl" }, "Audited Zig modules")),
+    el("div", { class: "kpi" }, el("div", { class: "val" }, String(report.telemetry?.fuzzHarnessCount ?? 0)), el("div", { class: "lbl" }, "Fuzz harnesses")),
+    el("div", { class: "kpi" }, el("div", { class: "val" }, String(report.telemetry?.benchmarkCount ?? 0)), el("div", { class: "lbl" }, "Tracked benchmarks")),
+    el("div", { class: "kpi" }, el("div", { class: "val" }, String(report.trustPolicy?.protectedPathCount ?? 0)), el("div", { class: "lbl" }, "Protected trust paths"))
+  )
+
+  const oppsBody = document.getElementById("opps-body")
+  oppsBody.replaceChildren()
+  if ((report.opportunities || []).length === 0) {
+    oppsBody.append(el("tr", {}, el("td", { colspan: "6" }, "All tracked Uphill targets are green.")))
+  } else {
+    for (const opp of report.opportunities) {
+      oppsBody.append(el(
+        "tr",
+        {},
+        el("td", {}, el("span", { class: "badge good" }, `+${opp.gain}`)),
+        el("td", {}, opp.category),
+        el("td", {}, el("code", {}, opp.metric)),
+        el("td", {}, el("code", {}, opp.item)),
+        el("td", {}, String(opp.value)),
+        el("td", {}, String(opp.target))
+      ))
+    }
+  }
+
+  const auditsPanel = document.getElementById("panel-audits")
+  auditsPanel.replaceChildren()
+  for (const cat of report.categories || []) {
+    const card = el(
+      "div",
+      { class: "card", id: `cat-card-${cat.id}` },
+      el("h2", {}, `${cat.title} (${cat.score}/100)`),
+      el("p", {}, cat.description || "")
+    )
+    for (const m of cat.metrics || []) {
+      const summary = el(
+        "summary",
+        {},
+        el("span", {}, `${m.title} `, el("code", {}, m.id)),
+        el("span", { class: `badge ${m.band}` }, m.score === null ? "info" : `${m.score}/100`)
+      )
+      const detail = el("details", {}, summary, el("p", { style: "margin:8px 0" }, m.description || ""))
+      const tbl = el("table", {}, el("thead", {}, el("tr", {}, el("th", {}, "Item"), el("th", {}, "Value"), el("th", {}, "Target"), el("th", {}, "Notes"))))
+      const tb = el("tbody", {})
+      for (const it of m.items || []) {
+        tb.append(el(
+          "tr",
+          {},
+          el("td", {}, el("code", {}, it.item)),
+          el("td", {}, String(it.value ?? "")),
+          el("td", {}, String(it.target ?? "")),
+          el("td", {}, String(it.note ?? ""))
+        ))
+      }
+      tbl.append(tb)
+      detail.append(el("div", { class: "scroll" }, tbl))
+      card.append(detail)
+    }
+    auditsPanel.append(card)
+  }
+
+  const modulesBody = document.getElementById("modules-body")
+  modulesBody.replaceChildren()
+  for (const mod of report.modules || []) {
+    const c = mod.checks || {}
+    const correctnessIssues = ["correctness:no-panic", "correctness:no-debug-print", "correctness:no-empty-catch", "correctness:no-todo"]
+      .filter((k) => c[k]?.value === "fail")
+      .map((k) => k.split(":")[1])
+    modulesBody.append(el(
+      "tr",
+      {},
+      el("td", {}, el("code", {}, mod.file)),
+      el("td", {}, String(c["footprint:module-prod-lines"]?.value ?? "")),
+      el("td", {}, String(c["style:max-fn-lines"]?.value ?? "")),
+      el("td", {}, String(c["style:assert-density"]?.value ?? "")),
+      el("td", {}, String(c["testing:unit-tests"]?.value ?? "")),
+      el("td", {}, `${c["documentation:pub-doc-coverage"]?.value ?? ""}%`),
+      el("td", {}, correctnessIssues.length === 0 ? el("span", { class: "badge good" }, "pass") : el("span", { class: "badge poor" }, correctnessIssues.join(", ")))
+    ))
+  }
+
+  const trustDetails = document.getElementById("trust-details")
+  trustDetails.replaceChildren(el(
+    "table",
+    {},
+    el("tbody", {},
+      el("tr", {}, el("th", {}, "Execution trust"), el("td", {}, prov.trust || "untrusted")),
+      el("tr", {}, el("th", {}, "Execution source"), el("td", {}, el("code", {}, prov.source || ""))),
+      el("tr", {}, el("th", {}, "Shared object store"), el("td", {}, el("code", {}, prov.objectStore || "https://build.smithers.sh"))),
+      el("tr", {}, el("th", {}, "Cache access"), el("td", {}, prov.cacheMode || "read-only")),
+      el("tr", {}, el("th", {}, "Can write shared cache"), el("td", {}, String(Boolean(prov.canPublishCache)))),
+      el("tr", {}, el("th", {}, "Can satisfy merge gates"), el("td", {}, String(Boolean(prov.canSatisfyMergeGates)))),
+      el("tr", {}, el("th", {}, "Cloud MCP endpoint"), el("td", {}, el("code", {}, report.trustPolicy?.mcpEndpoint || "https://smithers.sh/smithersai/zmux/mcp"))),
+      el("tr", {}, el("th", {}, "Maintainers"), el("td", {}, (report.trustPolicy?.maintainers || ["roninjin10"]).join(", ")))
+    )
+  ))
+
+  const telemetryDetails = document.getElementById("telemetry-details")
+  telemetryDetails.replaceChildren(
+    el("p", {}, `Fuzz harnesses (${report.telemetry?.fuzzHarnessCount ?? 0}): `, el("code", {}, (report.telemetry?.fuzzHarnesses || []).join(", "))),
+    el("p", {}, `Benchmark suites (${report.telemetry?.benchmarkSuiteCount ?? 0}, ${report.telemetry?.benchmarkCount ?? 0} benchmarks): `, el("code", {}, (report.telemetry?.benchmarkSuites || []).join(", ")))
+  )
+}
+
+for (const tabBtn of document.querySelectorAll(".tabs button")) {
+  tabBtn.addEventListener("click", () => {
+    const selected = tabBtn.dataset.tab
+    for (const b of document.querySelectorAll(".tabs button")) {
+      b.setAttribute("aria-selected", String(b.dataset.tab === selected))
+    }
+    for (const panel of document.querySelectorAll(".panel")) {
+      panel.hidden = panel.id !== `panel-${selected}`
+    }
+  })
+}
+
+function runLiveAudit() {
+  if (!port || pending) return
+  pending = `req-${++nextId}`
+  refreshBtn.disabled = true
+  statusEl.textContent = "Running backpressure audit in sandbox..."
+  port.postMessage({ id: pending, method: "flow/run", params: { flow: "backpressure/report", input: { args: JSON.stringify({ refresh: true }) } } })
+}
+
+refreshBtn.addEventListener("click", runLiveAudit)
+
+// Hide site-level navigation bar when embedded inside a Smithers Cloud iframe.
+if (window.parent && window.parent !== window) {
+  const nav = document.getElementById("site-nav")
+  if (nav) nav.hidden = true
+}
+
+const themeToggle = document.getElementById("theme-toggle")
+const savedTheme = localStorage.getItem("zmux-theme")
+if (savedTheme) document.documentElement.dataset.theme = savedTheme
+themeToggle?.addEventListener("click", () => {
+  const cur = document.documentElement.dataset.theme || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
+  const next = cur === "dark" ? "light" : "dark"
+  document.documentElement.dataset.theme = next
+  localStorage.setItem("zmux-theme", next)
+})
+
+document.getElementById("mod-search")?.addEventListener("input", (e) => {
+  const q = e.target.value.trim().toLowerCase()
+  for (const row of document.querySelectorAll("#modules-body tr")) {
+    row.style.display = !q || row.textContent.toLowerCase().includes(q) ? "" : "none"
+  }
+})
+
+// 1. Load embedded static snapshot immediately when available (GitHub Pages / standalone).
+try {
+  const snapText = document.getElementById("zmux-audit-snapshot")?.textContent?.trim()
+  if (snapText && snapText !== "null") {
+    render(JSON.parse(snapText))
+    statusEl.textContent = "Showing latest published backpressure snapshot."
+  }
+} catch {}
+
+// 2. Connect to Smithers host MessagePort bridge when embedded in smithers.sh.
+if (nonce && window.parent && window.parent !== window) {
+  window.addEventListener("message", (event) => {
+    if (event.origin !== host || event.source !== window.parent) return
+    const data = event.data
+    if (!data || data.id !== initId || !event.ports || !event.ports[0]) return
+    port = event.ports[0]
+    port.onmessage = (msg) => {
+      const payload = msg.data
+      if (!payload || payload.id !== pending) return
+      pending = null
+      refreshBtn.disabled = false
+      if (payload.error) {
+        statusEl.textContent = `Audit failed: ${payload.error.message || "unavailable"}`
+        return
+      }
+      render(payload.result)
+      statusEl.textContent = "Live sandbox audit complete."
+    }
+    refreshBtn.disabled = false
+    runLiveAudit()
+  })
+  window.parent.postMessage({ type: "smithers:connect", id: initId, nonce }, host)
+} else {
+  refreshBtn.disabled = true
+  refreshBtn.title = "Live re-run is active inside smithers.sh/smithersai/zmux"
+}
+</script>
+</body>
+</html>

@@ -1,6 +1,9 @@
 name: Uphill
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
   workflow_dispatch:
 
@@ -10,17 +13,18 @@ permissions:
 
 jobs:
   uphill:
-    name: Uphill metrics
+    name: Uphill Lighthouse Backpressure
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup mise toolchain (Zig)
-        uses: jdx/mise-action@v2
+        uses: jdx/mise-action@924e7c586e33d7d4bae9c14e26c5d22e2beb6e78 # v5.3.0
         with:
           install: true
           cache: true
@@ -30,3 +34,21 @@ jobs:
 
       - name: Run Uphill
         uses: wevm/uphill@main
+
+      - name: Publish Lighthouse audit summary
+        if: always()
+        run: |
+          if [ -f .uphill/report.md ]; then
+            cat .uphill/report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload Lighthouse report artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: zmux-uphill-lighthouse-${{ github.run_attempt }}
+          path: |
+            .uphill/report.html
+            .uphill/report.json
+            .uphill/report.md
+          if-no-files-found: ignore

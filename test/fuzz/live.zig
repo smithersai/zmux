@@ -204,12 +204,19 @@ fn fuzzLiveMuxManager(_: void, smith: *std.testing.Smith) !void {
                     "invalid-cmd",
                 };
                 const chosen = cmds[smith.index(cmds.len)];
-                try manager.bindKey("prefix", "k", chosen, smith.value(bool));
-                if (pane_ids.items.len > 0 and manager.paneCount() < max_live_panes) {
-                    const pid = pane_ids.items[smith.index(pane_ids.items.len)];
-                    if (manager.executeBinding("prefix", "k", pid)) |maybe_cmd| {
-                        if (maybe_cmd) |owned| allocator.free(owned);
-                    } else |_| {}
+                if (std.mem.eql(u8, chosen, "invalid-cmd")) {
+                    try std.testing.expectError(
+                        error.InvalidParams,
+                        manager.bindKey("prefix", "k", chosen, smith.value(bool)),
+                    );
+                } else {
+                    try manager.bindKey("prefix", "k", chosen, smith.value(bool));
+                    if (pane_ids.items.len > 0 and manager.paneCount() < max_live_panes) {
+                        const pid = pane_ids.items[smith.index(pane_ids.items.len)];
+                        if (manager.executeBinding("prefix", "k", pid)) |maybe_cmd| {
+                            if (maybe_cmd) |owned| allocator.free(owned);
+                        } else |_| {}
+                    }
                 }
             },
             .send_and_capture => {

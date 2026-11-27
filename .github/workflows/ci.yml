@@ -15,12 +15,13 @@ concurrency:
 permissions:
   contents: read
 
-# Every gate is a target in PACKAGE.ts or .smithers/PACKAGE.ts. CI runs the
-# same `smthrs ci //...` a developer runs locally: formatting, ReleaseSafe and
-# four-triple cross-compiles, per-module unit tests, integration, bounded
-# coverage-guided fuzzing, per-module benchmarks, and factory projection drift.
-# Unchanged targets replay from the local .smithers/cache (restored below) or
-# the https://build.smithers.sh remote cache when tokens are configured.
+# Every gate is a target in PACKAGE.ts or .smithers/PACKAGE.ts.
+# Trust boundary:
+# - Untrusted runs (PRs, fork contributors, local sandboxes) are encouraged and
+#   hydrate from the shared https://build.smithers.sh object store read-only
+#   (SMITHERS_CACHE_READ_TOKEN only). They can never publish cache or skip gates.
+# - Trusted runs (push to main on controlled runners / Smithers Cloud sandboxes)
+#   hold SMITHERS_CACHE_WRITE_TOKEN and publish verified results and artifacts.
 jobs:
   ci:
     name: smthrs ci //... (${{ matrix.os }})
@@ -66,6 +67,7 @@ jobs:
       - name: Every target
         run: smthrs ci '//...' ${{ matrix.exclusive }} --verbose --results-file "$RUNNER_TEMP/smthrs-results.json"
         env:
+          SMITHERS_TRUST_LEVEL: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'trusted' || 'untrusted' }}
           SMITHERS_CACHE_READ_TOKEN: ${{ secrets.SMITHERS_CACHE_READ_TOKEN }}
           SMITHERS_CACHE_WRITE_TOKEN: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.SMITHERS_CACHE_WRITE_TOKEN || '' }}
 
@@ -92,6 +94,7 @@ jobs:
           path: |
             ${{ runner.temp }}/smthrs-results.json
             .benchmarks/
+            dist/site/
           if-no-files-found: ignore
 
   musl:

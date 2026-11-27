@@ -7,3 +7,4 @@ zig-out/
 .smithers/cache/
 .smithers/reports/
 .uphill/
+dist/

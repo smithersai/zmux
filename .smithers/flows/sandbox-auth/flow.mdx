@@ -1,0 +1,21 @@
+---
+description: Print a one-time-use attenuated authentication bundle for zmux sandboxes and Cloud MCP agents
+capabilities:
+  - "fs:read:.smithers/trust-policy.json"
+  - "proc:spawn:node .smithers/scripts/mint-sandbox-auth.mjs *"
+model: sol
+budget:
+  tokens: 16000
+  milliseconds: 60000
+---
+
+Run `node .smithers/scripts/mint-sandbox-auth.mjs` to emit a single-use OAuth 2.1
+PKCE challenge bundle, read-only `build.smithers.sh` object store bindings, and
+authenticated MCP connection commands for `https://smithers.sh/smithersai/zmux/mcp`.
+
+Hard security rules:
+- Never print `SMITHERS_CACHE_WRITE_TOKEN`, personal cookies, or GitHub PATs.
+- Untrusted agent sandboxes receive `SMITHERS_TRUST_LEVEL=untrusted` and
+  `SMITHERS_CACHE_MODE=read-only`.
+- Person-only actions (`pull/merge`, `issue/triage`, `todo/commit`,
+  `secrets/write`) remain permanently blocked for agent credentials.

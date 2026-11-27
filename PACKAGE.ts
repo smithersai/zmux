@@ -4,6 +4,7 @@ import { Smithers as S } from "@smthrs/targets"
 // puts it on PATH; set ZIG to an absolute zig when PATH carries another one,
 // for example ZIG="$(mise which zig)". The binary's bytes are cache-key input.
 const zig = S.Host.bin("zig", { env: "ZIG" })
+const node = S.Host.bin("node")
 
 // Exact per-module Zig dependency closures so Smithers invalidates and runs
 // only the unit tests and performance benchmarks whose inputs actually changed.
@@ -248,6 +249,30 @@ const benchUpdateBaseline = S.Shell.Run({
   timeout: "5m"
 })
 
+// Builds the public static docs portal, llms.txt index, Engineering Wiki,
+// Protocol Inspector, and Lighthouse Backpressure Audit Report into dist/site/.
+const docsSite = S.Shell.Build({
+  bin: node,
+  args: ["scripts/build-docs.mjs"],
+  data: [
+    S.file("scripts/build-docs.mjs"),
+    S.file("README.md"),
+    S.file("CHANGELOG.md"),
+    S.file("CONTRIBUTING.md"),
+    S.file("AGENTS.md"),
+    S.file(".agents/uphill/rules.md"),
+    S.file(".smithers/coding-project.json"),
+    S.file(".smithers/trust-policy.json"),
+    S.file(".smithers/views/backpressure/run.mjs"),
+    S.file(".smithers/views/backpressure/index.html"),
+    S.file(".smithers/playground/index.html"),
+    S.file("bench/baseline.json"),
+    S.glob(".smithers/wiki/**")
+  ],
+  outDirs: ["dist/site"],
+  timeout: "2m"
+})
+
 export const Package = S.Package({
   defaultVisibility: "public",
   targets: {
@@ -288,6 +313,7 @@ export const Package = S.Package({
     benchServer,
     benchReport,
     bench,
-    benchUpdateBaseline
+    benchUpdateBaseline,
+    docsSite
   }
 })

@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-IzFZBsR5Qu82fQSTkTZR+2Ks25YYI8Myg9lfP4DzrMY='; style-src 'sha256-txs/4a3I+B59uPjeCcgMudIWMK+q7bXFA4vAJ6Y9n3k='; base-uri 'none'; form-action 'none'; connect-src 'none'">
+<title>zmux Protocol &amp; Ring-Buffer Playground</title>
+<style>
+:root { color-scheme: light dark; font: 14.5px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+body { margin: 0; padding: clamp(16px, 3vw, 32px); background: Canvas; color: CanvasText; }
+main { max-width: 920px; margin: 0 auto; display: grid; gap: 18px; }
+header { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 10px; }
+h1 { margin: 0; font-size: clamp(22px, 4vw, 32px); letter-spacing: -0.02em; }
+.badge { font-family: ui-monospace, monospace; font-size: 12px; padding: 3px 9px; border: 1px solid GrayText; border-radius: 999px; }
+.card { border: 1px solid GrayText; border-radius: 12px; padding: clamp(14px, 2.5vw, 22px); display: grid; gap: 14px; }
+.presets { display: flex; flex-wrap: wrap; gap: 8px; }
+.preset-btn { font: 12.5px ui-monospace, monospace; padding: 5px 10px; border-radius: 8px; border: 1px solid GrayText; background: ButtonFace; color: ButtonText; cursor: pointer; }
+.preset-btn:hover { opacity: 0.88; }
+label { display: grid; gap: 6px; font-weight: 600; }
+textarea, select, input { font: 13px/1.45 ui-monospace, monospace; padding: 9px 10px; border: 1px solid GrayText; border-radius: 8px; background: Field; color: FieldText; width: 100%; box-sizing: border-box; }
+textarea { min-height: 92px; resize: vertical; }
+.row { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+.actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+button.primary { font: inherit; font-weight: 700; padding: 8px 18px; border-radius: 8px; border: 1px solid GrayText; background: ButtonFace; color: ButtonText; cursor: pointer; }
+#status { font-size: 13px; opacity: 0.85; margin: 0; }
+pre { margin: 0; padding: 12px; border-radius: 8px; border: 1px solid GrayText; overflow-x: auto; font: 12.5px/1.45 ui-monospace, monospace; white-space: pre-wrap; word-break: break-word; }
+ul.notes { margin: 0; padding-left: 18px; display: grid; gap: 4px; font-size: 13.5px; }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>zmux JSON-RPC &amp; Scrollback Playground</h1>
+    </div>
+    <span class="badge" id="mode-badge">zmux v0.4.0 · D1-D6 Contract</span>
+  </header>
+
+  <section class="card">
+    <div class="row">
+      <label>Inspection Mode
+        <select id="mode">
+          <option value="rpc">JSON-RPC 2.0 Wire Frame</option>
+          <option value="ringbuffer">Scrollback Ring Buffer Replay</option>
+        </select>
+      </label>
+      <label id="cap-wrap" hidden>Ring Buffer Capacity (bytes)
+        <input id="capacity" type="number" value="48" min="8" max="65536">
+      </label>
+    </div>
+
+    <div id="rpc-panel">
+      <div class="presets" aria-label="Wire presets">
+        <button type="button" class="preset-btn" data-preset="ping">daemon.ping</button>
+        <button type="button" class="preset-btn" data-preset="create">session.create</button>
+        <button type="button" class="preset-btn" data-preset="attach">client.attach</button>
+        <button type="button" class="preset-btn" data-preset="subscribe">events.subscribe</button>
+        <button type="button" class="preset-btn" data-preset="respawn">pane.respawn (running)</button>
+        <button type="button" class="preset-btn" data-preset="snapshot">mux.snapshot</button>
+        <button type="button" class="preset-btn" data-preset="dup">DuplicateSessionName</button>
+        <button type="button" class="preset-btn" data-preset="badjson">Malformed JSON (-32700)</button>
+      </div>
+      <label style="margin-top:10px">Single-line JSON-RPC Frame
+        <textarea id="frame" spellcheck="false" autocomplete="off">{"jsonrpc":"2.0","id":1,"method":"client.attach","params":{"target":"work","createIfMissing":true,"rows":40,"cols":120}}</textarea>
+      </label>
+    </div>
+
+    <div id="ring-panel" hidden>
+      <label>PTY Output Chunks (one chunk per line)
+        <textarea id="chunks" spellcheck="false" autocomplete="off">zmuxd v0.4.0 starting
+$ zig build test
+468/477 tests passed
+$ echo hello-smithers
+hello-smithers</textarea>
+      </label>
+    </div>
+
+    <div class="actions">
+      <button type="button" class="primary" id="run-btn">Run Frame</button>
+      <p id="status" role="status">Ready (local deterministic wire verifier)</p>
+    </div>
+  </section>
+
+  <section class="card" id="result-card" hidden>
+    <strong>Response &amp; Wire Analysis</strong>
+    <pre id="response-out"></pre>
+    <div id="notif-wrap" hidden>
+      <strong>Server Notifications</strong>
+      <pre id="notif-out"></pre>
+    </div>
+    <div>
+      <strong>Contract Notes</strong>
+      <ul class="notes" id="notes-out"></ul>
+    </div>
+  </section>
+</main>
+<script>
+const HOST = "https://smithers.sh";
+const PRESETS = {
+  ping: '{"jsonrpc":"2.0","id":1,"method":"daemon.ping"}',
+  create: '{"jsonrpc":"2.0","id":2,"method":"session.create","params":{"id":"work","rows":40,"cols":120,"command":"bash","clearEnv":false}}',
+  attach: '{"jsonrpc":"2.0","id":3,"method":"client.attach","params":{"target":"work","createIfMissing":true,"rows":40,"cols":120}}',
+  subscribe: '{"jsonrpc":"2.0","id":4,"method":"events.subscribe","params":{"panes":["*"]}}',
+  respawn: '{"jsonrpc":"2.0","id":5,"method":"pane.respawn","params":{"target":"pane-1","kill":false}}',
+  snapshot: '{"jsonrpc":"2.0","id":6,"method":"mux.snapshot"}',
+  dup: '{"jsonrpc":"2.0","id":7,"method":"session.create","params":{"id":"duplicate","rows":24,"cols":80}}',
+  badjson: '{"jsonrpc":"2.0","id":8,"method":"daemon.ping"'
+};
+
+const KNOWN = new Set([
+  "daemon.ping","daemon.shutdown","mux.snapshot","session.create","session.info",
+  "session.list","session.terminate","session.resize","session.capture","session.send",
+  "session.sendKey","session.rename","window.new","window.select","window.rename",
+  "pane.split","pane.select","pane.rename","pane.respawn","client.attach","client.detach",
+  "client.switch","client.list","events.subscribe","key.bind","key.dispatch","key.list","command.exec"
+]);
+
+const modeEl = document.getElementById("mode");
+const capWrap = document.getElementById("cap-wrap");
+const capEl = document.getElementById("capacity");
+const rpcPanel = document.getElementById("rpc-panel");
+const ringPanel = document.getElementById("ring-panel");
+const frameEl = document.getElementById("frame");
+const chunksEl = document.getElementById("chunks");
+const runBtn = document.getElementById("run-btn");
+const statusEl = document.getElementById("status");
+const resultCard = document.getElementById("result-card");
+const responseOut = document.getElementById("response-out");
+const notifWrap = document.getElementById("notif-wrap");
+const notifOut = document.getElementById("notif-out");
+const notesOut = document.getElementById("notes-out");
+const badgeEl = document.getElementById("mode-badge");
+
+let port = null;
+let nextId = 0;
+
+function toB64(str) {
+  const bytes = new TextEncoder().encode(str);
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+
+function localExec(params) {
+  if (params.mode === "ringbuffer") {
+    const cap = Math.max(8, Math.min(65536, Number(params.capacity) || 48));
+    let total = 0;
+    let buf = "";
+    const notifications = [];
+    for (const chunk of (params.chunks || []).slice(0, 64)) {
+      const text = String(chunk) + "\n";
+      const offset = total;
+      total += new TextEncoder().encode(text).length;
+      buf += text;
+      if (buf.length > cap) buf = buf.slice(buf.length - cap);
+      notifications.push({ jsonrpc: "2.0", method: "pane_output", params: { pane_id: "pane-1", data_base64: toB64(text), offset, generation: 1 } });
+    }
+    return {
+      ok: true,
+      response: { capacity: cap, totalBytesWritten: total, retainedBytes: new TextEncoder().encode(buf).length, evictedBytes: Math.max(0, total - new TextEncoder().encode(buf).length), replayEndOffset: total, replayText: buf, replayBase64: toB64(buf) },
+      notifications,
+      notes: ["Scrollback retains the newest capacity bytes and returns replayEndOffset so attaching clients discard duplicate live bytes."]
+    };
+  }
+  const raw = String(params.frame || "");
+  if (raw.includes("\n")) return { ok: false, response: { jsonrpc: "2.0", id: null, error: { code: -32700, message: "MultilineFrameRejected", data: { kind: "parse" } } }, notifications: [], notes: ["Frames must be one physical line terminated by newline."] };
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch {
+    return { ok: false, response: { jsonrpc: "2.0", id: null, error: { code: -32700, message: "ParseError", data: { kind: "parse" } } }, notifications: [], notes: ["Decision D2: malformed JSON returns -32700 with data.kind = parse."] };
+  }
+  if (Array.isArray(parsed)) return { ok: false, response: { jsonrpc: "2.0", id: null, error: { code: -32600, message: "BatchNotSupported", data: { kind: "invalid_request" } } }, notifications: [], notes: ["Batch arrays are rejected with -32600 invalid_request."] };
+  if (!parsed || typeof parsed !== "object" || parsed.jsonrpc !== "2.0" || typeof parsed.method !== "string") {
+    return { ok: false, response: { jsonrpc: "2.0", id: null, error: { code: -32600, message: "InvalidRequest", data: { kind: "invalid_request" } } }, notifications: [], notes: ["Requires jsonrpc: 2.0 and string method."] };
+  }
+  const hasId = Object.prototype.hasOwnProperty.call(parsed, "id");
+  if (!KNOWN.has(parsed.method)) {
+    return { ok: false, response: hasId ? { jsonrpc: "2.0", id: parsed.id, error: { code: -32601, message: "MethodNotFound", data: { kind: "method_not_found" } } } : null, notifications: [], notes: ["Unknown method name."] };
+  }
+  const p = parsed.params && typeof parsed.params === "object" && !Array.isArray(parsed.params) ? parsed.params : {};
+  if (parsed.method === "session.create" && (p.id === "duplicate" || p.name === "duplicate")) {
+    return { ok: false, response: { jsonrpc: "2.0", id: parsed.id, error: { code: -32000, message: "DuplicateSessionName", data: { kind: "conflict" } } }, notifications: [], notes: ["Decision D5: session names are unique across the daemon."] };
+  }
+  if (parsed.method === "pane.respawn" && p.kill !== true) {
+    return { ok: false, response: { jsonrpc: "2.0", id: parsed.id, error: { code: -32000, message: "PaneRunning", data: { kind: "conflict" } } }, notifications: [], notes: ["Decision D4: pane.respawn defaults to kill=false on a running pane."] };
+  }
+  const notifications = [];
+  let result = { ok: true, method: parsed.method };
+  const notes = ["Validated against zmux v0.4.0 JSON-RPC 2.0 contract."];
+  if (parsed.method === "daemon.ping") result = { version: "0.4.0", pid: 42420, socketPath: "/tmp/zmux-sandbox/sessions.sock", sessions: 1, panes: 2 };
+  else if (parsed.method === "session.create") result = { sessionId: "session-1", windowId: "window-1", paneId: "pane-1", generation: 1 };
+  else if (parsed.method === "client.attach") {
+    const replay = "zmux 0.4.0 session ready\r\n$ ";
+    result = { clientId: "client-1", sessionId: "session-1", paneId: "pane-1", created: Boolean(p.createIfMissing), exited: false, exitCode: null, signal: null, generation: 1, replayBase64: toB64(replay), replayEndOffset: replay.length };
+    notes.push("Decision D4: discard live pane_output bytes below replayEndOffset in generation 1.");
+  } else if (parsed.method === "events.subscribe") {
+    result = { subscribed: Array.isArray(p.panes) ? p.panes : ["*"] };
+    notifications.push({ jsonrpc: "2.0", method: "pane_output", params: { pane_id: "pane-1", data_base64: toB64("hello from zmuxd\n"), offset: 28, generation: 1 } });
+    notes.push("Decision D1: pane_output streams only to attached or subscribed connections.");
+  } else if (parsed.method === "mux.snapshot") {
+    result = { sessions: [{ id: "session-1", name: "work", windows: [{ id: "window-1", panes: [{ id: "pane-1", generation: 1, rows: 40, cols: 120 }] }] }], clients: [{ id: "client-1", paneId: "pane-1" }] };
+  }
+  return { ok: true, response: hasId ? { jsonrpc: "2.0", id: parsed.id, result } : null, notifications, notes };
+}
+
+function paint(data) {
+  responseOut.textContent = JSON.stringify(data.response ?? data.result ?? data, null, 2);
+  const notifs = Array.isArray(data.notifications) ? data.notifications : [];
+  notifWrap.hidden = notifs.length === 0;
+  notifOut.textContent = JSON.stringify(notifs, null, 2);
+  notesOut.replaceChildren();
+  for (const note of Array.isArray(data.notes) ? data.notes : []) {
+    const li = document.createElement("li");
+    li.textContent = String(note);
+    notesOut.appendChild(li);
+  }
+  resultCard.hidden = false;
+  statusEl.textContent = data.ok ? "Frame valid" : "Contract error returned";
+}
+
+modeEl.addEventListener("change", () => {
+  const isRing = modeEl.value === "ringbuffer";
+  rpcPanel.hidden = isRing;
+  ringPanel.hidden = !isRing;
+  capWrap.hidden = !isRing;
+});
+
+for (const btn of document.querySelectorAll(".preset-btn")) {
+  btn.addEventListener("click", () => {
+    frameEl.value = PRESETS[btn.dataset.preset] || PRESETS.ping;
+  });
+}
+
+const nonce = document.documentElement.dataset.smithersNonce;
+if (parent !== window && /^[A-Za-z0-9_-]{22,128}$/.test(nonce ?? "")) {
+  window.addEventListener("message", function init(event) {
+    const reply = event.data;
+    if (event.source !== parent || event.origin !== HOST || reply?.jsonrpc !== "2.0" || reply.id !== "playground" || reply.result?.flow !== "playground/exec" || event.ports.length !== 1) return;
+    window.removeEventListener("message", init);
+    port = event.ports[0];
+    port.onmessage = (ev) => {
+      if (ev.data?.result) paint(ev.data.result);
+    };
+    badgeEl.textContent = "Smithers Sandbox Connected";
+    statusEl.textContent = "Connected to Smithers Cloud sandbox runner";
+  });
+  parent.postMessage({ jsonrpc: "2.0", id: "playground", method: "ui/initialize", params: { nonce } }, HOST);
+}
+
+runBtn.addEventListener("click", () => {
+  const params = modeEl.value === "ringbuffer"
+    ? { mode: "ringbuffer", capacity: Number(capEl.value), chunks: chunksEl.value.split("\n").filter(Boolean) }
+    : { mode: "rpc", frame: frameEl.value.trim() };
+  if (port) {
+    statusEl.textContent = "Running in Smithers sandbox...";
+    port.postMessage({ jsonrpc: "2.0", id: ++nextId, method: "playground/exec", params });
+  } else {
+    paint(localExec(params));
+  }
+});
+</script>
+</body>
+</html>

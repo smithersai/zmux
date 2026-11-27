@@ -4,10 +4,12 @@ export const Workspace = S.Workspace("smithersai-zmux", {
   repository: "git+https://github.com/smithersai/zmux.git",
   cache: S.Cache({
     directory: ".smithers/cache",
-    hostDirectories: [".zig-cache", "zig-out", ".benchmarks"],
-    // Local-first action cache. Syncs through https://build.smithers.sh when
-    // SMITHERS_CACHE_READ_TOKEN / SMITHERS_CACHE_WRITE_TOKEN are set locally
-    // or in GitHub Actions.
+    hostDirectories: [".zig-cache", "zig-out", ".benchmarks", ".uphill", "dist/site"],
+    // Shared Smithers Cloud object store (/ac + /cas at https://build.smithers.sh).
+    // Untrusted runs (forks, PRs, non-maintainer local runs, agent sandboxes) read
+    // through SMITHERS_CACHE_READ_TOKEN only and can never write or poison cache entries.
+    // Trusted runs (Smithers Cloud controlled sandboxes and post-merge main) hold
+    // SMITHERS_CACHE_WRITE_TOKEN and publish verified action results and artifacts.
     remote: S.RemoteCache.make({
       endpoint: "https://build.smithers.sh",
       read: S.Secret("SMITHERS_CACHE_READ_TOKEN"),
@@ -18,11 +20,20 @@ export const Workspace = S.Workspace("smithersai-zmux", {
   // jdx/mise-action). Targets resolve zig as a host binary whose bytes key
   // every Zig action, so bumping the pin invalidates exactly those targets.
   toolchains: [S.Mise({ config: S.file("//mise.toml") })],
-  host: S.Host({ bins: ["zig"] }),
+  host: S.Host({ bins: ["zig", "node"] }),
   sandboxes: S.Sandboxes({
     default: S.Sandbox.None()
   }),
   discovery: {
-    prune: [".zig-cache", "zig-out", ".benchmarks", ".flows", ".smithers/cache", ".smithers/reports"]
+    prune: [
+      ".zig-cache",
+      "zig-out",
+      ".benchmarks",
+      ".flows",
+      ".smithers/cache",
+      ".smithers/reports",
+      ".uphill",
+      "dist"
+    ]
   }
 })

@@ -4060,10 +4060,15 @@ test "daemon.shutdown replies, stops new work, and leaves teardown to the server
     try std.testing.expectError(error.EndOfStream, readLineTimeout(std.testing.allocator, client.fd, 2000));
     try std.testing.expect(!server.running.load(.seq_cst));
 
-    // A concurrent mutation after shutdown began is refused: the connection
-    // closes and nothing is created.
-    try bystander.send("{\"id\":2,\"method\":\"session.create\",\"params\":{\"shell\":\"/bin/sh\",\"command\":\"cat\"}}\n");
-    try std.testing.expectError(error.EndOfStream, readLineTimeout(std.testing.allocator, bystander.fd, 2000));
+    // A concurrent mutation after shutdown began is refused: the server may
+    // already have closed the bystander's socket (BrokenPipe / ConnectionResetByPeer),
+    // or close it before replying (EndOfStream). Either way, nothing is created.
+    if (bystander.send("{\"id\":2,\"method\":\"session.create\",\"params\":{\"shell\":\"/bin/sh\",\"command\":\"cat\"}}\n")) |_| {
+        try std.testing.expectError(error.EndOfStream, readLineTimeout(std.testing.allocator, bystander.fd, 2000));
+    } else |err| switch (err) {
+        error.BrokenPipe, error.ConnectionResetByPeer => {},
+        else => return err,
+    }
     try std.testing.expectEqual(@as(usize, 0), server.manager.counts().sessions);
 }
 

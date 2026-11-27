@@ -1986,13 +1986,22 @@ test "destroy terminates a running child and joins the reader" {
 }
 
 /// Type a foreground job that ignores SIGHUP into an interactive shell and
-/// return its process group once the terminal reports it.
-fn startHupIgnoringJob(native: *NativeSession, seconds: []const u8) !std.posix.pid_t {
-    var line_buf: [96]u8 = undefined;
+/// return its process group once the inner shell has installed the trap and
+/// taken ownership of the terminal.
+fn startHupIgnoringJob(rec: *Recorder, native: *NativeSession, seconds: []const u8) !std.posix.pid_t {
+    var line_buf: [144]u8 = undefined;
+    var marker_buf: [32]u8 = undefined;
+    const marker = try std.fmt.bufPrint(&marker_buf, "HUPREADY-{s}", .{seconds});
     // An ignored disposition survives exec, so the `sleep` itself ignores
-    // the hangup.
-    const line = try std.fmt.bufPrint(&line_buf, "sh -c 'trap \"\" HUP; exec sleep {s}'", .{seconds});
+    // the hangup. Split the marker in printf so terminal echo of the typed
+    // command never triggers waitForOutput before the trap is installed.
+    const line = try std.fmt.bufPrint(
+        &line_buf,
+        "sh -c 'trap \"\" HUP; printf \"HUP%s\\n\" \"READY-{s}\"; exec sleep {s}'",
+        .{ seconds, seconds },
+    );
     try native.send(line, true);
+    try rec.waitForOutput(marker, 10_000);
 
     const shell_pid = native.handle.child_pid;
     var fg_pgid: std.posix.pid_t = 0;
@@ -2000,11 +2009,9 @@ fn startHupIgnoringJob(native: *NativeSession, seconds: []const u8) !std.posix.p
     while (true) {
         try std.testing.expect(sys.monotonicMs() < deadline);
         fg_pgid = tcgetpgrp(native.handle.master_fd);
-        if (fg_pgid > 1 and fg_pgid != shell_pid) break;
+        if (fg_pgid > 1 and fg_pgid != shell_pid and processExists(fg_pgid)) break;
         sys.sleepMs(10);
     }
-    // Let the inner shell install the trap and exec.
-    sys.sleepMs(300);
     try std.testing.expect(processExists(fg_pgid));
     return fg_pgid;
 }
@@ -2016,7 +2023,7 @@ test "terminate finishes off a foreground job that ignores SIGHUP after its shel
     defer rec.deinit();
     const native = try testCreate(&rec, null, .{ .env = &.{ "HOME=/nonexistent", "PS1=zmux$ " } });
     defer native.destroy();
-    const fg_pgid = try startHupIgnoringJob(native, "9993");
+    const fg_pgid = try startHupIgnoringJob(&rec, native, "9993");
 
     // SIGHUP kills the interactive shell at once; the job ignores it. The
     // ladder must keep going for the job: SIGTERM after the hangup grace.
@@ -2033,7 +2040,7 @@ test "releasing a pane whose shell died first still terminates its foreground jo
     defer rec.deinit();
     const native = try testCreate(&rec, null, .{ .env = &.{ "HOME=/nonexistent", "PS1=zmux$ " } });
     defer native.destroy();
-    const fg_pgid = try startHupIgnoringJob(native, "9992");
+    const fg_pgid = try startHupIgnoringJob(&rec, native, "9992");
     // The reader remembers the foreground group on its polling interval.
     sys.sleepMs(foreground.poll_interval_ms + 200);
 

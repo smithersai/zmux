@@ -1,37 +1,302 @@
 {
-  "blocks": [
+  "docs": "https://smithersai.github.io/zmux/llms.txt",
+  "contributors": "role",
+  "sections": [
     {
-      "type": "text",
-      "title": "zmux factory",
-      "text": "tmux-style PTY session multiplexer in Zig: a daemon owns sessions, windows, panes, and PTYs; clients attach over a UNIX-socket JSON-RPC protocol. Incremental per-module Zig tests and benchmarks, coverage-guided fuzzing, and cross-compiled release builds run through `smthrs ci` with the build.smithers.sh cache."
-    },
-    {
-      "type": "prompt",
-      "title": "Ask about zmux",
-      "placeholder": "Describe a PTY hang, attach bug, protocol issue, or change…"
-    },
-    {
-      "type": "flows",
-      "title": "Review, reproduce, and fuzz"
-    },
-    {
-      "type": "links",
-      "links": [
+      "title": "Control room",
+      "audience": "maintainer",
+      "blocks": [
         {
-          "label": "Repository",
-          "url": "https://github.com/smithersai/zmux"
+          "type": "action",
+          "flow": "branch.new",
+          "title": "New branch",
+          "key": "b"
         },
         {
-          "label": "CI",
-          "url": "https://github.com/smithersai/zmux/actions/workflows/ci.yml"
+          "type": "issues",
+          "title": "Issues and pull requests"
         },
         {
-          "label": "Releases",
-          "url": "https://github.com/smithersai/zmux/releases"
+          "type": "runs",
+          "title": "Recent factory runs"
         },
         {
-          "label": "README",
-          "url": "https://github.com/smithersai/zmux/blob/main/README.md"
+          "type": "stack",
+          "title": "Mythical history stack"
+        },
+        {
+          "type": "view",
+          "flow": "backpressure/report"
+        },
+        {
+          "type": "links",
+          "title": "Maintainer operations",
+          "links": [
+            {
+              "label": "Cloud MCP endpoint",
+              "url": "https://smithers.sh/smithersai/zmux/mcp"
+            },
+            {
+              "label": "Live Lighthouse audit",
+              "url": "https://smithersai.github.io/zmux/audit/"
+            },
+            {
+              "label": "GitHub Actions CI",
+              "url": "https://github.com/smithersai/zmux/actions/workflows/ci.yml"
+            },
+            {
+              "label": "Release pipeline",
+              "url": "https://github.com/smithersai/zmux/actions/workflows/release.yml"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "Contribute",
+      "audience": "contributor",
+      "blocks": [
+        {
+          "type": "code",
+          "title": "Set up and verify locally",
+          "language": "sh",
+          "code": "mise install\nsmthrs ci '//...'\nuphill --compact\nclaude mcp add zmux --transport http https://smithers.sh/smithersai/zmux/mcp"
+        },
+        {
+          "type": "cards",
+          "title": "How a change lands",
+          "cards": [
+            {
+              "title": "Reproduce on a real PTY",
+              "text": "Run the failing unit, integration, or fuzz target against a real UNIX socket and PTY before patching."
+            },
+            {
+              "title": "Run untrusted checks freely",
+              "text": "Anyone can run smthrs ci and uphill locally with read-only cache hits. Untrusted runs never write cache or skip gates."
+            },
+            {
+              "title": "Open one focused change",
+              "text": "Use the Smithers Cloud MCP server to file issues, draft TODOs, and link stacked changesets with credit preserved."
+            },
+            {
+              "title": "Trusted gate and auto release",
+              "text": "A maintainer approves and runs trusted gates. Merging to GitHub publishes binaries, docs, llms.txt, and the audit report."
+            }
+          ]
+        },
+        {
+          "type": "flows",
+          "title": "Factory flows"
+        },
+        {
+          "type": "links",
+          "title": "Contributor references",
+          "links": [
+            {
+              "label": "Engineering wiki",
+              "url": "https://smithersai.github.io/zmux/wiki/"
+            },
+            {
+              "label": "Backpressure Lighthouse report",
+              "url": "https://smithersai.github.io/zmux/audit/"
+            },
+            {
+              "label": "CONTRIBUTING.md",
+              "url": "https://github.com/smithersai/zmux/blob/main/CONTRIBUTING.md"
+            },
+            {
+              "label": "Trust and cache policy",
+              "url": "https://github.com/smithersai/zmux/blob/main/.smithers/trust-policy.json"
+            }
+          ]
+        },
+        {
+          "type": "prompt",
+          "title": "Ask about zmux internals",
+          "placeholder": "Ask about PTY lifecycle, JSON-RPC framing, daemon locking, or Uphill metrics..."
+        }
+      ]
+    },
+    {
+      "audience": "everyone",
+      "blocks": [
+        {
+          "type": "hero",
+          "title": "zmux",
+          "tagline": "tmux-style PTY session multiplexer in Zig with a structured JSON-RPC UNIX socket protocol.",
+          "text": "A long-lived daemon owns sessions, windows, panes, and PTYs so desktop apps, web terminals, and agents attach and replay scrollback without shelling out to tmux.",
+          "install": "zig fetch --save=zmux git+https://github.com/smithersai/zmux",
+          "actions": [
+            {
+              "label": "Documentation",
+              "url": "https://smithersai.github.io/zmux/"
+            },
+            {
+              "label": "Lighthouse audit",
+              "url": "https://smithersai.github.io/zmux/audit/"
+            },
+            {
+              "label": "Releases",
+              "url": "https://github.com/smithersai/zmux/releases"
+            }
+          ],
+          "announcement": {
+            "label": "v0.4.0: Hardened JSON-RPC protocol, bounded replay, and Zig 0.17.1",
+            "url": "https://github.com/smithersai/zmux/releases/tag/v0.4.0"
+          }
+        },
+        {
+          "type": "stats",
+          "stats": [
+            {
+              "value": "MIT",
+              "label": "License"
+            },
+            {
+              "value": "Zig 0.17.1",
+              "label": "Toolchain"
+            },
+            {
+              "value": "0",
+              "label": "Runtime deps"
+            },
+            {
+              "value": "Linux · macOS",
+              "label": "arm64 and x64"
+            },
+            {
+              "value": "JSON-RPC 2.0",
+              "label": "UNIX socket API"
+            },
+            {
+              "value": "Smithers Cloud",
+              "label": "Public factory"
+            }
+          ]
+        },
+        {
+          "type": "code",
+          "title": "Quick start over UNIX socket",
+          "language": "sh",
+          "code": "zmuxd --socket /tmp/zmux.sock &\nprintf '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"daemon.ping\"}\\n' | nc -U /tmp/zmux.sock\nzmux-connect --socket /tmp/zmux.sock work --spawn-daemon"
+        },
+        {
+          "type": "code",
+          "title": "Embed in Zig",
+          "file": "src/main.zig",
+          "language": "zig",
+          "code": "const zmux = @import(\"zmux\");\n\nvar srv = try zmux.Server.init(allocator, io, \"/tmp/zmux.sock\", 60);\ndefer srv.deinit();\ntry srv.run();"
+        },
+        {
+          "type": "cards",
+          "title": "Why zmux",
+          "cards": [
+            {
+              "title": "Structured JSON-RPC over UNIX socket",
+              "text": "Every call returns typed JSON with explicit error kinds. No format strings or screen-scraping."
+            },
+            {
+              "title": "Multi-client PTY sharing",
+              "text": "Native apps, web terminals, and headless agents attach to the same daemon-owned pane together."
+            },
+            {
+              "title": "Bounded scrollback replay",
+              "text": "Ring-buffered output tracks monotonic offsets and generations so reattaching clients never miss bytes."
+            },
+            {
+              "title": "Owner-only socket security",
+              "text": "Private 0700 directories, same-UID peer credential checks, and startup locking protect every daemon."
+            },
+            {
+              "title": "Incremental Smithers builds",
+              "text": "Per-module Zig dependency closures cache tests, fuzz runs, and benchmarks in the shared cloud object store."
+            },
+            {
+              "title": "Lighthouse backpressure",
+              "text": "Continuous Uphill audits score footprint, TigerStyle, correctness, test coverage, and docs on every change."
+            }
+          ]
+        },
+        {
+          "type": "view",
+          "flow": "playground/protocol"
+        },
+        {
+          "type": "view",
+          "flow": "backpressure/report"
+        },
+        {
+          "type": "releases",
+          "title": "Releases",
+          "releases": [
+            {
+              "name": "v0.4.0",
+              "url": "https://github.com/smithersai/zmux/releases/tag/v0.4.0",
+              "date": "2026-11-24",
+              "summary": "Scoped pane_output subscriptions, offset and generation replay, strict JSON-RPC errors, and daemon hardening."
+            },
+            {
+              "name": "v0.3.0",
+              "url": "https://github.com/smithersai/zmux/releases/tag/v0.3.0",
+              "date": "2026-11-22",
+              "summary": "Migrated zmux to Zig 0.17.1 and std.Io with per-module build steps and benchmarks."
+            },
+            {
+              "name": "v0.2.1",
+              "url": "https://github.com/smithersai/zmux/releases/tag/v0.2.1",
+              "date": "2026-11-22",
+              "summary": "Fixed Linux private socket parent directory creation and permissions."
+            },
+            {
+              "name": "v0.2.0",
+              "url": "https://github.com/smithersai/zmux/releases/tag/v0.2.0",
+              "date": "2026-11-22",
+              "summary": "Added structured JSON logging, Linux /proc foreground detection, and cross-compiled musl binaries."
+            }
+          ],
+          "more": {
+            "label": "All releases",
+            "url": "https://github.com/smithersai/zmux/releases"
+          }
+        },
+        {
+          "type": "links",
+          "title": "Explore zmux",
+          "links": [
+            {
+              "label": "Documentation and llms.txt",
+              "url": "https://smithersai.github.io/zmux/"
+            },
+            {
+              "label": "Engineering wiki",
+              "url": "https://smithersai.github.io/zmux/wiki/"
+            },
+            {
+              "label": "Mythical history",
+              "url": "https://smithersai.github.io/zmux/history/"
+            },
+            {
+              "label": "Lighthouse backpressure report",
+              "url": "https://smithersai.github.io/zmux/audit/"
+            },
+            {
+              "label": "Protocol inspector",
+              "url": "https://smithersai.github.io/zmux/playground/"
+            },
+            {
+              "label": "Public MCP endpoint",
+              "url": "https://smithers.sh/smithersai/zmux/mcp"
+            },
+            {
+              "label": "GitHub repository",
+              "url": "https://github.com/smithersai/zmux"
+            }
+          ]
+        },
+        {
+          "type": "prompt",
+          "title": "Questions about zmux?",
+          "placeholder": "Describe a PTY hang, attach bug, protocol question, or feature idea..."
         }
       ]
     }

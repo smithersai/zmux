@@ -1,0 +1,15 @@
+---
+description: Render the zmux Lighthouse-style backpressure audit report across Uphill metrics, fuzz coverage, benchmarks, and trust provenance
+flows: [backpressure/native]
+disable-model-invocation: true
+placement: sandbox
+capabilities:
+  - "fs:read:**"
+  - "proc:spawn:node .smithers/views/backpressure/run.mjs *"
+effects:
+  reads: [".uphill/**", ".agents/uphill/**", "bench/baseline.json", ".smithers/trust-policy.json", "src/**", "test/fuzz/**"]
+  writes: []
+budget:
+  milliseconds: 25000
+---
+Run the bounded zmux Lighthouse backpressure audit collector and return its structured JSON audit report with category gauges, per-module diagnostics, ranked opportunities, and trust provenance.

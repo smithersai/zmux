@@ -1,5 +1,5 @@
 {
-  "summary": "zmux: incremental Zig 0.17.1 CI with per-module tests and benchmarks, coverage-guided protocol and live-PTY fuzzing, and maintainer triage.",
+  "summary": "zmux: public Smithers Cloud Zig factory with shared object store, Lighthouse backpressure audits, wiki, and auto releases.",
   "flows": [
     {
       "id": "checks/review",
@@ -13,22 +13,6 @@
       ],
       "model": null,
       "modelInvocable": true,
-      "inputSchema": {
-        "dialect": "draft-2020-12",
-        "schema": {
-          "type": "object",
-          "properties": {
-            "args": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "args"
-          ],
-          "additionalProperties": true
-        },
-        "definitions": {}
-      },
       "flows": [
         "coding/ReviewCheck"
       ]
@@ -49,22 +33,6 @@
       ],
       "model": "sol",
       "modelInvocable": true,
-      "inputSchema": {
-        "dialect": "draft-2020-12",
-        "schema": {
-          "type": "object",
-          "properties": {
-            "args": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "args"
-          ],
-          "additionalProperties": true
-        },
-        "definitions": {}
-      },
       "flows": [],
       "budget": {
         "tokens": 64000,
@@ -88,22 +56,6 @@
       ],
       "model": "sol",
       "modelInvocable": true,
-      "inputSchema": {
-        "dialect": "draft-2020-12",
-        "schema": {
-          "type": "object",
-          "properties": {
-            "args": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "args"
-          ],
-          "additionalProperties": true
-        },
-        "definitions": {}
-      },
       "flows": [],
       "budget": {
         "tokens": 100000,
@@ -124,22 +76,6 @@
       ],
       "model": "sol",
       "modelInvocable": true,
-      "inputSchema": {
-        "dialect": "draft-2020-12",
-        "schema": {
-          "type": "object",
-          "properties": {
-            "args": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "args"
-          ],
-          "additionalProperties": true
-        },
-        "definitions": {}
-      },
       "flows": [],
       "budget": {
         "tokens": 64000,
@@ -162,40 +98,185 @@
       ],
       "model": "sol",
       "modelInvocable": true,
-      "inputSchema": {
-        "dialect": "draft-2020-12",
-        "schema": {
-          "type": "object",
-          "properties": {
-            "args": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "args"
-          ],
-          "additionalProperties": true
-        },
-        "definitions": {}
-      },
       "flows": [],
       "budget": {
         "tokens": 64000,
         "milliseconds": 3600000
       }
+    },
+    {
+      "id": "backpressure/report",
+      "description": "Render the zmux Lighthouse-style backpressure audit report across Uphill metrics, fuzz coverage, benchmarks, and trust provenance",
+      "summary": "Generate the Lighthouse-style Uphill backpressure audit report with trust provenance and ranked opportunities.",
+      "featured": true,
+      "kind": "mdx",
+      "path": ".smithers/flows/backpressure/report/flow.mdx",
+      "capabilities": [
+        "fs:read:**",
+        "proc:spawn:node .smithers/views/backpressure/run.mjs *"
+      ],
+      "model": null,
+      "modelInvocable": false,
+      "flows": [
+        "backpressure/native"
+      ],
+      "budget": {
+        "milliseconds": 25000
+      }
+    },
+    {
+      "id": "backpressure/native",
+      "description": "Collect the zmux Lighthouse backpressure audit JSON (Uphill scores, fuzz harnesses, benchmarks, and trust provenance)",
+      "summary": null,
+      "featured": false,
+      "kind": "ts",
+      "path": ".smithers/flows/backpressure/native/flow.ts",
+      "capabilities": [
+        "fs:read:**",
+        "proc:spawn:node .smithers/views/backpressure/run.mjs *"
+      ],
+      "model": null,
+      "modelInvocable": false,
+      "flows": []
+    },
+    {
+      "id": "playground/protocol",
+      "description": "Validate and simulate zmux UNIX-socket JSON-RPC 2.0 protocol frames against the v0.4.0 D1-D6 wire contract",
+      "summary": "Inspect and validate zmux JSON-RPC 2.0 frames against the v0.4.0 D1-D6 wire contract.",
+      "featured": true,
+      "kind": "mdx",
+      "path": ".smithers/flows/playground/protocol/flow.mdx",
+      "capabilities": [
+        "fs:read:**",
+        "proc:spawn:node .smithers/playground/run.mjs *"
+      ],
+      "model": null,
+      "modelInvocable": false,
+      "flows": [
+        "playground/native"
+      ],
+      "budget": {
+        "milliseconds": 10000
+      }
+    },
+    {
+      "id": "playground/native",
+      "description": "Validate bounded zmux JSON-RPC 2.0 frames against the v0.4.0 D1-D6 contract",
+      "summary": null,
+      "featured": false,
+      "kind": "ts",
+      "path": ".smithers/flows/playground/native/flow.ts",
+      "capabilities": [
+        "fs:read:**",
+        "proc:spawn:node .smithers/playground/run.mjs *"
+      ],
+      "model": null,
+      "modelInvocable": false,
+      "flows": []
+    },
+    {
+      "id": "uphill",
+      "description": "Run Uphill continuous metrics, validate metric definitions, and report compact scores and opportunities.",
+      "summary": "Run Uphill continuous metrics, verify baselines, and score footprint, TigerStyle, correctness, testing, and docs.",
+      "featured": true,
+      "kind": "ts",
+      "path": ".smithers/flows/uphill/flow.ts",
+      "capabilities": [
+        "proc:spawn:uphill *"
+      ],
+      "model": null,
+      "modelInvocable": true,
+      "flows": []
+    },
+    {
+      "id": "wiki/refresh",
+      "description": "Refresh and verify the zmux engineering wiki and mythical history pages from .smithers/coding-project.json",
+      "summary": "Refresh and citation-check the zmux engineering wiki and mythical history from coding-project.json.",
+      "featured": true,
+      "kind": "mdx",
+      "path": ".smithers/flows/wiki/refresh/flow.mdx",
+      "capabilities": [
+        "fs:read:**",
+        "fs:write:.smithers/wiki/**",
+        "proc:spawn:node .smithers/scripts/validate-factory.mjs *",
+        "proc:spawn:jj --no-pager *"
+      ],
+      "model": "sol",
+      "modelInvocable": true,
+      "flows": [],
+      "budget": {
+        "tokens": 64000,
+        "milliseconds": 900000
+      }
+    },
+    {
+      "id": "sandbox-auth",
+      "description": "Print a one-time-use attenuated authentication bundle for zmux sandboxes and Cloud MCP agents",
+      "summary": "Print one-time-use attenuated OAuth PKCE and read-only cache auth bundles for zmux sandboxes and MCP agents.",
+      "featured": true,
+      "kind": "mdx",
+      "path": ".smithers/flows/sandbox-auth/flow.mdx",
+      "capabilities": [
+        "fs:read:.smithers/trust-policy.json",
+        "proc:spawn:node .smithers/scripts/mint-sandbox-auth.mjs *"
+      ],
+      "model": "sol",
+      "modelInvocable": true,
+      "flows": [],
+      "budget": {
+        "tokens": 16000,
+        "milliseconds": 60000
+      }
     }
   ],
   "on": [
     {
+      "event": "issue.labeled:todo",
+      "flow": "issue/poc",
+      "description": "Implement every maintainer-approved TODO as a stacked Change on mythical history"
+    },
+    {
+      "event": "change.opened",
+      "flow": "checks/review",
+      "description": "Review every opened Change across PTY, protocol, daemon, and memory lenses"
+    },
+    {
+      "event": "change.updated",
+      "flow": "checks/review",
+      "description": "Re-review updated Changes before maintainer approval and landing"
+    },
+    {
+      "event": "change.landed",
+      "flow": [
+        "wiki/refresh",
+        "uphill"
+      ],
+      "description": "Refresh the engineering wiki and Lighthouse backpressure audit after every landing"
+    },
+    {
+      "event": "github.push:main",
+      "flow": [
+        "wiki/refresh",
+        "uphill"
+      ],
+      "description": "Refresh wiki and backpressure baseline after merges mirrored to GitHub main"
+    },
+    {
       "event": "schedule:0 14 * * 1",
       "flow": "fuzz-soak",
-      "description": "Weekly Monday extended fuzz soak of the protocol, line reader, and live PTY/daemon targets"
+      "description": "Weekly Monday extended fuzz soak of protocol, line reader, and live PTY/daemon targets"
+    },
+    {
+      "event": "schedule:0 9 * * *",
+      "flow": "backpressure/report",
+      "description": "Daily Lighthouse backpressure audit across all Zig modules"
     }
   ],
   "github": {
-    "mirror": "pull",
-    "issues": "read",
-    "changes": "send-upstream",
+    "mirror": "push",
+    "issues": "two-way",
+    "changes": "land",
+    "dailyTokens": 500000000,
     "protectedPaths": [
       "src/protocol.zig",
       "src/sys.zig",
@@ -204,7 +285,16 @@
       "src/native.zig",
       "build.zig",
       "build.zig.zon",
-      ".github/workflows/release.yml"
+      "PACKAGE.ts",
+      ".smithers/WORKSPACE.ts",
+      ".smithers/FACTORY.ts",
+      ".smithers/PACKAGE.ts",
+      ".smithers/trust-policy.json",
+      ".agents/uphill/uphill.yaml",
+      ".agents/uphill/uphill.baseline.yaml",
+      ".github/workflows/ci.yml",
+      ".github/workflows/release.yml",
+      ".github/workflows/uphill.yml"
     ],
     "maintainers": [
       "roninjin10"

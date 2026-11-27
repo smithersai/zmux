@@ -1,0 +1,166 @@
+{
+  "wiki": true,
+  "wikiOutput": "dist/site/wiki",
+  "reviewer": "zmux-public-engineering-v1",
+  "implementation": "issue/poc",
+  "seats": {
+    "checks/review": "auto",
+    "issue/repro": "auto",
+    "issue/poc": "auto",
+    "pr-triage": "auto",
+    "fuzz-soak": "auto",
+    "wiki/refresh": "auto"
+  },
+  "pages": [
+    {
+      "id": "start-here",
+      "title": "Start here",
+      "purpose": "Orient new contributors, viewers, and agents to zmux architecture, binaries, modules, and factory workflows.",
+      "kind": "current",
+      "document": ".smithers/wiki/pages/start-here.md",
+      "inputs": [
+        "README.md",
+        "src/main.zig",
+        "build.zig",
+        "PACKAGE.ts"
+      ],
+      "related": [
+        "pty-and-process-lifecycle",
+        "protocol-and-framing",
+        "daemon-and-security",
+        "mux-model-and-scrollback",
+        "factory-and-trust-model",
+        "mythical-history"
+      ]
+    },
+    {
+      "id": "pty-and-process-lifecycle",
+      "title": "PTY and process lifecycle",
+      "purpose": "Explain openpty/forkpty ownership, O_CLOEXEC hygiene, signal escalation ladders, and macOS/Linux foreground tracking.",
+      "kind": "current",
+      "document": ".smithers/wiki/pages/pty-and-process-lifecycle.md",
+      "inputs": [
+        "src/pty.zig",
+        "src/foreground.zig",
+        "src/sys.zig",
+        "src/native.zig"
+      ],
+      "related": [
+        "start-here",
+        "mux-model-and-scrollback",
+        "daemon-and-security",
+        "testing-fuzzing-and-benchmarks"
+      ]
+    },
+    {
+      "id": "protocol-and-framing",
+      "title": "JSON-RPC protocol and framing",
+      "purpose": "Document the UNIX-socket JSON-RPC 2.0 wire contract, v0.4.0 D1-D6 decisions, bounded parsing, and error shapes.",
+      "kind": "current",
+      "document": ".smithers/wiki/pages/protocol-and-framing.md",
+      "inputs": [
+        "src/protocol.zig",
+        "src/rpc_line_reader.zig",
+        "src/connect.zig",
+        "CHANGELOG.md"
+      ],
+      "related": [
+        "start-here",
+        "daemon-and-security",
+        "mux-model-and-scrollback",
+        "testing-fuzzing-and-benchmarks"
+      ]
+    },
+    {
+      "id": "daemon-and-security",
+      "title": "Daemon lifecycle and socket security",
+      "purpose": "Detail private 0700 socket directories, same-UID peer credentials, startup locking, and slow-client backpressure.",
+      "kind": "current",
+      "document": ".smithers/wiki/pages/daemon-and-security.md",
+      "inputs": [
+        "src/daemon.zig",
+        "src/server.zig",
+        "src/socket_path.zig",
+        "src/log.zig"
+      ],
+      "related": [
+        "start-here",
+        "protocol-and-framing",
+        "pty-and-process-lifecycle",
+        "factory-and-trust-model"
+      ]
+    },
+    {
+      "id": "mux-model-and-scrollback",
+      "title": "Mux model and scrollback replay",
+      "purpose": "Explain sessions, windows, panes, multi-client attach/switch, bounded ring-buffer scrollback, and key bindings.",
+      "kind": "current",
+      "document": ".smithers/wiki/pages/mux-model-and-scrollback.md",
+      "inputs": [
+        "src/mux.zig",
+        "src/buffer.zig",
+        "src/native.zig"
+      ],
+      "related": [
+        "start-here",
+        "pty-and-process-lifecycle",
+        "protocol-and-framing",
+        "testing-fuzzing-and-benchmarks"
+      ]
+    },
+    {
+      "id": "testing-fuzzing-and-benchmarks",
+      "title": "Testing, fuzzing, benchmarks, and Uphill",
+      "purpose": "Explain per-module Zig test closures, coverage-guided and live PTY fuzzing, benchmark baselines, and Lighthouse backpressure.",
+      "kind": "current",
+      "document": ".smithers/wiki/pages/testing-fuzzing-and-benchmarks.md",
+      "inputs": [
+        "PACKAGE.ts",
+        "build.zig",
+        ".agents/uphill/uphill.yaml",
+        ".agents/uphill/rules.md"
+      ],
+      "related": [
+        "start-here",
+        "factory-and-trust-model",
+        "mythical-history"
+      ]
+    },
+    {
+      "id": "factory-and-trust-model",
+      "title": "Smithers Cloud factory, object store, and trust model",
+      "purpose": "Explain how zmux builds on Smithers Cloud, shares build.smithers.sh read-only with untrusted runs, and gates merges.",
+      "kind": "current",
+      "document": ".smithers/wiki/pages/factory-and-trust-model.md",
+      "inputs": [
+        ".smithers/WORKSPACE.ts",
+        ".smithers/FACTORY.ts",
+        ".smithers/trust-policy.json",
+        ".smithers/home.json"
+      ],
+      "related": [
+        "start-here",
+        "testing-fuzzing-and-benchmarks",
+        "mythical-history"
+      ]
+    },
+    {
+      "id": "mythical-history",
+      "title": "Mythical history, stacked changesets, and releases",
+      "purpose": "Explain how TODOs become stacked Changes on Smithers Cloud, land through trusted gates, and auto-publish releases and docs on GitHub.",
+      "kind": "current",
+      "document": ".smithers/wiki/pages/mythical-history.md",
+      "inputs": [
+        ".smithers/FACTORY.ts",
+        ".smithers/merge.json",
+        ".github/workflows/release.yml",
+        "CONTRIBUTING.md"
+      ],
+      "related": [
+        "start-here",
+        "factory-and-trust-model",
+        "testing-fuzzing-and-benchmarks"
+      ]
+    }
+  ]
+}

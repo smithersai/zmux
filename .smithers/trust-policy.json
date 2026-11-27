@@ -1,0 +1,106 @@
+{
+  "version": 1,
+  "repository": "smithersai/zmux",
+  "cloudUrl": "https://smithers.sh/smithersai/zmux",
+  "mcpEndpoint": "https://smithers.sh/smithersai/zmux/mcp",
+  "objectStore": {
+    "endpoint": "https://build.smithers.sh",
+    "protocol": "result-only-v1",
+    "actionCachePath": "/ac",
+    "casPath": "/cas",
+    "readTokenEnv": "SMITHERS_CACHE_READ_TOKEN",
+    "writeTokenEnv": "SMITHERS_CACHE_WRITE_TOKEN"
+  },
+  "maintainers": [
+    "roninjin10"
+  ],
+  "executionPolicy": {
+    "untrusted": {
+      "allowExecution": true,
+      "encourageContributions": true,
+      "receiptLabel": "untrusted",
+      "objectStoreAccess": "read-only",
+      "canWriteCache": false,
+      "canSatisfyMergeGates": false,
+      "canTriggerRelease": false,
+      "canPublishDocs": false,
+      "canModifyProtectedPaths": false,
+      "notes": "Non-maintainers and contributor sandboxes are encouraged to run smthrs ci, benchmarks, fuzzing, and Uphill audits locally or in untrusted sandboxes. Results hydrate from the shared object store read-only and never poison cache entries or bypass trusted merge gates."
+    },
+    "trusted": {
+      "receiptLabel": "trusted",
+      "objectStoreAccess": "read-write",
+      "canWriteCache": true,
+      "canSatisfyMergeGates": true,
+      "canTriggerRelease": true,
+      "canPublishDocs": true,
+      "acceptedSources": [
+        "smithers-cloud-controlled-sandbox",
+        "maintainer-signed-execution",
+        "github-actions-main-branch"
+      ],
+      "requiredActors": [
+        "roninjin10"
+      ],
+      "notes": "Only executions inside Smithers-controlled sandboxes or directly run by maintainers publish cache entries to build.smithers.sh, satisfy required merge gates, and trigger GitHub mirror releases and docs publishing."
+    }
+  },
+  "mcpPolicy": {
+    "transport": "streamable-http",
+    "authProtocol": "oauth-2.1-pkce-s256",
+    "tokenPrefix": "sma_",
+    "sandboxCredentialFlow": "sandbox-auth",
+    "oneTimeAuthCodeTtlSeconds": 300,
+    "agentAttributionFormat": "<login> (agent)",
+    "allowedAgentActions": [
+      "repo_tree",
+      "repo_read_file",
+      "repo_refs",
+      "docs_list",
+      "docs_read",
+      "flows_list",
+      "flow_get",
+      "issues_list",
+      "issue_get",
+      "issue_create",
+      "issue_comment",
+      "pulls_list",
+      "pull_get",
+      "pull_files",
+      "todo_list",
+      "todo_draft",
+      "work_link_post"
+    ],
+    "personOnlyBlockedActions": [
+      "pull/merge",
+      "issue/triage",
+      "issue/commitment",
+      "triage/enable",
+      "triage/pause",
+      "todo/commit",
+      "todo/drop",
+      "secrets/write",
+      "runner/register",
+      "model/write"
+    ]
+  },
+  "protectedPaths": [
+    "src/protocol.zig",
+    "src/sys.zig",
+    "src/pty.zig",
+    "src/daemon.zig",
+    "src/native.zig",
+    "build.zig",
+    "build.zig.zon",
+    "PACKAGE.ts",
+    ".smithers/WORKSPACE.ts",
+    ".smithers/FACTORY.ts",
+    ".smithers/PACKAGE.ts",
+    ".smithers/trust-policy.json",
+    ".agents/uphill/uphill.yaml",
+    ".agents/uphill/uphill.baseline.yaml",
+    ".github/workflows/ci.yml",
+    ".github/workflows/release.yml",
+    ".github/workflows/uphill.yml"
+  ]
+}

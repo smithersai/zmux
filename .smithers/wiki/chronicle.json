@@ -1,0 +1,305 @@
+{
+  "generatedFrom": "jj log -r ::main",
+  "commits": [
+    {
+      "sha": "9d241246",
+      "date": "2026-11-26",
+      "author": "William Cory",
+      "subject": "chore(uphill): add Uphill continuous metrics, baseline, rules, CI workflow, and Smithers flow"
+    },
+    {
+      "sha": "693d92a0",
+      "date": "2026-11-24",
+      "author": "William Cory",
+      "subject": "merge: land v0.4.0 Round-2 and Round-3 hardening fixes onto main"
+    },
+    {
+      "sha": "6b78b45d",
+      "date": "2026-11-24",
+      "author": "William Cory",
+      "subject": "fix(r3): re-entrant sink barrier, finalized exit gating, reap pgid cleanup, and CI/doc polish"
+    },
+    {
+      "sha": "4b331f45",
+      "date": "2026-11-23",
+      "author": "William Cory",
+      "subject": "fix(r2-t3): fix spawn-daemon dirs, connect reconciliation, CI/release gates, bump 0.4.0"
+    },
+    {
+      "sha": "247c47bf",
+      "date": "2026-11-23",
+      "author": "William Cory",
+      "subject": "fix(r2-t2): fix C01 event-sink UAF, daemon lock lifetime, attach/respawn ordering, server safety"
+    },
+    {
+      "sha": "2015ef7c",
+      "date": "2026-11-23",
+      "author": "William Cory",
+      "subject": "fix(r2-t1): harden pty, native, sys, foreground, protocol, line_reader"
+    },
+    {
+      "sha": "77530a00",
+      "date": "2026-11-23",
+      "author": "William Cory",
+      "subject": "integrate: round-1 review fixes across T1-T5 (macOS + Linux verified)"
+    },
+    {
+      "sha": "82e64d2e",
+      "date": "2026-11-23",
+      "author": "William Cory",
+      "subject": "merge: land round-1 review fixes (T1-T5) onto main"
+    },
+    {
+      "sha": "1d3b1625",
+      "date": "2026-11-23",
+      "author": "William Cory",
+      "subject": "build(smithers): add zmux software factory and dogfood smthrs ci"
+    },
+    {
+      "sha": "aabf28c2",
+      "date": "2026-11-23",
+      "author": "William Cory",
+      "subject": "fix(connect,native): never surface corrupt base64 from handleServerLine fast path; mask wait-status decoding"
+    },
+    {
+      "sha": "ff1674b7",
+      "date": "2026-11-23",
+      "author": "William Cory",
+      "subject": "integrate: round-1 review fixes across T1-T5"
+    },
+    {
+      "sha": "a386af1b",
+      "date": "2026-11-22",
+      "author": "William Cory",
+      "subject": "fix: harden client and release checks for round 1 track T5"
+    },
+    {
+      "sha": "97e6dc84",
+      "date": "2026-11-22",
+      "author": "William Cory",
+      "subject": "T4: server/daemon lifecycle, socket security, scoped pane_output routing (review round 1)"
+    },
+    {
+      "sha": "a19326b7",
+      "date": "2026-11-22",
+      "author": "William Cory",
+      "subject": "mux: Round-1 Track T3 fixes (C1, H5, H19-H21, M22-M26, L5-L10, L17, L26)"
+    },
+    {
+      "sha": "470c316c",
+      "date": "2026-11-22",
+      "author": "William Cory",
+      "subject": "T2: harden PTY, NativeSession and sys per review round-1"
+    },
+    {
+      "sha": "8ce98cf6",
+      "date": "2026-11-22",
+      "author": "William Cory",
+      "subject": "perf(zmux): add incremental Smithers benchmarks and fix major bottlenecks"
+    },
+    {
+      "sha": "af7477df",
+      "date": "2026-11-22",
+      "author": "William Cory",
+      "subject": "test(fuzz): add coverage-guided fuzz suite and benchmark scaffolding"
+    },
+    {
+      "sha": "bb5bc114",
+      "date": "2026-11-22",
+      "author": "William Cory",
+      "subject": "Track T1: harden protocol, foreground, log, line reader, and scrollback (review round 1)"
+    },
+    {
+      "sha": "089e9a8d",
+      "date": "2026-11-22",
+      "author": "William Cory",
+      "subject": "Add review round-1 Phase 0 contract stubs"
+    },
+    {
+      "sha": "82cc8929",
+      "date": "2026-11-22",
+      "author": "William Cory",
+      "subject": "Merge the Zig 0.15.2 maintenance hotfix"
+    },
+    {
+      "sha": "97cce865",
+      "date": "2026-11-22",
+      "author": "William Cory",
+      "subject": "release(v0.2.1): fix Linux socket parent permissions"
+    },
+    {
+      "sha": "335234ec",
+      "date": "2026-11-22",
+      "author": "William Cory",
+      "subject": "feat(v0.3.0): migrate zmux to Zig 0.17.1 and std.Io"
+    },
+    {
+      "sha": "1b822bad",
+      "date": "2026-11-22",
+      "author": "William Cory",
+      "subject": "release(v0.2.0): bump version, sync README, add CHANGELOG"
+    },
+    {
+      "sha": "6f48be5a",
+      "date": "2026-11-22",
+      "author": "William Cory",
+      "subject": "fix(rpc): handle Linux POLL.HUP without POLL.IN when draining EOF lines"
+    },
+    {
+      "sha": "8fc26861",
+      "date": "2026-11-22",
+      "author": "William Cory",
+      "subject": "feat(observability): add structured logger, socket path cap, and race-free socket bind"
+    },
+    {
+      "sha": "d088ddb0",
+      "date": "2026-11-22",
+      "author": "William Cory",
+      "subject": "feat(foreground): implement Linux /proc comm and cmdline inspection"
+    },
+    {
+      "sha": "9e435dcb",
+      "date": "2026-11-22",
+      "author": "William Cory",
+      "subject": "ci: bump GitHub Actions to Node 24, add fmt/cross-compile/smoke checks"
+    },
+    {
+      "sha": "4e7071e6",
+      "date": "2026-07-02",
+      "author": "William Cory",
+      "subject": "docs: bring README in line with the code; export connect module (audit batch G)"
+    },
+    {
+      "sha": "a04f331a",
+      "date": "2026-07-02",
+      "author": "William Cory",
+      "subject": "test: complete audit-driven coverage (audit batch F)"
+    },
+    {
+      "sha": "52268b54",
+      "date": "2026-07-02",
+      "author": "William Cory",
+      "subject": "feat: detach key, management verbs, richer key input (audit batch E)"
+    },
+    {
+      "sha": "b743fa18",
+      "date": "2026-07-02",
+      "author": "William Cory",
+      "subject": "ci: add test workflow and harden release pipeline (audit batch G/CI)"
+    },
+    {
+      "sha": "2c419e8d",
+      "date": "2026-07-02",
+      "author": "William Cory",
+      "subject": "fix: daemon hardening & security (audit batch D)"
+    },
+    {
+      "sha": "2ae7f257",
+      "date": "2026-07-02",
+      "author": "William Cory",
+      "subject": "fix: PTY and client robustness (audit batch C)"
+    },
+    {
+      "sha": "15ade62c",
+      "date": "2026-07-02",
+      "author": "William Cory",
+      "subject": "fix: mux model correctness (audit batch B)"
+    },
+    {
+      "sha": "90e0b5d0",
+      "date": "2026-07-02",
+      "author": "William Cory",
+      "subject": "fix: daemon lifecycle & concurrency core (audit batch A)"
+    },
+    {
+      "sha": "da6bad3f",
+      "date": "2026-07-02",
+      "author": "William Cory",
+      "subject": "✅ test(integration): handle async RPC notifications"
+    },
+    {
+      "sha": "207549a1",
+      "date": "2026-07-02",
+      "author": "William Cory",
+      "subject": "✅ test(connect): cover RPC response handling"
+    },
+    {
+      "sha": "dfb6c2d0",
+      "date": "2026-07-02",
+      "author": "William Cory",
+      "subject": "✅ test(mux): cover client switching and split cleanup"
+    },
+    {
+      "sha": "e7151392",
+      "date": "2026-07-02",
+      "author": "William Cory",
+      "subject": "✅ test(server): cover mux argument parsing"
+    },
+    {
+      "sha": "53afe8cf",
+      "date": "2026-07-02",
+      "author": "William Cory",
+      "subject": "✅ test(protocol): cover JSON-RPC id handling"
+    },
+    {
+      "sha": "a859fa08",
+      "date": "2026-06-18",
+      "author": "William Cory",
+      "subject": "👷 ci(release): build and publish prebuilt binaries on v* tags"
+    },
+    {
+      "sha": "9c581d5a",
+      "date": "2026-05-09",
+      "author": "Will Cory",
+      "subject": "Merge pull request #1 from patcito/fix/connect-create-or-attach"
+    },
+    {
+      "sha": "3fe07e07",
+      "date": "2026-05-08",
+      "author": "Patrick Aljord",
+      "subject": "perf: remove ~350ms keystroke latency floor"
+    },
+    {
+      "sha": "a4327f4c",
+      "date": "2026-05-08",
+      "author": "Patrick Aljord",
+      "subject": "fix(connect): forward input to canonical paneId, not the user's name"
+    },
+    {
+      "sha": "a09806e3",
+      "date": "2026-05-08",
+      "author": "Patrick Aljord",
+      "subject": "fix: make zmux-connect \"open or create\" by name match the README"
+    },
+    {
+      "sha": "d3fe3cff",
+      "date": "2026-05-07",
+      "author": "William Cory",
+      "subject": "Fix session daemon hangups"
+    },
+    {
+      "sha": "b03b0c37",
+      "date": "2026-05-07",
+      "author": "William Cory",
+      "subject": "🐛 fix(server): preserve replacement sockets on shutdown"
+    },
+    {
+      "sha": "eb764732",
+      "date": "2026-05-07",
+      "author": "William Cory",
+      "subject": "docs: rename Tabmonsters references to Smithers App"
+    },
+    {
+      "sha": "c146b430",
+      "date": "2026-05-07",
+      "author": "William Cory",
+      "subject": "feat: initial release of zmux"
+    },
+    {
+      "sha": "00000000",
+      "date": "1969-12-31",
+      "author": "",
+      "subject": ""
+    }
+  ]
+}

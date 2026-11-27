@@ -1,0 +1,15 @@
+---
+description: Validate and simulate zmux UNIX-socket JSON-RPC 2.0 protocol frames against the v0.4.0 D1-D6 wire contract
+flows: [playground/native]
+disable-model-invocation: true
+placement: sandbox
+capabilities:
+  - "fs:read:**"
+  - "proc:spawn:node .smithers/playground/run.mjs *"
+effects:
+  reads: [".smithers/playground/**"]
+  writes: []
+budget:
+  milliseconds: 10000
+---
+Validate one bounded JSON-RPC 2.0 request frame against the zmux v0.4.0 wire contract and return contract check results and the simulated daemon response frame.

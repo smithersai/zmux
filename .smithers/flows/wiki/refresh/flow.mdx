@@ -1,0 +1,25 @@
+---
+description: Refresh and verify the zmux engineering wiki and mythical history pages from .smithers/coding-project.json
+capabilities:
+  - "fs:read:**"
+  - "fs:write:.smithers/wiki/**"
+  - "proc:spawn:node .smithers/scripts/validate-factory.mjs *"
+  - "proc:spawn:jj --no-pager *"
+model: sol
+budget:
+  tokens: 64000
+  milliseconds: 900000
+---
+
+Refresh the zmux engineering wiki under `.smithers/wiki/` using the page catalog
+in `.smithers/coding-project.json`.
+
+Rules:
+1. Read only public repository files listed in `.smithers/coding-project.json`.
+   Never include hidden secrets, runtime caches, `.env`, or credentials.
+2. Every factual claim about PTY lifecycle, JSON-RPC D1-D6 wire rules, daemon
+   locking, scrollback replay, benchmarks, or trust boundaries must cite the
+   exact owning source file.
+3. Keep public prose free of semicolons and em dashes.
+4. Run `node .smithers/scripts/validate-factory.mjs --wiki` and verify exit 0
+   before finishing.
