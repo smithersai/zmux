@@ -4,7 +4,7 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import test from "node:test"
-import { base64Url, buildBundle, generatePkceBundle, readMode600Cookie } from "./mint-sandbox-auth.mjs"
+import { base64Url, buildBundle, generatePkceBundle, readMode600Cookie, renderShellBootstrap } from "./mint-sandbox-auth.mjs"
 
 test("generatePkceBundle creates valid RFC 7636 S256 challenge and 300s TTL", () => {
   const pkce = generatePkceBundle()
@@ -45,4 +45,13 @@ test("readMode600Cookie rejects world/group-readable cookie files", () => {
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test("renderShellBootstrap explicitly unsets SMITHERS_CACHE_WRITE_TOKEN for untrusted sandboxes", () => {
+  const bundle = buildBundle({ trusted: false }, null)
+  const sh = renderShellBootstrap(bundle)
+  assert.ok(sh.includes("unset SMITHERS_CACHE_WRITE_TOKEN"))
+  assert.ok(sh.includes('export SMITHERS_CACHE_MODE="read-only"'))
+  assert.ok(sh.includes('export SMITHERS_TRUST_LEVEL="untrusted"'))
+  assert.ok(!sh.includes("export SMITHERS_CACHE_WRITE_TOKEN="))
 })

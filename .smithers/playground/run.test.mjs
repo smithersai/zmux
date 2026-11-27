@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import test from "node:test"
-import { executePlaygroundRequest, simulateRingBuffer } from "./run.mjs"
+import { executePlaygroundRequest, simulateRingBuffer, simulateSessionTrace } from "./run.mjs"
 
 const here = dirname(fileURLToPath(import.meta.url))
 
@@ -69,4 +69,27 @@ test("index.html CSP script-src and style-src SHA-256 hashes match inline blocks
   assert.ok(html.includes(`style-src 'sha256-${styleHash}'`), `CSP style-src hash mismatch; expected sha256-${styleHash}`)
   assert.ok(html.includes(`script-src 'sha256-${scriptHash}'`), `CSP script-src hash mismatch; expected sha256-${scriptHash}`)
   assert.ok(!/\sstyle=/.test(html), "inline style= attributes violate strict style-src hash CSP")
+})
+
+test("simulateSessionTrace runs 6-step lifecycle with monotonic offsets and generation bump", () => {
+  const trace = simulateSessionTrace({ sessionId: "demo", command: "/bin/sh", input: "echo zmux-ok" })
+  assert.equal(trace.steps.length, 6)
+  assert.equal(trace.steps[0].method, "session.create")
+  assert.equal(trace.steps[1].method, "client.attach")
+  assert.equal(trace.steps[2].method, "session.send")
+  assert.equal(trace.steps[3].method, "session.capture")
+  assert.equal(trace.steps[4].method, "pane.respawn")
+  assert.equal(trace.steps[5].method, "session.terminate")
+  assert.equal(trace.notifications[0].params.offset, trace.replayEndOffset)
+  assert.equal(trace.notifications[0].params.generation, 1)
+  assert.equal(trace.notifications[1].params.generation, 2)
+  assert.equal(trace.finalGeneration, 2)
+})
+
+test("executePlaygroundRequest supports session_trace mode with D1-D6 notes", () => {
+  const out = executePlaygroundRequest({ mode: "session_trace", sessionId: "work", input: "echo hi" })
+  assert.equal(out.ok, true)
+  assert.equal(out.mode, "session_trace")
+  assert.equal(out.notifications.length, 3)
+  assert.ok(out.notes.length >= 3)
 })

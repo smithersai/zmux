@@ -205,6 +205,19 @@ export function buildBundle(options, runCredential, attachIntent = null) {
   }
 }
 
+export function renderShellBootstrap(bundle) {
+  const lines = [
+    `# One-time-use sandbox auth bootstrap for ${REPO} (expires ${bundle.oneTimeAuth.expiresAt})`,
+    ...(bundle.trust.canPublishCache ? [] : ["unset SMITHERS_CACHE_WRITE_TOKEN"]),
+    ...Object.entries(bundle.sandboxEnv).map(([k, v]) => `export ${k}=${JSON.stringify(v)}`),
+    `# Connect your agent over authenticated Cloud MCP:`,
+    `# ${bundle.mcpClients.claude}`,
+    `# ${bundle.mcpClients.codex}`,
+    `# ${bundle.mcpClients.agy}`
+  ]
+  return `${lines.join("\n")}\n`
+}
+
 async function main() {
   const args = process.argv.slice(2)
   if (args.includes("--doctor")) {
@@ -240,15 +253,7 @@ async function main() {
   const bundle = buildBundle({ trusted }, runCredential, attachIntent)
 
   if (format === "shell") {
-    const lines = [
-      `# One-time-use sandbox auth bootstrap for ${REPO} (expires ${bundle.oneTimeAuth.expiresAt})`,
-      ...Object.entries(bundle.sandboxEnv).map(([k, v]) => `export ${k}=${JSON.stringify(v)}`),
-      `# Connect your agent over authenticated Cloud MCP:`,
-      `# ${bundle.mcpClients.claude}`,
-      `# ${bundle.mcpClients.codex}`,
-      `# ${bundle.mcpClients.agy}`
-    ]
-    process.stdout.write(`${lines.join("\n")}\n`)
+    process.stdout.write(renderShellBootstrap(bundle))
     return
   }
 

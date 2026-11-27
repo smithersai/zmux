@@ -25,10 +25,12 @@ codex mcp add zmux --url https://smithers.sh/smithersai/zmux/mcp
 agy mcp add zmux --transport http https://smithers.sh/smithersai/zmux/mcp
 ```
 
-To print a one-time-use attenuated authentication bundle for an isolated agent sandbox:
+To print a one-time-use attenuated authentication bundle (or shell bootstrap) for an isolated agent sandbox, and verify live Cloud MCP and shared object store connectivity:
 
 ```sh
 node .smithers/scripts/mint-sandbox-auth.mjs
+eval "$(node .smithers/scripts/mint-sandbox-auth.mjs --shell)"
+node .smithers/scripts/mint-sandbox-auth.mjs --doctor
 ```
 
 ## Trusted vs untrusted execution

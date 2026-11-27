@@ -29,6 +29,12 @@
           "flow": "backpressure/report"
         },
         {
+          "type": "code",
+          "title": "Mint one-time sandbox auth and check Cloud MCP",
+          "language": "sh",
+          "code": "node .smithers/scripts/mint-sandbox-auth.mjs --doctor\neval \"$(node .smithers/scripts/mint-sandbox-auth.mjs --shell)\""
+        },
+        {
           "type": "links",
           "title": "Maintainer operations",
           "links": [
@@ -87,6 +93,10 @@
         {
           "type": "flows",
           "title": "Factory flows"
+        },
+        {
+          "type": "issues",
+          "title": "Open roadmap issues and TODOs"
         },
         {
           "type": "links",

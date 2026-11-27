@@ -1,5 +1,5 @@
 ---
-description: Run extended coverage-guided and live PTY fuzzing against zmux, minimize any crash, and report it with a reproducing corpus seed.
+description: Run extended cross-platform coverage-guided and live PTY fuzzing against zmux, minimize and deduplicate crashing inputs, archive seed deltas, and report regressions via Smithers MCP.
 capabilities: ["fs:read:**", "fs:write:.smithers/reports/fuzz-soak.json", "proc:spawn:zig *", "proc:spawn:rg *", "proc:spawn:jj --no-pager *"]
 model: sol
 budget:
@@ -8,17 +8,56 @@ budget:
 ---
 
 Run from the repository root with Zig 0.17.1. Do not modify source, push, or
-publish. Record `jj --no-pager log -r @ -n 1`, `zig version`, and host OS.
+publish. Record `jj --no-pager log -r @ -n 1`, `zig version`, host OS and
+architecture (Linux x86_64 or macOS arm64), and execution trust level.
 
-1. Run `zig build fuzz -Doptimize=ReleaseSafe --fuzz=1M --summary all` for the
-   protocol, line reader, buffer, mux, connect, and server targets.
-2. Run `zig build fuzz-live --fuzz=500 --summary all` for real-PTY and
-   UNIX-socket chaos targets.
-3. For any failure, capture the failing input, minimize it, identify the
-   owning module, and state whether an existing seed in `test/fuzz/corpus.zig`
-   already covers it.
+1. Run bounded coverage-guided fuzzing across every core subsystem:
+   `zig build fuzz -Doptimize=ReleaseSafe --fuzz=1M --summary all`
+   covering `buffer`, `protocol`, `rpc_line_reader`, `log`, `foreground`,
+   `socket_path`, `pty`, `native`, `mux`, `connect`, `server`, `daemon`, and
+   `sys`.
+2. Run live PTY and UNIX-socket chaos fuzzing:
+   `zig build fuzz-live --fuzz=500 --summary all`.
+3. For any failing target:
+   - Capture the exact failing seed hex and shrink/minimize it to the smallest
+     reproducing byte sequence that still triggers the same assertion, panic,
+     or error.
+   - Deduplicate crashes by owning subsystem (`src/<module>/`), symbol name,
+     and error or signal.
+   - Check `test/fuzz/corpus.zig` and the subsystem's `test/fuzz/<module>.zig`
+     to record whether an existing corpus seed already covers it.
+   - Record recommended regression seed bytes and owning subsystem for
+     archival.
+4. When invoked with authenticated Smithers Cloud MCP access and crashes are
+   found, file a deduplicated regression issue (`issue_create`) and attach the
+   archived report artifact (`work_link_post`) referencing the minimized seed.
 
 Write `.smithers/reports/fuzz-soak.json`:
-{"revision":"...","zig_version":"...","host":"...","runs":[{"step":"fuzz","iterations":"1M","status":"passed|failed"},{"step":"fuzz-live","iterations":"500","status":"passed|failed"}],"crashes":[{"module":"...","input_hex":"...","signal_or_error":"...","existing_seed":false}],"summary":"..."}
-Never fabricate pass results; a step that did not run is `skipped` with the
-reason.
+```json
+{
+  "schema": "zmux.fuzz_soak.v2",
+  "revision": "...",
+  "zig_version": "0.17.1",
+  "host": "linux-x86_64|macos-arm64",
+  "trust_level": "trusted|untrusted",
+  "runs": [
+    {"step": "fuzz", "iterations": "1M", "status": "passed|failed|skipped", "unique_paths": 0},
+    {"step": "fuzz-live", "iterations": "500", "status": "passed|failed|skipped", "unique_paths": 0}
+  ],
+  "corpus_delta": {"new_seeds": 0, "minimized_seeds": 0},
+  "crashes": [
+    {
+      "fingerprint": "module:symbol:signal",
+      "module": "src/...",
+      "input_hex": "...",
+      "minimized_hex": "...",
+      "signal_or_error": "...",
+      "existing_seed": false
+    }
+  ],
+  "summary": "..."
+}
+```
+
+Never fabricate pass results. Any step that did not run must be recorded as
+`skipped` with the concrete reason.

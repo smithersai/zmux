@@ -118,6 +118,120 @@ export function simulateRingBuffer({ capacity = 64, chunks = [] }) {
   }
 }
 
+export function simulateSessionTrace({
+  sessionId = "work",
+  command = "/bin/sh",
+  input = "echo hello-smithers",
+  scrollbackBytes = 4096
+} = {}) {
+  const safeName = String(sessionId || "work").slice(0, 64)
+  const safeCmd = String(command || "/bin/sh").slice(0, 128)
+  const safeInput = String(input || "echo hello-smithers").slice(0, 512)
+  const cap = Math.max(64, Math.min(64 * 1024 * 1024, Number(scrollbackBytes) || 4096))
+
+  const banner = `zmux 0.4.0 [${safeName}] (${safeCmd})\r\n$ `
+  const bannerBytes = Buffer.byteLength(banner, "utf8")
+  const echoed = `${safeInput}\r\n${safeInput.replace(/^echo\s+/i, "")}\r\n$ `
+  const echoedBytes = Buffer.byteLength(echoed, "utf8")
+  const totalGen1Bytes = bannerBytes + echoedBytes
+  const combined = (banner + echoed).slice(-cap)
+
+  const paneOutputNotif = {
+    jsonrpc: "2.0",
+    method: "pane_output",
+    params: {
+      pane_id: "pane-1",
+      data_base64: Buffer.from(echoed, "utf8").toString("base64"),
+      offset: bannerBytes,
+      generation: 1
+    }
+  }
+  const respawnNotif = {
+    jsonrpc: "2.0",
+    method: "pane_respawned",
+    params: { pane_id: "pane-1", generation: 2, pid: 42801 }
+  }
+  const exitNotif = {
+    jsonrpc: "2.0",
+    method: "session_exited",
+    params: { session_id: "session-1", pane_id: "pane-1", exit_code: 0, signal: null, generation: 2 }
+  }
+
+  const steps = [
+    {
+      step: 1,
+      method: "session.create",
+      request: { jsonrpc: "2.0", id: 1, method: "session.create", params: { id: safeName, rows: 40, cols: 120, command: safeCmd, scrollbackBytes: cap } },
+      response: { jsonrpc: "2.0", id: 1, result: { sessionId: "session-1", windowId: "window-1", paneId: "pane-1", generation: 1 } }
+    },
+    {
+      step: 2,
+      method: "client.attach",
+      request: { jsonrpc: "2.0", id: 2, method: "client.attach", params: { target: safeName, createIfMissing: false, rows: 40, cols: 120 } },
+      response: {
+        jsonrpc: "2.0",
+        id: 2,
+        result: {
+          clientId: "client-1",
+          sessionId: "session-1",
+          paneId: "pane-1",
+          created: false,
+          generation: 1,
+          replayBase64: Buffer.from(banner, "utf8").toString("base64"),
+          replayEndOffset: bannerBytes
+        }
+      }
+    },
+    {
+      step: 3,
+      method: "session.send",
+      request: { jsonrpc: "2.0", id: 3, method: "session.send", params: { target: "pane-1", data: `${safeInput}\n` } },
+      response: { jsonrpc: "2.0", id: 3, result: { ok: true, bytesWritten: Buffer.byteLength(`${safeInput}\n`, "utf8") } },
+      notification: paneOutputNotif
+    },
+    {
+      step: 4,
+      method: "session.capture",
+      request: { jsonrpc: "2.0", id: 4, method: "session.capture", params: { target: "pane-1", lines: 20 } },
+      response: {
+        jsonrpc: "2.0",
+        id: 4,
+        result: {
+          paneId: "pane-1",
+          text: combined,
+          textBase64: Buffer.from(combined, "utf8").toString("base64"),
+          generation: 1,
+          endOffset: totalGen1Bytes
+        }
+      }
+    },
+    {
+      step: 5,
+      method: "pane.respawn",
+      request: { jsonrpc: "2.0", id: 5, method: "pane.respawn", params: { target: "pane-1", kill: true } },
+      response: { jsonrpc: "2.0", id: 5, result: { paneId: "pane-1", generation: 2, pid: 42801 } },
+      notification: respawnNotif
+    },
+    {
+      step: 6,
+      method: "session.terminate",
+      request: { jsonrpc: "2.0", id: 6, method: "session.terminate", params: { target: "session-1" } },
+      response: { jsonrpc: "2.0", id: 6, result: { ok: true, terminated: "session-1" } },
+      notification: exitNotif
+    }
+  ]
+
+  return {
+    sessionName: safeName,
+    scrollbackCapacity: cap,
+    replayEndOffset: bannerBytes,
+    totalBytesStreamed: totalGen1Bytes,
+    finalGeneration: 2,
+    steps,
+    notifications: [paneOutputNotif, respawnNotif, exitNotif]
+  }
+}
+
 export function executePlaygroundRequest(input) {
   const mode = input?.mode ?? "rpc"
   if (mode === "ringbuffer") {
@@ -126,6 +240,27 @@ export function executePlaygroundRequest(input) {
       mode: "ringbuffer",
       contract: "zmux v0.4.0 scrollback ring buffer",
       result: simulateRingBuffer({ capacity: input.capacity, chunks: input.chunks })
+    }
+  }
+  if (mode === "session_trace") {
+    const trace = simulateSessionTrace({
+      sessionId: input.sessionId,
+      command: input.command,
+      input: input.input,
+      scrollbackBytes: input.scrollbackBytes
+    })
+    return {
+      ok: true,
+      mode: "session_trace",
+      contract: "zmux v0.4.0 D1-D6 end-to-end session lifecycle",
+      response: trace,
+      notifications: trace.notifications,
+      notes: [
+        "Decision D1: pane_output streams only to attached or subscribed clients with monotonic offset and generation.",
+        "Decision D4: client.attach returns replayEndOffset so live bytes below it are discarded without gaps or duplicates.",
+        "Decision D4: pane.respawn with kill=true emits pane_respawned advancing generation 1 -> 2 before any gen-2 output.",
+        "Decision D5: session names remain unique across the daemon until terminated."
+      ]
     }
   }
 
