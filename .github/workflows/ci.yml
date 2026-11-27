@@ -68,6 +68,7 @@ jobs:
         run: smthrs ci '//...' ${{ matrix.exclusive }} --verbose --results-file "$RUNNER_TEMP/smthrs-results.json"
         env:
           SMITHERS_TRUST_LEVEL: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'trusted' || 'untrusted' }}
+          SMITHERS_CACHE_NAMESPACE: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || '' }}
           SMITHERS_CACHE_READ_TOKEN: ${{ secrets.SMITHERS_CACHE_READ_TOKEN }}
           SMITHERS_CACHE_WRITE_TOKEN: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.SMITHERS_CACHE_WRITE_TOKEN || '' }}
 

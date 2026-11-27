@@ -148,6 +148,8 @@ function checkTrust() {
   const ciYml = readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8")
   assert(ciYml.includes("SMITHERS_CACHE_READ_TOKEN"), "ci.yml must bind read-only cache token")
   assert(ciYml.includes("SMITHERS_CACHE_WRITE_TOKEN"), "ci.yml must bind write cache token only on trusted main")
+  assert(ciYml.includes("SMITHERS_CACHE_NAMESPACE"), "ci.yml must isolate PR runs via SMITHERS_CACHE_NAMESPACE")
+  assert(!ciYml.includes("pull_request_target"), "ci.yml must never use pull_request_target")
   assert(ciYml.includes("refs/heads/main"), "ci.yml write cache token must be gated on refs/heads/main")
 }
 
@@ -212,10 +214,19 @@ function checkViews() {
   assert(authOut.trust?.writeTokensRedacted === true, "sandbox auth must redact write tokens")
   assert(authOut.sandboxEnv?.SMITHERS_CACHE_WRITE_TOKEN === undefined, "sandbox auth must never print write token")
 
-  execFileSync(process.execPath, ["--test", ".smithers/playground/run.test.mjs", ".smithers/views/backpressure/run.test.mjs"], {
-    cwd: ROOT,
-    stdio: "inherit"
-  })
+  execFileSync(
+    process.execPath,
+    [
+      "--test",
+      ".smithers/playground/run.test.mjs",
+      ".smithers/views/backpressure/run.test.mjs",
+      ".smithers/scripts/mint-sandbox-auth.test.mjs"
+    ],
+    {
+      cwd: ROOT,
+      stdio: "inherit"
+    }
+  )
 }
 
 const flags = new Set(process.argv.slice(2))

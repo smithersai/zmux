@@ -1,4 +1,4 @@
-# AGENTS.md — zmux Agent & Factory Guide
+# AGENTS.md: zmux Agent & Factory Guide
 
 Follow the [Uphill rules](.agents/uphill/rules.md), which `uphill rules --write` rewrites from each metric's description: @/Users/williamcory/zmux/.agents/uphill/rules.md
 
@@ -15,7 +15,7 @@ Follow the [Uphill rules](.agents/uphill/rules.md), which `uphill rules --write`
 ## Local verification loop
 
 1. Fast check: `zig fmt --check src test bench build.zig build.zig.zon` and affected per-module `smthrs test //:test<Module>`
-2. Factory & contract check: `smthrs test '//.smithers:...'`
+2. Factory & contract check: `smthrs test '//.smithers/...'`
 3. Lighthouse backpressure audit: `uphill --compare HEAD --compact`
 4. Full verification: `smthrs ci '//...'` and `smthrs run //:bench`
 

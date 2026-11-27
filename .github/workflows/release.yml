@@ -253,7 +253,9 @@ jobs:
           test -s dist/site/index.html
           test -s dist/site/llms.txt
           test -s dist/site/audit/index.html
+          test -s dist/site/audit/report.md
           test -s dist/site/wiki/index.html
+          test -s dist/site/history/index.html
           test -s dist/site/playground/index.html
 
       - name: Configure Pages

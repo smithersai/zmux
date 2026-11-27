@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
  * Build the static documentation site, llms.txt index, Engineering Wiki,
- * interactive Protocol Inspector, and live Lighthouse Backpressure Audit Report
- * for smithersai/zmux into dist/site/.
+ * Mythical History Chronicle, interactive Protocol Inspector, and live
+ * Lighthouse Backpressure Audit Report for smithersai/zmux into dist/site/.
  *
  * Zero external dependencies so it runs identically locally, in smthrs build
  * targets, and on GitHub Actions.
@@ -144,6 +144,10 @@ function pageShell({ title, description, active, body, prefix = "." }) {
   --accent: #0969da;
   --good: #00aa55;
   --good-bg: rgba(0, 170, 85, 0.12);
+  --avg: #b25e00;
+  --avg-bg: rgba(255, 164, 0, 0.14);
+  --poor: #c62828;
+  --poor-bg: rgba(255, 51, 51, 0.14);
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -154,6 +158,8 @@ function pageShell({ title, description, active, body, prefix = "." }) {
     --line: #30363d;
     --accent: #58a6ff;
     --good: #3fb950;
+    --avg: #f0b429;
+    --poor: #f85149;
   }
 }
 * { box-sizing: border-box }
@@ -191,7 +197,33 @@ pre code { background: transparent; padding: 0 }
 .card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 16px }
 .card h3 { margin: 0 0 6px }
 .card p { margin: 0; color: var(--muted); font-size: 14px }
-.pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--good-bg); color: var(--good) }
+.diagram {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 16px;
+  margin: 18px 0 24px;
+  overflow-x: auto;
+}
+.diagram svg { width: 100%; height: auto; display: block }
+.pill { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; margin: 0 6px 6px 0 }
+.pill.good { background: var(--good-bg); color: var(--good) }
+.pill.average { background: var(--avg-bg); color: var(--avg) }
+.pill.poor { background: var(--poor-bg); color: var(--poor) }
+.timeline { list-style: none; padding: 0; margin: 16px 0; border-left: 2px solid var(--line); margin-left: 8px }
+.timeline li { position: relative; padding: 0 0 18px 22px }
+.timeline li::before {
+  content: "";
+  position: absolute;
+  left: -7px;
+  top: 6px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg);
+}
+.timeline .meta { color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace }
 .scroll { overflow-x: auto }
 table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14px }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line) }
@@ -206,6 +238,7 @@ footer { border-top: 1px solid var(--line); margin-top: 48px; padding-top: 18px;
     <nav class="links">
       <a class="${active === "home" ? "active" : ""}" href="${prefix}/index.html">Overview</a>
       <a class="${active === "wiki" ? "active" : ""}" href="${prefix}/wiki/index.html">Engineering wiki</a>
+      <a class="${active === "history" ? "active" : ""}" href="${prefix}/history/index.html">Mythical history</a>
       <a class="${active === "audit" ? "active" : ""}" href="${prefix}/audit/index.html">Lighthouse audit</a>
       <a class="${active === "playground" ? "active" : ""}" href="${prefix}/playground/index.html">Protocol inspector</a>
       <a href="${prefix}/llms.txt">llms.txt</a>
@@ -226,15 +259,72 @@ ${body}
 `
 }
 
+const ARCHITECTURE_SVG = `<div class="diagram" aria-label="zmux runtime and Smithers Cloud factory architecture">
+<svg viewBox="0 0 920 260" xmlns="http://www.w3.org/2000/svg" role="img">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="currentColor" opacity="0.65"/>
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" stroke-opacity="0.35" stroke-width="1.5">
+    <rect x="16" y="20" width="210" height="96" rx="10" fill="currentColor" fill-opacity="0.04"/>
+    <rect x="278" y="20" width="250" height="96" rx="10" fill="currentColor" fill-opacity="0.06"/>
+    <rect x="580" y="20" width="324" height="96" rx="10" fill="currentColor" fill-opacity="0.04"/>
+    <rect x="16" y="148" width="275" height="92" rx="10" fill="currentColor" fill-opacity="0.04"/>
+    <rect x="336" y="148" width="256" height="92" rx="10" fill="currentColor" fill-opacity="0.06"/>
+    <rect x="636" y="148" width="268" height="92" rx="10" fill="currentColor" fill-opacity="0.04"/>
+    <line x1="226" y1="68" x2="274" y2="68" marker-end="url(#arrow)"/>
+    <line x1="528" y1="68" x2="576" y2="68" marker-end="url(#arrow)"/>
+    <line x1="291" y1="194" x2="332" y2="194" marker-end="url(#arrow)"/>
+    <line x1="592" y1="194" x2="632" y2="194" marker-end="url(#arrow)"/>
+  </g>
+  <g fill="currentColor" font-family="system-ui, -apple-system, sans-serif">
+    <text x="32" y="46" font-size="13" font-weight="700">Clients (Multi-Attach)</text>
+    <text x="32" y="68" font-size="12" opacity="0.78">zmux-connect CLI · Desktop</text>
+    <text x="32" y="86" font-size="12" opacity="0.78">Web terminals · MCP agents</text>
+    <text x="32" y="104" font-size="11" opacity="0.65">UNIX socket JSON-RPC 2.0</text>
+
+    <text x="294" y="46" font-size="13" font-weight="700">zmuxd Daemon (Zig 0.17.1)</text>
+    <text x="294" y="68" font-size="12" opacity="0.78">0700 dirs · same-UID peer creds</text>
+    <text x="294" y="86" font-size="12" opacity="0.78">Sessions · Windows · Panes</text>
+    <text x="294" y="104" font-size="11" opacity="0.65">Bounded scrollback + replay offsets</text>
+
+    <text x="596" y="46" font-size="13" font-weight="700">OS PTYs and Foreground Tracker</text>
+    <text x="596" y="68" font-size="12" opacity="0.78">openpty/forkpty + O_CLOEXEC hygiene</text>
+    <text x="596" y="86" font-size="12" opacity="0.78">SIGHUP -> SIGTERM -> SIGKILL ladder</text>
+    <text x="596" y="104" font-size="11" opacity="0.65">macOS libproc + Linux /proc foreground</text>
+
+    <text x="32" y="174" font-size="13" font-weight="700">Smithers Cloud + Cloud MCP</text>
+    <text x="32" y="196" font-size="12" opacity="0.78">smithers.sh/smithersai/zmux/mcp</text>
+    <text x="32" y="214" font-size="12" opacity="0.78">OAuth 2.1 PKCE · One-time sandbox auth</text>
+    <text x="32" y="230" font-size="11" opacity="0.65">Maintainer / Contributor / Viewer UI</text>
+
+    <text x="352" y="174" font-size="13" font-weight="700">Shared Object Store + Trust Gate</text>
+    <text x="352" y="196" font-size="12" opacity="0.78">build.smithers.sh (/ac + /cas)</text>
+    <text x="352" y="214" font-size="12" opacity="0.78">Untrusted runs: read-only, no gate skip</text>
+    <text x="352" y="230" font-size="11" opacity="0.65">Trusted sandboxes write cache + land</text>
+
+    <text x="652" y="174" font-size="13" font-weight="700">GitHub Mirror Auto-Publish</text>
+    <text x="652" y="196" font-size="12" opacity="0.78">4-target ReleaseSafe tarballs + SHA256</text>
+    <text x="652" y="214" font-size="12" opacity="0.78">Docs + llms.txt + Engineering Wiki</text>
+    <text x="652" y="230" font-size="11" opacity="0.65">Live Lighthouse Backpressure Audit</text>
+  </g>
+</svg>
+</div>`
+
 function main() {
   rmSync(OUT, { recursive: true, force: true })
   mkdirSync(join(OUT, "pages"), { recursive: true })
   mkdirSync(join(OUT, "wiki"), { recursive: true })
+  mkdirSync(join(OUT, "history"), { recursive: true })
   mkdirSync(join(OUT, "audit"), { recursive: true })
   mkdirSync(join(OUT, "playground"), { recursive: true })
   writeFileSync(join(OUT, ".nojekyll"), "")
 
   const project = JSON.parse(readFileSync(join(ROOT, ".smithers", "coding-project.json"), "utf8"))
+  const homeJson = JSON.parse(readFileSync(join(ROOT, ".smithers", "home.json"), "utf8"))
+  const chroniclePath = join(ROOT, ".smithers", "wiki", "chronicle.json")
+  const chronicle = existsSync(chroniclePath) ? JSON.parse(readFileSync(chroniclePath, "utf8")) : { commits: [] }
   const auditJson = JSON.parse(
     execFileSync(process.execPath, [".smithers/views/backpressure/run.mjs", '{"refresh":false}'], {
       cwd: ROOT,
@@ -242,7 +332,6 @@ function main() {
     })
   )
 
-  // Copy core Markdown documents into pages/ for llms.txt consumption.
   const coreDocs = [
     { slug: "readme.md", title: "README", summary: "Overview, installation, JSON-RPC API, and Zig embedding guide", src: "README.md" },
     { slug: "changelog.md", title: "Changelog", summary: "Release history including v0.4.0 D1 to D6 hardening decisions", src: "CHANGELOG.md" },
@@ -293,6 +382,7 @@ function main() {
       active: "wiki",
       prefix: "../..",
       body: `<p><a href="../index.html">Back to Engineering wiki</a></p>
+${page.id === "start-here" ? ARCHITECTURE_SVG : ""}
 ${renderMarkdown(rawMd)}
 <h2>Cited source files</h2>
 <p>${inputsHtml}</p>
@@ -307,7 +397,6 @@ ${relatedHtml ? `<h2>Related pages</h2><ul>${relatedHtml}</ul>` : ""}`
   writeFileSync(join(OUT, "llms.txt"), `${llmsLines.join("\n")}\n`)
   writeFileSync(join(OUT, "llms-full.txt"), `${llmsFull.join("\n")}\n`)
 
-  // Render Wiki index.
   writeFileSync(
     join(OUT, "wiki", "index.html"),
     pageShell({
@@ -317,7 +406,32 @@ ${relatedHtml ? `<h2>Related pages</h2><ul>${relatedHtml}</ul>` : ""}`
       prefix: "..",
       body: `<h1>zmux Engineering Wiki</h1>
 <p>Every page is cataloged in <code>.smithers/coding-project.json</code>, grounded in exact public source files, and validated in CI.</p>
+${ARCHITECTURE_SVG}
 <div class="grid">${wikiCards.join("\n")}</div>`
+    })
+  )
+
+  // Render Mythical History Chronicle page.
+  const commits = Array.isArray(chronicle.commits) ? chronicle.commits.slice(0, 30) : []
+  const timelineItems = commits
+    .map(
+      (c) =>
+        `<li><div class="meta">${escapeHtml(c.date || "")} · <code>${escapeHtml(c.sha || "")}</code> · ${escapeHtml(c.author || "")}</div><strong>${escapeHtml(c.subject || "")}</strong></li>`
+    )
+    .join("\n")
+  const mythicalMd = readFileSync(join(ROOT, ".smithers/wiki/pages/mythical-history.md"), "utf8")
+  writeFileSync(
+    join(OUT, "history", "index.html"),
+    pageShell({
+      title: "Mythical history",
+      description: "Chronicle of zmux releases, hardening rounds, and Smithers Cloud stacked changesets",
+      active: "history",
+      prefix: "..",
+      body: `<h1>zmux Mythical History</h1>
+<p>How TODOs become stacked Changes on Smithers Cloud, land through trusted gates, and mirror to GitHub for automated releases and docs publishing.</p>
+${renderMarkdown(mythicalMd)}
+<h2>Commit chronicle</h2>
+<ul class="timeline">${timelineItems || "<li>No recorded commits yet.</li>"}</ul>`
     })
   )
 
@@ -334,18 +448,24 @@ ${relatedHtml ? `<h2>Related pages</h2><ul>${relatedHtml}</ul>` : ""}`
     copyFileSync(join(ROOT, ".uphill", "report.html"), join(OUT, "audit", "uphill.html"))
   }
 
-  // Copy interactive Protocol Inspector view.
   copyFileSync(join(ROOT, ".smithers", "playground", "index.html"), join(OUT, "playground", "index.html"))
 
-  // Render site landing page.
   const scorePills = (auditJson.categories ?? [])
-    .map((c) => `<span class="pill">${escapeHtml(c.title)}: ${c.score}/100</span>`)
-    .join(" ")
+    .map((c) => `<span class="pill ${escapeHtml(c.band || "average")}">${escapeHtml(c.title)}: ${c.score}/100</span>`)
+    .join("")
+
+  const audienceRows = (homeJson.sections ?? [])
+    .map(
+      (s) =>
+        `<tr><td><code>${escapeHtml(s.audience)}</code></td><td>${escapeHtml(s.title || "Public landing")}</td><td>${(s.blocks || []).map((b) => `<code>${escapeHtml(b.type)}</code>`).join(" ")}</td></tr>`
+    )
+    .join("")
 
   const indexBody = `
 <h1>zmux</h1>
 <p>tmux-style PTY session multiplexer in Zig 0.17.1. A long-lived daemon owns sessions, windows, panes, and PTYs while clients attach over a UNIX-domain JSON-RPC 2.0 socket.</p>
 <p>${scorePills}</p>
+${ARCHITECTURE_SVG}
 
 <div class="grid">
   <div class="card">
@@ -362,8 +482,17 @@ ${relatedHtml ? `<h2>Related pages</h2><ul>${relatedHtml}</ul>` : ""}`
   </div>
   <div class="card">
     <h3><a href="playground/index.html">JSON-RPC Protocol Inspector</a></h3>
-    <p>Validate UNIX-socket frames, atomic client.attach replay, scoped subscriptions, and error shapes interactively.</p>
+    <p>Validate UNIX-socket frames, atomic client.attach replay, scoped subscriptions, and scrollback ring offsets interactively.</p>
   </div>
+</div>
+
+<h2>Personalized factory views on smithers.sh/smithersai/zmux</h2>
+<p><code>.smithers/home.json</code> tailors the repository home to each audience (contributors have contributed at least one change).</p>
+<div class="scroll">
+  <table>
+    <thead><tr><th>Audience</th><th>Section</th><th>Blocks</th></tr></thead>
+    <tbody>${audienceRows}</tbody>
+  </table>
 </div>
 
 <h2>Install</h2>
@@ -395,7 +524,7 @@ uphill --compact</code></pre>
     })
   )
 
-  process.stdout.write(`Built zmux docs site in ${OUT} (${project.pages.length} wiki pages, overall audit ${auditJson.overallScore}/100)\n`)
+  process.stdout.write(`Built zmux docs site in ${OUT} (${project.pages.length} wiki pages, ${commits.length} chronicle entries, overall audit ${auditJson.overallScore}/100)\n`)
 }
 
 main()

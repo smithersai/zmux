@@ -19,6 +19,7 @@ const validatorInputs = [
   S.glob("//.smithers/views/**"),
   S.glob("//.smithers/playground/**"),
   S.file("//.smithers/scripts/mint-sandbox-auth.mjs"),
+  S.file("//.smithers/scripts/mint-sandbox-auth.test.mjs"),
   S.file("//.github/workflows/ci.yml"),
   S.file("//bench/baseline.json")
 ]

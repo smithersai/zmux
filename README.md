@@ -512,7 +512,7 @@ replay their last measurement and only affected benchmarks re-run:
 mise install && export ZIG="$(mise which zig)"
 
 # Everything CI runs: fmt, ReleaseSafe + 4 cross-compiles, per-module tests,
-# integration, bounded coverage-guided fuzz, benchmarks, factory drift
+# integration, bounded coverage-guided fuzz, benchmarks, factory/home/wiki/trust checks, docs site
 smthrs ci '//...'
 
 # Also run the live PTY / UNIX-socket chaos fuzzers (exclusive tier)
@@ -521,20 +521,42 @@ smthrs ci '//...' --include-exclusive
 # Print the Markdown comparison table against bench/baseline.json
 smthrs run //:bench
 
-# Refresh bench/baseline.json from the latest cached/fresh benchmark results
-smthrs run //:benchUpdateBaseline
+# Run the Uphill Lighthouse-style backpressure audit
+uphill --compact
 
-# Regenerate .smithers/factory.json and home.json after editing FACTORY.ts
-smthrs target //.smithers:factory-write --write
+# Validate factory manifest, personalized home, trust policy, wiki, and views
+smthrs test '//.smithers/...'
+
+# Build the static docs site, llms.txt, Engineering Wiki, and Lighthouse audit
+smthrs build //:docsSite
+
+# Print a one-time-use attenuated sandbox auth bundle for Cloud MCP agents
+node .smithers/scripts/mint-sandbox-auth.mjs
 ```
 
-Results cache locally under `.smithers/cache` and sync through
-`https://build.smithers.sh` when `SMITHERS_CACHE_READ_TOKEN` and
-`SMITHERS_CACHE_WRITE_TOKEN` are set. The factory at
-`smithers.sh/smithersai/zmux` is declared in
-[`.smithers/FACTORY.ts`](.smithers/FACTORY.ts) with review, issue
-reproduction, issue proof-of-concept, PR triage, and weekly fuzz-soak flows
-under [`.smithers/flows/`](.smithers/flows).
+### Public Smithers Cloud factory, Cloud MCP, and trust model
+
+`zmux` is developed publicly on [Smithers Cloud](https://smithers.sh/smithersai/zmux)
+with a personalized UI tailored to maintainers, contributors, and viewers
+([`.smithers/home.json`](.smithers/home.json)), an engineering wiki
+([`.smithers/wiki/README.md`](.smithers/wiki/README.md)), a source-linked
+[Mythical History](https://smithersai.github.io/zmux/history/), a live
+[Lighthouse Backpressure Audit Report](https://smithersai.github.io/zmux/audit/),
+and an interactive [JSON-RPC Protocol Inspector](https://smithersai.github.io/zmux/playground/).
+
+- **Authenticated Cloud MCP:** Connect your coding agent over OAuth 2.1 + PKCE
+  to `https://smithers.sh/smithersai/zmux/mcp` (`claude mcp add zmux --transport http https://smithers.sh/smithersai/zmux/mcp`)
+  to create and manage issues, TODOs, pull requests, artifacts, and stacked changesets.
+- **Shared object store & trust boundary:** Results cache locally under
+  `.smithers/cache` and sync through `https://build.smithers.sh`. Non-maintainers
+  and contributor sandboxes are encouraged to run checks untrusted with read-only
+  cache access (`SMITHERS_CACHE_READ_TOKEN`), while only Smithers-controlled
+  sandboxes and maintainer gates write to the shared cache, clear merge gates,
+  and trigger automatic GitHub releases and docs publishing ([`.smithers/trust-policy.json`](.smithers/trust-policy.json)).
+- **Factory flows & wiki:** Declared in [`.smithers/FACTORY.ts`](.smithers/FACTORY.ts),
+  [`.smithers/factory.json`](.smithers/factory.json), and [`.smithers/coding-project.json`](.smithers/coding-project.json).
+  See [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`AGENTS.md`](AGENTS.md) for the
+  complete contribution and agent workflow.
 
 You can also invoke individual suites directly with Zig:
 
