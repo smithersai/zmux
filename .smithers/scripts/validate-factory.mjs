@@ -171,6 +171,8 @@ function checkWiki() {
     assert(existsSync(docFull), `wiki page document missing: ${page.document}`)
     const md = readFileSync(docFull, "utf8")
     assert(md.trim().length >= 300, `wiki page ${page.document} is too short`)
+    assert(!md.toLowerCase().includes("jjhub"), `wiki page ${page.document} must not contain internal codename`)
+    assert(!md.includes("—"), `wiki page ${page.document} must not contain em dashes`)
     assert(Array.isArray(page.inputs) && page.inputs.length > 0, `wiki page ${page.id} must declare inputs`)
     for (const input of page.inputs) {
       assert(!forbiddenSegments.test(input), `forbidden input in wiki catalog: ${input}`)
