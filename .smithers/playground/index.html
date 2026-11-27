@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-jg16QZ0faLZKxCO/rFZ0tk59rJRLlm1rpG5e/4hMPFY='; style-src 'sha256-9nMAWQQ6QJkdE/Lmq/ZvWN77wrgpBTbLVspVVoeualg='; base-uri 'none'; form-action 'none'; connect-src 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-549pukNHBYb7r5UmNvhWgn1dISq9EVh9xDnLPAOR8aI='; style-src 'sha256-9nMAWQQ6QJkdE/Lmq/ZvWN77wrgpBTbLVspVVoeualg='; base-uri 'none'; form-action 'none'; connect-src 'none'">
 <title>zmux Protocol &amp; Ring-Buffer Playground</title>
 <style>
 :root { color-scheme: light dark; font: 14.5px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
@@ -100,7 +100,7 @@ ul.notes { margin: 0; padding-left: 18px; display: grid; gap: 4px; font-size: 13
       <label>PTY Output Chunks (one chunk per line)
         <textarea id="chunks" spellcheck="false" autocomplete="off">zmuxd v0.4.0 starting
 $ zig build test
-468/477 tests passed
+522/531 tests passed
 $ echo hello-smithers
 hello-smithers</textarea>
       </label>
@@ -355,7 +355,14 @@ function paint(data) {
     notesOut.appendChild(li);
   }
   resultCard.hidden = false;
-  statusEl.textContent = data.ok ? "Frame valid" : "Contract error returned";
+  const mode = modeEl.value;
+  statusEl.textContent = !data.ok
+    ? "Contract error returned"
+    : mode === "ringbuffer"
+      ? "Replay simulated"
+      : mode === "session_trace"
+        ? "Session trace complete"
+        : "Frame valid";
 }
 
 function executeCurrent() {

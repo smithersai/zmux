@@ -153,10 +153,11 @@ button:disabled { opacity: 0.55; cursor: default }
 .dot.poor { background: var(--poor); clip-path: polygon(50% 0%, 0% 100%, 100% 100%); border-radius: 0 }
 .tabs {
   display: flex;
-  gap: 6px;
+  gap: 4px;
   border-bottom: 1px solid var(--line);
   margin: 22px 0 18px;
   overflow-x: auto;
+  flex-wrap: wrap;
 }
 .tabs button {
   border: 0;
@@ -164,7 +165,9 @@ button:disabled { opacity: 0.55; cursor: default }
   border-radius: 0;
   background: transparent;
   color: var(--muted);
-  padding: 10px 14px;
+  padding: 9px 12px;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 .tabs button[aria-selected="true"] {
   color: var(--fg);
@@ -285,11 +288,11 @@ summary::-webkit-details-marker { display: none }
   </div>
 
   <nav class="tabs" role="tablist" aria-label="Audit views">
-    <button role="tab" aria-selected="true" data-tab="overview" type="button">Overview and opportunities</button>
-    <button role="tab" aria-selected="false" data-tab="audits" type="button">Category audits</button>
-    <button role="tab" aria-selected="false" data-tab="modules" type="button">Module matrix</button>
+    <button role="tab" aria-selected="true" data-tab="overview" type="button">Overview</button>
+    <button role="tab" aria-selected="false" data-tab="audits" type="button">Audits</button>
+    <button role="tab" aria-selected="false" data-tab="modules" type="button">Modules</button>
     <button role="tab" aria-selected="false" data-tab="benchmarks" type="button">Benchmarks</button>
-    <button role="tab" aria-selected="false" data-tab="trust" type="button">Trust and telemetry</button>
+    <button role="tab" aria-selected="false" data-tab="trust" type="button">Trust</button>
   </nav>
 
   <section id="panel-overview" class="panel">
