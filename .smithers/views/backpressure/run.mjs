@@ -263,7 +263,7 @@ function summarizeReport(rawReport, benchBaseline, policy, provenance) {
       for (const m of cat.metrics ?? []) {
         const mId = m.name ?? m.id ?? "metric"
         const mScore = typeof m.score === "number" ? Math.round(m.score) : null
-        const items = (m.items ?? []).slice(0, 64).map((it) => {
+        const items = (m.items ?? []).slice(0, 256).map((it) => {
           const itemName = it.name ?? it.item ?? "repo"
           const target = it.target ?? m.target ?? null
           if (typeof itemName === "string" && itemName.startsWith("src/")) {
@@ -340,9 +340,18 @@ function summarizeReport(rawReport, benchBaseline, policy, provenance) {
     ? readdirSync(fuzzDir).filter((f) => f.endsWith(".zig") && f !== "main.zig" && f !== "corpus.zig").sort()
     : []
 
-  const benchSuites = Array.isArray(benchBaseline?.benchmarks)
-    ? [...new Set(benchBaseline.benchmarks.map((b) => b.suite))].sort()
+  const benchmarks = Array.isArray(benchBaseline?.benchmarks)
+    ? benchBaseline.benchmarks.map((b) => ({
+        suite: b.suite,
+        name: b.name,
+        medianNs: b.medianNs ?? null,
+        p95Ns: b.p95Ns ?? null,
+        opsPerSec: b.opsPerSec ?? null,
+        mbPerSec: b.mbPerSec ?? null
+      }))
     : []
+
+  const benchSuites = [...new Set(benchmarks.map((b) => b.suite))].sort()
 
   return {
     schema: "zmux.backpressure.lighthouse.v1",
@@ -359,7 +368,8 @@ function summarizeReport(rawReport, benchBaseline, policy, provenance) {
       fuzzHarnesses,
       benchmarkSuiteCount: benchSuites.length,
       benchmarkSuites: benchSuites,
-      benchmarkCount: Array.isArray(benchBaseline?.benchmarks) ? benchBaseline.benchmarks.length : 0
+      benchmarkCount: benchmarks.length,
+      benchmarks
     },
     trustPolicy: {
       maintainers: policy?.maintainers ?? ["roninjin10"],

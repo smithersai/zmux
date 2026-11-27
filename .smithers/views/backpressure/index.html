@@ -221,8 +221,18 @@ summary::-webkit-details-marker { display: none }
 .site-nav[hidden] { display: none }
 .site-nav a { color: var(--muted); text-decoration: none; font-weight: 500 }
 .site-nav a:hover, .site-nav a.active { color: var(--focus) }
+.site-nav a.site-brand { font-weight: 800; color: var(--fg); letter-spacing: -0.02em }
 .site-nav-links { display: flex; flex-wrap: wrap; gap: 14px; align-items: center }
-.mod-search { width: 100%; max-width: 340px; padding: 7px 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--fg); font: inherit; margin-bottom: 12px }
+.theme-btn { padding: 4px 10px; font-size: 12px }
+.trust-note-text { margin-left: 8px; font-size: 13px }
+.metric-desc { margin: 8px 0 }
+.is-hidden { display: none }
+.num-cell { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap }
+.export-links { display: flex; gap: 8px; align-items: center }
+.export-links[hidden] { display: none }
+.export-link { font-size: 12.5px; font-weight: 600; color: var(--focus); text-decoration: none; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface) }
+.export-link:hover { border-color: var(--focus) }
+.mod-search { width: 100%; max-width: 380px; padding: 7px 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--fg); font: inherit; margin-bottom: 12px }
 .gauge { cursor: pointer; transition: transform 0.14s ease }
 .gauge:hover { transform: translateY(-2px) }
 [data-theme="dark"] { --bg: #0d1117; --surface: #161b22; --fg: #e6edf3; --muted: #8b949e; --line: #30363d; --focus: #58a6ff; --good-fg: #3fb950; --avg-fg: #f0b429; --poor-fg: #f85149 }
@@ -231,7 +241,7 @@ summary::-webkit-details-marker { display: none }
 </head>
 <body>
 <nav id="site-nav" class="site-nav" aria-label="zmux documentation">
-  <a href="../index.html" style="font-weight:800;color:var(--fg)">zmux</a>
+  <a href="../index.html" class="site-brand">zmux</a>
   <div class="site-nav-links">
     <a href="../index.html">Overview</a>
     <a href="../wiki/index.html">Engineering wiki</a>
@@ -241,7 +251,7 @@ summary::-webkit-details-marker { display: none }
     <a href="../llms.txt">llms.txt</a>
     <a href="https://smithers.sh/smithersai/zmux" target="_blank" rel="noopener">Smithers Cloud</a>
     <a href="https://github.com/smithersai/zmux" target="_blank" rel="noopener">GitHub</a>
-    <button id="theme-toggle" type="button" style="padding:4px 10px;font-size:12px">Theme</button>
+    <button id="theme-toggle" class="theme-btn" type="button">Theme</button>
   </div>
 </nav>
 <main>
@@ -251,6 +261,10 @@ summary::-webkit-details-marker { display: none }
       <p class="sub" id="subtitle">Continuous Uphill Lighthouse audit for smithersai/zmux</p>
     </div>
     <div class="toolbar">
+      <div id="export-links" class="export-links">
+        <a class="export-link" href="./report.json">JSON</a>
+        <a class="export-link" href="./report.md">Markdown</a>
+      </div>
       <button id="refresh" type="button">Run live audit</button>
     </div>
   </header>
@@ -258,7 +272,7 @@ summary::-webkit-details-marker { display: none }
   <section id="trust-banner" class="trust-banner" aria-label="Execution trust provenance">
     <div>
       <span id="trust-badge" class="badge none">Loading</span>
-      <span id="trust-note" style="margin-left:8px;font-size:13px">Collecting backpressure metrics...</span>
+      <span id="trust-note" class="trust-note-text">Collecting backpressure metrics...</span>
     </div>
     <div id="trust-meta" class="status-line"></div>
   </section>
@@ -274,6 +288,7 @@ summary::-webkit-details-marker { display: none }
     <button role="tab" aria-selected="true" data-tab="overview" type="button">Overview and opportunities</button>
     <button role="tab" aria-selected="false" data-tab="audits" type="button">Category audits</button>
     <button role="tab" aria-selected="false" data-tab="modules" type="button">Module matrix</button>
+    <button role="tab" aria-selected="false" data-tab="benchmarks" type="button">Benchmarks</button>
     <button role="tab" aria-selected="false" data-tab="trust" type="button">Trust and telemetry</button>
   </nav>
 
@@ -296,12 +311,26 @@ summary::-webkit-details-marker { display: none }
   <section id="panel-modules" class="panel" hidden>
     <div class="card">
       <h2>Per-module Zig audit matrix</h2>
-      <p>Every module in src/ scored against TigerStyle, correctness, fuzzing, benchmarks, and doc coverage.</p>
+      <p>Every module in src/ scored against footprint, TigerStyle, correctness, testing, and doc coverage.</p>
       <input id="mod-search" class="mod-search" type="search" placeholder="Filter modules (for example server, protocol, pty)..." aria-label="Filter Zig modules">
       <div class="scroll">
         <table>
-          <thead><tr><th>Module</th><th>Prod lines</th><th>Max fn</th><th>Asserts/kLOC</th><th>Unit tests</th><th>Docs %</th><th>Correctness</th></tr></thead>
+          <thead><tr><th>Module</th><th>Prod lines</th><th>Bytes</th><th>Max fn</th><th>Asserts/kLOC</th><th>Unit tests</th><th>Docs %</th><th>Correctness</th></tr></thead>
           <tbody id="modules-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section id="panel-benchmarks" class="panel" hidden>
+    <div class="card">
+      <h2>ReleaseFast benchmark baselines</h2>
+      <p>Tracked across all Zig subsystems in bench/baseline.json and diffed on every smthrs run //:bench execution.</p>
+      <input id="bench-search" class="mod-search" type="search" placeholder="Filter benchmarks (for example buffer, server, protocol, pty)..." aria-label="Filter benchmarks">
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Suite</th><th>Benchmark</th><th class="num-cell">Median</th><th class="num-cell">p95</th><th class="num-cell">Ops/sec</th><th class="num-cell">Throughput</th></tr></thead>
+          <tbody id="benchmarks-body"></tbody>
         </table>
       </div>
     </div>
@@ -369,6 +398,33 @@ function makeGauge(label, score, band) {
 
   const ring = el("div", { class: "gauge-ring" }, svg, el("div", { class: "gauge-num" }, String(clamped)))
   return el("div", { class: `gauge ${band}` }, ring, el("div", { class: "gauge-label" }, label))
+}
+
+function fmtBytes(n) {
+  if (typeof n !== "number") return String(n ?? "")
+  if (n >= 1000) return `${(n / 1000).toFixed(1)} kB`
+  return `${n} B`
+}
+
+function fmtNs(ns) {
+  if (typeof ns !== "number") return "-"
+  if (ns >= 1e6) return `${(ns / 1e6).toFixed(2)} ms`
+  if (ns >= 1e3) return `${(ns / 1e3).toFixed(2)} us`
+  return `${ns.toFixed(ns < 10 ? 2 : 1)} ns`
+}
+
+function fmtOps(ops) {
+  if (typeof ops !== "number") return "-"
+  if (ops >= 1e9) return `${(ops / 1e9).toFixed(2)} G/s`
+  if (ops >= 1e6) return `${(ops / 1e6).toFixed(2)} M/s`
+  if (ops >= 1e3) return `${(ops / 1e3).toFixed(1)} K/s`
+  return ops.toFixed(1)
+}
+
+function fmtThroughput(mb) {
+  if (typeof mb !== "number") return "-"
+  if (mb >= 1024) return `${(mb / 1024).toFixed(2)} GB/s`
+  return `${mb.toFixed(1)} MB/s`
 }
 
 function render(report) {
@@ -448,7 +504,7 @@ function render(report) {
         el("span", {}, `${m.title} `, el("code", {}, m.id)),
         el("span", { class: `badge ${m.band}` }, m.score === null ? "info" : `${m.score}/100`)
       )
-      const detail = el("details", {}, summary, el("p", { style: "margin:8px 0" }, m.description || ""))
+      const detail = el("details", {}, summary, el("p", { class: "metric-desc" }, m.description || ""))
       const tbl = el("table", {}, el("thead", {}, el("tr", {}, el("th", {}, "Item"), el("th", {}, "Value"), el("th", {}, "Target"), el("th", {}, "Notes"))))
       const tb = el("tbody", {})
       for (const it of m.items || []) {
@@ -456,8 +512,8 @@ function render(report) {
           "tr",
           {},
           el("td", {}, el("code", {}, it.item)),
-          el("td", {}, String(it.value ?? "")),
-          el("td", {}, String(it.target ?? "")),
+          el("td", {}, m.unit === "B" ? fmtBytes(it.value) : String(it.value ?? "")),
+          el("td", {}, m.unit === "B" ? fmtBytes(it.target) : String(it.target ?? "")),
           el("td", {}, String(it.note ?? ""))
         ))
       }
@@ -475,17 +531,36 @@ function render(report) {
     const correctnessIssues = ["correctness:no-panic", "correctness:no-debug-print", "correctness:no-empty-catch", "correctness:no-todo"]
       .filter((k) => c[k]?.value === "fail")
       .map((k) => k.split(":")[1])
+    const unitVal = c["testing:unit-tests"]?.value
     modulesBody.append(el(
       "tr",
       {},
       el("td", {}, el("code", {}, mod.file)),
       el("td", {}, String(c["footprint:module-prod-lines"]?.value ?? "")),
+      el("td", {}, fmtBytes(c["footprint:module-bytes"]?.value)),
       el("td", {}, String(c["style:max-fn-lines"]?.value ?? "")),
       el("td", {}, String(c["style:assert-density"]?.value ?? "")),
-      el("td", {}, String(c["testing:unit-tests"]?.value ?? "")),
-      el("td", {}, `${c["documentation:pub-doc-coverage"]?.value ?? ""}%`),
+      el("td", {}, unitVal === undefined || unitVal === null ? "subsystem" : String(unitVal)),
+      el("td", {}, c["documentation:pub-doc-coverage"]?.value !== undefined ? `${c["documentation:pub-doc-coverage"].value}%` : "-"),
       el("td", {}, correctnessIssues.length === 0 ? el("span", { class: "badge good" }, "pass") : el("span", { class: "badge poor" }, correctnessIssues.join(", ")))
     ))
+  }
+
+  const benchmarksBody = document.getElementById("benchmarks-body")
+  if (benchmarksBody) {
+    benchmarksBody.replaceChildren()
+    for (const b of report.telemetry?.benchmarks || []) {
+      benchmarksBody.append(el(
+        "tr",
+        {},
+        el("td", {}, el("code", {}, b.suite)),
+        el("td", {}, el("code", {}, b.name)),
+        el("td", { class: "num-cell" }, fmtNs(b.medianNs)),
+        el("td", { class: "num-cell" }, fmtNs(b.p95Ns)),
+        el("td", { class: "num-cell" }, fmtOps(b.opsPerSec)),
+        el("td", { class: "num-cell" }, fmtThroughput(b.mbPerSec))
+      ))
+    }
   }
 
   const trustDetails = document.getElementById("trust-details")
@@ -533,10 +608,12 @@ function runLiveAudit() {
 
 refreshBtn.addEventListener("click", runLiveAudit)
 
-// Hide site-level navigation bar when embedded inside a Smithers Cloud iframe.
+// Hide site-level navigation bar and static export links when embedded inside a Smithers Cloud iframe.
 if (window.parent && window.parent !== window) {
   const nav = document.getElementById("site-nav")
   if (nav) nav.hidden = true
+  const exportsEl = document.getElementById("export-links")
+  if (exportsEl) exportsEl.hidden = true
 }
 
 const themeToggle = document.getElementById("theme-toggle")
@@ -552,7 +629,14 @@ themeToggle?.addEventListener("click", () => {
 document.getElementById("mod-search")?.addEventListener("input", (e) => {
   const q = e.target.value.trim().toLowerCase()
   for (const row of document.querySelectorAll("#modules-body tr")) {
-    row.style.display = !q || row.textContent.toLowerCase().includes(q) ? "" : "none"
+    row.classList.toggle("is-hidden", Boolean(q) && !row.textContent.toLowerCase().includes(q))
+  }
+})
+
+document.getElementById("bench-search")?.addEventListener("input", (e) => {
+  const q = e.target.value.trim().toLowerCase()
+  for (const row of document.querySelectorAll("#benchmarks-body tr")) {
+    row.classList.toggle("is-hidden", Boolean(q) && !row.textContent.toLowerCase().includes(q))
   }
 })
 

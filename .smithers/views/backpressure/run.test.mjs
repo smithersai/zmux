@@ -46,10 +46,19 @@ test("trusted Smithers-controlled sandbox with write token reports trusted prove
   assert.equal(report.provenance.source, "smithers-cloud-controlled-sandbox")
 })
 
-test("index.html renders Lighthouse gauges without forbidden internal codenames", () => {
+test("index.html renders Lighthouse gauges with zero inline styles and no forbidden internal codenames", () => {
   const html = readFileSync(join(here, "index.html"), "utf8")
   assert.ok(html.includes("<!doctype html>"))
   assert.ok(html.includes("zmux Backpressure Audit Report"))
   assert.ok(html.includes("zmux-audit-snapshot"))
+  assert.ok(html.includes('data-tab="benchmarks"'))
+  assert.ok(!/\bstyle\s*=/.test(html), "index.html must not contain inline style= attributes")
   assert.ok(!html.toLowerCase().includes("jjhub"))
+})
+
+test("telemetry includes full benchmark list from bench/baseline.json", () => {
+  const report = runAudit({})
+  assert.ok(Array.isArray(report.telemetry.benchmarks))
+  assert.ok(report.telemetry.benchmarks.length >= 90)
+  assert.ok(report.telemetry.benchmarkSuiteCount >= 13)
 })

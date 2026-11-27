@@ -225,6 +225,11 @@ pre code { background: transparent; padding: 0 }
 }
 .timeline .meta { color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace }
 .scroll { overflow-x: auto }
+.search-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 16px 0 8px }
+.search-input { width: 100%; max-width: 420px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--fg); font: inherit }
+.search-count { color: var(--muted); font-size: 13px }
+.card[hidden] { display: none }
+.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap }
 table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14px }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line) }
 th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em }
@@ -359,6 +364,15 @@ function main() {
 
   llmsLines.push("", "## Engineering Wiki", "")
 
+  const backlinks = new Map()
+  for (const page of project.pages) {
+    for (const relId of page.related ?? []) {
+      const list = backlinks.get(relId) ?? []
+      list.push(page)
+      backlinks.set(relId, list)
+    }
+  }
+
   const wikiCards = []
   for (const page of project.pages) {
     const rawMd = readFileSync(join(ROOT, page.document), "utf8")
@@ -375,6 +389,9 @@ function main() {
         return target ? `<li><a href="../${escapeHtml(relId)}/index.html">${escapeHtml(target.title)}</a></li>` : ""
       })
       .join("")
+    const backlinkHtml = (backlinks.get(page.id) ?? [])
+      .map((srcPage) => `<li><a href="../${escapeHtml(srcPage.id)}/index.html">${escapeHtml(srcPage.title)}</a></li>`)
+      .join("")
     const inputsHtml = (page.inputs ?? []).map((p) => `<code>${escapeHtml(p)}</code>`).join(" ")
     const wikiPageHtml = pageShell({
       title: page.title,
@@ -386,16 +403,15 @@ ${page.id === "start-here" ? ARCHITECTURE_SVG : ""}
 ${renderMarkdown(rawMd)}
 <h2>Cited source files</h2>
 <p>${inputsHtml}</p>
-${relatedHtml ? `<h2>Related pages</h2><ul>${relatedHtml}</ul>` : ""}`
+${relatedHtml ? `<h2>Related pages</h2><ul>${relatedHtml}</ul>` : ""}
+${backlinkHtml ? `<h2>Referenced by</h2><ul>${backlinkHtml}</ul>` : ""}`
     })
     writeFileSync(join(pageDir, "index.html"), wikiPageHtml)
+    const searchIndex = [page.title, page.purpose, ...(page.inputs ?? [])].join(" ").toLowerCase()
     wikiCards.push(
-      `<div class="card"><h3><a href="${escapeHtml(page.id)}/index.html">${escapeHtml(page.title)}</a></h3><p>${escapeHtml(page.purpose)}</p></div>`
+      `<div class="card" data-wiki-card data-search="${escapeHtml(searchIndex)}"><h3><a href="${escapeHtml(page.id)}/index.html">${escapeHtml(page.title)}</a></h3><p>${escapeHtml(page.purpose)}</p></div>`
     )
   }
-
-  writeFileSync(join(OUT, "llms.txt"), `${llmsLines.join("\n")}\n`)
-  writeFileSync(join(OUT, "llms-full.txt"), `${llmsFull.join("\n")}\n`)
 
   writeFileSync(
     join(OUT, "wiki", "index.html"),
@@ -407,7 +423,27 @@ ${relatedHtml ? `<h2>Related pages</h2><ul>${relatedHtml}</ul>` : ""}`
       body: `<h1>zmux Engineering Wiki</h1>
 <p>Every page is cataloged in <code>.smithers/coding-project.json</code>, grounded in exact public source files, and validated in CI.</p>
 ${ARCHITECTURE_SVG}
-<div class="grid">${wikiCards.join("\n")}</div>`
+<div class="search-bar">
+  <input id="wiki-search" class="search-input" type="search" placeholder="Search wiki pages or Zig modules (for example pty, protocol, scrollback)..." aria-label="Search engineering wiki">
+  <span id="wiki-search-count" class="search-count">${wikiCards.length} of ${wikiCards.length} pages</span>
+</div>
+<div class="grid" id="wiki-grid">${wikiCards.join("\n")}</div>
+<script>
+const input = document.getElementById("wiki-search")
+const countEl = document.getElementById("wiki-search-count")
+const cards = [...document.querySelectorAll("[data-wiki-card]")]
+input?.addEventListener("input", () => {
+  const q = input.value.trim().toLowerCase()
+  let shown = 0
+  for (const card of cards) {
+    const hay = card.getAttribute("data-search") || ""
+    const match = !q || hay.includes(q)
+    card.hidden = !match
+    if (match) shown++
+  }
+  if (countEl) countEl.textContent = shown + " of " + cards.length + " pages"
+})
+</script>`
     })
   )
 
@@ -448,7 +484,7 @@ ${renderMarkdown(mythicalMd)}
     "# zmux Lighthouse Backpressure Audit Report",
     "",
     `- Overall score: **${auditJson.overallScore}/100**`,
-    `- Trust level: **${auditJson.trust?.trust || "untrusted"}** (${auditJson.trust?.cacheMode || "read-only"} cache on \`build.smithers.sh\`)`,
+    `- Trust level: **${auditJson.provenance?.trust || "untrusted"}** (${auditJson.provenance?.cacheMode || "read-only"} cache on \`build.smithers.sh\`)`,
     `- Generated at: \`${auditJson.generatedAt || ""}\``,
     "",
     "## Category Scores",
@@ -475,7 +511,18 @@ ${renderMarkdown(mythicalMd)}
       )
     }
   }
-  writeFileSync(join(OUT, "audit", "report.md"), `${mdLines.join("\n")}\n`)
+  const auditMd = `${mdLines.join("\n")}\n`
+  writeFileSync(join(OUT, "audit", "report.md"), auditMd)
+  writeFileSync(join(OUT, "pages", "backpressure-audit.md"), auditMd)
+  llmsLines.push(
+    "",
+    "## Backpressure Audit",
+    "",
+    `- [Lighthouse Backpressure Audit Report](${BASE_URL}/pages/backpressure-audit.md): Live Uphill quality scores, module matrix, and trust provenance`
+  )
+  llmsFull.push(`\n---\n<!-- audit/report.md -->\n\n${auditMd}`)
+  writeFileSync(join(OUT, "llms.txt"), `${llmsLines.join("\n")}\n`)
+  writeFileSync(join(OUT, "llms-full.txt"), `${llmsFull.join("\n")}\n`)
   if (existsSync(join(ROOT, ".uphill", "report.html"))) {
     copyFileSync(join(ROOT, ".uphill", "report.html"), join(OUT, "audit", "uphill.html"))
   }
@@ -490,6 +537,26 @@ ${renderMarkdown(mythicalMd)}
     .map(
       (s) =>
         `<tr><td><code>${escapeHtml(s.audience)}</code></td><td>${escapeHtml(s.title || "Public landing")}</td><td>${(s.blocks || []).map((b) => `<code>${escapeHtml(b.type)}</code>`).join(" ")}</td></tr>`
+    )
+    .join("")
+
+  const featuredBenchNames = [
+    ["buffer", "append_64B_wrapped_10MiB"],
+    ["buffer", "append_64KiB_wrapped_10MiB"],
+    ["protocol", "format_notification_pane_output_8KiB"],
+    ["server", "rpc_mux_snapshot_roundtrip"],
+    ["server", "rpc_session_capture_50_from_10MiB"],
+    ["server", "clientConn_broadcast_queue_512x1KiB"]
+  ]
+  const fmtBenchNs = (ns) => (ns >= 1e6 ? `${(ns / 1e6).toFixed(2)} ms` : ns >= 1e3 ? `${(ns / 1e3).toFixed(2)} us` : `${ns.toFixed(ns < 10 ? 2 : 1)} ns`)
+  const fmtBenchThru = (mb) => (typeof mb !== "number" ? "-" : mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB/s` : `${mb.toFixed(1)} MB/s`)
+  const benchList = auditJson.telemetry?.benchmarks ?? []
+  const benchRows = featuredBenchNames
+    .map(([suite, name]) => benchList.find((b) => b.suite === suite && b.name === name))
+    .filter(Boolean)
+    .map(
+      (b) =>
+        `<tr><td><code>${escapeHtml(b.suite)}</code></td><td><code>${escapeHtml(b.name)}</code></td><td class="num">${fmtBenchNs(b.medianNs)}</td><td class="num">${fmtBenchNs(b.p95Ns)}</td><td class="num">${fmtBenchThru(b.mbPerSec)}</td></tr>`
     )
     .join("")
 
@@ -534,6 +601,15 @@ ${ARCHITECTURE_SVG}
     <tbody>${audienceRows}</tbody>
   </table>
 </div>
+
+${benchRows ? `<h2>Performance highlights (ReleaseFast baselines)</h2>
+<p>Measured across ${benchList.length} tracked Zig benchmarks in <code>bench/baseline.json</code>. Explore the full table in the <a href="audit/index.html">Lighthouse Audit Benchmarks tab</a>.</p>
+<div class="scroll">
+  <table>
+    <thead><tr><th>Suite</th><th>Benchmark</th><th class="num">Median</th><th class="num">p95</th><th class="num">Throughput</th></tr></thead>
+    <tbody>${benchRows}</tbody>
+  </table>
+</div>` : ""}
 
 <h2>Install</h2>
 <pre><code>zig fetch --save=zmux git+https://github.com/smithersai/zmux</code></pre>
