@@ -3,12 +3,19 @@
 const std = @import("std");
 const buffer = @import("../buffer.zig");
 const foreground = @import("../foreground.zig");
+const log = @import("../log.zig");
 const pty = @import("../pty.zig");
+const reactor_mod = @import("../reactor.zig");
 const sys = @import("../sys.zig");
+const vt_mod = @import("../vt.zig");
 const root = @import("../native.zig");
 const events = @import("events.zig");
 const control = @import("control.zig");
 const reader = @import("reader.zig");
+const vt_bridge = @import("vt_bridge.zig");
+const screen = @import("screen.zig");
+const recording = @import("recording.zig");
+const wait_mod = @import("wait.zig");
 const harness = @import("harness.zig");
 const assert = std.debug.assert;
 const NativeSessionState = events.NativeSessionState;
@@ -61,7 +68,13 @@ pub const NativeSession = struct {
     shell_value: ?[]u8,
     cwd_value: ?[]u8,
     handle: pty.Pty,
+    reactor: reactor_mod.Reactor,
+    pid_watched: bool = false,
     scrollback: buffer.ScrollbackBuffer,
+    vt: vt_mod.Terminal,
+    recorder: recording.Recorder = .{},
+    /// Signaled under `mutex` on PTY output, OSC updates, stopInput, and exit.
+    state_changed: std.Io.Condition = .init,
     /// Written only under `mutex` (via `setStateLocked`); read lock-free by
     /// `state()` so hot polling paths never contend with the reader thread.
     state_value: std.atomic.Value(NativeSessionState) = std.atomic.Value(NativeSessionState).init(.creating),
@@ -106,24 +119,43 @@ pub const NativeSession = struct {
     /// the reader thread detaches and tears the session down itself.
     destroy_on_reader_exit: std.atomic.Value(bool) = .init(false),
 
+    const OwnedStrings = struct {
+        id: []u8,
+        title: []u8,
+        shell: ?[]u8,
+        cwd: ?[]u8,
+
+        fn init(allocator: std.mem.Allocator, opts: NativeSessionOptions) !OwnedStrings {
+            const id = try allocator.dupe(u8, opts.id);
+            errdefer allocator.free(id);
+            const title = try allocator.dupe(u8, opts.title orelse opts.id);
+            errdefer allocator.free(title);
+            const shell = if (opts.shell) |v| try allocator.dupe(u8, v) else null;
+            errdefer if (shell) |v| allocator.free(v);
+            const cwd = if (opts.cwd) |v| try allocator.dupe(u8, v) else null;
+            return .{ .id = id, .title = title, .shell = shell, .cwd = cwd };
+        }
+
+        fn deinit(self: OwnedStrings, allocator: std.mem.Allocator) void {
+            allocator.free(self.id);
+            allocator.free(self.title);
+            if (self.shell) |v| allocator.free(v);
+            if (self.cwd) |v| allocator.free(v);
+        }
+    };
+
     pub fn create(allocator: std.mem.Allocator, io: std.Io, opts: NativeSessionOptions) !*NativeSession {
         const native = try allocator.create(NativeSession);
         errdefer allocator.destroy(native);
 
-        const id = try allocator.dupe(u8, opts.id);
-        errdefer allocator.free(id);
-
-        const native_title = try allocator.dupe(u8, opts.title orelse opts.id);
-        errdefer allocator.free(native_title);
-
-        const shell = if (opts.shell) |value| try allocator.dupe(u8, value) else null;
-        errdefer if (shell) |value| allocator.free(value);
-
-        const cwd = if (opts.cwd) |value| try allocator.dupe(u8, value) else null;
-        errdefer if (cwd) |value| allocator.free(value);
+        const strings = try OwnedStrings.init(allocator, opts);
+        errdefer strings.deinit(allocator);
 
         var scrollback = try buffer.ScrollbackBuffer.init(allocator, opts.scrollback_bytes);
         errdefer scrollback.deinit();
+
+        var vt_term = try vt_mod.Terminal.init(allocator, .{ .rows = opts.rows, .cols = opts.cols });
+        errdefer vt_term.deinit();
 
         const stop_pipe = try openStopPipe();
         errdefer {
@@ -140,41 +172,62 @@ pub const NativeSession = struct {
             .rows = opts.rows,
             .cols = opts.cols,
         });
-        assert(handle.child_pid > 0);
-        assert(handle.master_fd >= 0);
+        assert(handle.child_pid > 0 and handle.master_fd >= 0);
 
         native.* = .{
             .allocator = allocator,
             .io = io,
-            .id = id,
-            .title_value = native_title,
-            .shell_value = shell,
-            .cwd_value = cwd,
+            .id = strings.id,
+            .title_value = strings.title,
+            .shell_value = strings.shell,
+            .cwd_value = strings.cwd,
             .handle = handle,
+            .reactor = undefined,
             .scrollback = scrollback,
+            .vt = vt_term,
             .event_sink = opts.event_sink,
             .stop_pipe = stop_pipe,
             .foreground_tracker = foreground.Tracker.init(handle.child_pid),
             .generation_value = opts.generation,
         };
-        // From here the child is ours: any failure must kill and reap it, or
-        // it would run on with nobody holding its PID.
         errdefer {
             native.handle.kill();
             _ = native.handle.waitBlocking(kill_reap_budget_ms);
             native.handle.close();
         }
 
-        // Set before the reader exists, so the reader's own transition to
-        // `terminated` can never be overwritten.
+        var r = try initReactor(allocator, &handle);
+        errdefer r.deinit();
+        native.reactor = r.reactor;
+        native.pid_watched = r.pid_watched;
+
         native.setState(.running);
-        // The shell owns the terminal at spawn: that is the baseline, not a
-        // change. The first event is the first job, and a later return to
-        // the shell group is reported like any other change.
         native.foreground_tracker.commit(handle.child_pid);
         if (root.spawn_reader_hook) |hook| try hook(handle.child_pid);
         native.reader_thread = try std.Thread.spawn(.{}, reader.readerLoop, .{native});
         return native;
+    }
+
+    const InitReactor = struct {
+        reactor: reactor_mod.Reactor,
+        pid_watched: bool,
+        fn deinit(self: *InitReactor) void {
+            self.reactor.deinit();
+        }
+    };
+
+    fn initReactor(allocator: std.mem.Allocator, handle: *const pty.Pty) !InitReactor {
+        var r = try reactor_mod.Reactor.init(allocator);
+        errdefer r.deinit();
+        try r.watchFd(handle.master_fd, reader.master_token, .{ .read = true });
+        const pid_watched = blk: {
+            const res = r.watchPid(handle.child_pid, reader.pid_token) catch |err| switch (err) {
+                error.OperationNotSupported => break :blk false,
+                else => return err,
+            };
+            break :blk res == .watching;
+        };
+        return .{ .reactor = r, .pid_watched = pid_watched };
     }
 
     /// The `stopInput` wake-up pipe: close-on-exec, non-blocking write end.
@@ -218,8 +271,14 @@ pub const NativeSession = struct {
     fn destroyInternal(self: *NativeSession) void {
         self.stopForOwnerRelease();
         self.reader_stop.store(true, .seq_cst);
+        self.wakeReader();
         if (self.reader_thread) |thread| thread.join();
         freeResources(self);
+    }
+
+    /// Wake the background reader thread out of `Reactor.wait`.
+    pub fn wakeReader(self: *NativeSession) void {
+        self.reactor.wake() catch |err| log.debug("native_reactor_wake_failed", .{ .err = err });
     }
 
     pub fn state(self: *NativeSession) NativeSessionState {
@@ -296,63 +355,24 @@ pub const NativeSession = struct {
         return self.scrollback.snapshot(allocator);
     }
 
-    /// Write the opening `{` and all `NativeSession` JSON fields without the
-    /// closing `}`, so callers such as `mux.Manager.listJson` can append more
-    /// fields into one output buffer with no intermediate allocation.
-    pub fn writeInfoJsonFields(self: *NativeSession, writer: *std.Io.Writer) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-
-        try writer.print(
-            "{{\"id\":{f},\"title\":{f},\"pid\":{},\"state\":{f},\"cwd\":",
-            .{
-                std.json.fmt(self.id, .{}),
-                std.json.fmt(self.title_value, .{}),
-                self.handle.child_pid,
-                std.json.fmt(self.state_value.load(.monotonic).label(), .{}),
-            },
-        );
-        if (self.cwd_value) |cwd| {
-            try writer.print("{f}", .{std.json.fmt(cwd, .{})});
-        } else {
-            try writer.writeAll("null");
-        }
-        try writer.writeAll(",\"shell\":");
-        if (self.shell_value) |shell| {
-            try writer.print("{f}", .{std.json.fmt(shell, .{})});
-        } else {
-            try writer.writeAll("null");
-        }
-        try writer.print(",\"scrollbackBytes\":{},\"exitStatus\":", .{self.scrollback.len});
-        try writeOptionalU32(writer, self.exit_status);
-        // `exitStatus` conflates exit code and signal number and is kept for
-        // existing clients; `exitCode` and `signal` separate them.
-        const exit: ExitInfo = exitInfoLocked(self) orelse .{ .exit_code = null, .signal = null };
-        try writer.writeAll(",\"exitCode\":");
-        try writeOptionalU32(writer, exit.exit_code);
-        try writer.writeAll(",\"signal\":");
-        try writeOptionalU32(writer, exit.signal);
-        try writer.print(",\"generation\":{}", .{self.generation_value});
-    }
-
-    pub fn infoJson(self: *NativeSession, allocator: std.mem.Allocator) ![]u8 {
-        var out: std.Io.Writer.Allocating = try .initCapacity(allocator, 256);
-        errdefer out.deinit();
-        try self.writeInfoJsonFields(&out.writer);
-        try out.writer.writeByte('}');
-        return out.toOwnedSlice();
-    }
-
-    fn writeOptionalU32(writer: *std.Io.Writer, value: ?u32) !void {
-        if (value) |v| {
-            try writer.print("{}", .{v});
-        } else {
-            try writer.writeAll("null");
-        }
-    }
-
     // -- Delegated to `native/*.zig` --
 
+    pub const writeInfoJsonFields = vt_bridge.writeInfoJsonFields;
+    pub const infoJson = vt_bridge.infoJson;
+    pub const screenJson = screen.screenJson;
+    pub const cellsJson = screen.cellsJson;
+    pub const plainText = vt_bridge.plainText;
+    pub const ansiRestore = vt_bridge.ansiRestore;
+    pub const semanticStatus = vt_bridge.semanticStatus;
+    pub const scrollbackSliceSince = vt_bridge.scrollbackSliceSince;
+    pub const scrollbackEndOffset = vt_bridge.scrollbackEndOffset;
+    pub const sendSignal = vt_bridge.sendSignal;
+    pub const startRecording = recording.startRecording;
+    pub const stopRecording = recording.stopRecording;
+    pub const recordingStatus = recording.recordingStatus;
+    pub const exportAsciicast = recording.exportAsciicast;
+    pub const waitCondition = wait_mod.waitCondition;
+    pub const execInPane = wait_mod.execInPane;
     pub const terminate = control.terminate;
     pub const stopForOwnerRelease = control.stopForOwnerRelease;
     pub const beginTerminate = control.beginTerminate;
@@ -372,6 +392,9 @@ pub const NativeSession = struct {
 pub fn freeResources(self: *NativeSession) void {
     assert(self.reader_finished.load(.seq_cst));
     assert(self.ref_count.load(.seq_cst) == 0);
+    self.recorder.deinit(self.allocator);
+    self.vt.deinit();
+    self.reactor.deinit();
     self.handle.close();
     sys.close(self.stop_pipe[0]);
     sys.close(self.stop_pipe[1]);

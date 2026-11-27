@@ -9,12 +9,14 @@ const types = @import("types.zig");
 const lookup = @import("lookup.zig");
 const creation = @import("creation.zig");
 const removal = @import("removal.zig");
+const layout_ops = @import("layout_ops.zig");
 
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const Manager = mux.Manager;
 const NativeSession = native_mod.NativeSession;
 const CreateOptions = types.CreateOptions;
+const AttachOptions = types.AttachOptions;
 const PaneHandle = types.PaneHandle;
 const PaneRef = types.PaneRef;
 const AttachResult = types.AttachResult;
@@ -30,11 +32,22 @@ const paneState = mux.test_support.paneState;
 
 /// Attaches a logical client to `target_pane_id` with initial dimensions `(rows, cols)`.
 pub fn attachClient(self: *Manager, target_pane_id: []const u8, rows: u16, cols: u16) !ClientSnapshot {
+    return attachClientWithOptions(self, target_pane_id, rows, cols, .{});
+}
+
+/// Attaches a logical client with explicit observer (`read_only`) and `resize_policy` options.
+pub fn attachClientWithOptions(
+    self: *Manager,
+    target_pane_id: []const u8,
+    rows: u16,
+    cols: u16,
+    opts: AttachOptions,
+) !ClientSnapshot {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
 
     const found = lookup.resolveTargetPaneLocked(self, target_pane_id) orelse return error.PaneNotFound;
-    return attachClientLocked(self, found, rows, cols);
+    return attachClientLocked(self, found, rows, cols, opts);
 }
 
 /// Attach a client to `target`, creating a session named `target` first
@@ -47,6 +60,18 @@ pub fn attachOrCreateClient(
     rows: u16,
     cols: u16,
     create_opts: ?CreateOptions,
+) !AttachResult {
+    return attachOrCreateClientWithOptions(self, target, rows, cols, create_opts, .{});
+}
+
+/// Like `attachOrCreateClient`, honoring observer `read_only` and `resize_policy` options.
+pub fn attachOrCreateClientWithOptions(
+    self: *Manager,
+    target: []const u8,
+    rows: u16,
+    cols: u16,
+    create_opts: ?CreateOptions,
+    attach_opts: AttachOptions,
 ) !AttachResult {
     // Declared before the lock so a rollback tears down after unlock.
     var rollback: RemovedItems = .{};
@@ -70,7 +95,7 @@ pub fn attachOrCreateClient(
         rollback = removal.takeSessionLocked(self, found.session);
     };
 
-    const client = try attachClientLocked(self, found, rows, cols);
+    const client = try attachClientLocked(self, found, rows, cols, attach_opts);
     const exit = found.pane.native.finalizedExitInfo();
     return .{
         .client = client,
@@ -139,7 +164,17 @@ pub fn switchClient(self: *Manager, client_id: []const u8, pane_id: []const u8) 
     errdefer self.allocator.free(window_id);
     const owned_pane_id = try self.allocator.dupe(u8, found.pane.id);
     errdefer self.allocator.free(owned_pane_id);
-    try applyPaneSize(found.pane, client.rows, client.cols);
+    if (layout_ops.resolveClientGeometryLocked(
+        self,
+        found.pane,
+        client,
+        client.rows,
+        client.cols,
+        client.read_only,
+        client.resize_policy,
+    )) |sz| {
+        try applyPaneSize(found.pane, sz.rows, sz.cols);
+    }
 
     self.allocator.free(client.session_id);
     client.session_id = session_id;
@@ -166,8 +201,15 @@ pub fn resizePane(self: *Manager, pane_id: []const u8, rows: u16, cols: u16) !vo
 }
 
 /// All fallible work (limits, reservations, allocation, resize) happens
-/// before the client is recorded. Skips the resize on an exited pane.
-pub fn attachClientLocked(self: *Manager, found: PaneRef, rows: u16, cols: u16) !ClientSnapshot {
+/// before the client is recorded. Skips the resize on an exited pane or
+/// when `opts.read_only` / `opts.resize_policy == .none`.
+pub fn attachClientLocked(
+    self: *Manager,
+    found: PaneRef,
+    rows: u16,
+    cols: u16,
+    opts: AttachOptions,
+) !ClientSnapshot {
     if (self.clients.items.len >= self.limits.max_clients) return error.LimitExceeded;
     try self.detached_clients.ensureTotalCapacity(
         self.allocator,
@@ -193,10 +235,22 @@ pub fn attachClientLocked(self: *Manager, found: PaneRef, rows: u16, cols: u16) 
         .pane_id = pane_id,
         .rows = rows,
         .cols = cols,
+        .read_only = opts.read_only,
+        .resize_policy = opts.resize_policy,
     };
     var snapshot = try ClientSnapshot.fromClient(self.allocator, client);
     errdefer snapshot.deinit(self.allocator);
-    try applyPaneSize(found.pane, rows, cols);
+    if (layout_ops.resolveClientGeometryLocked(
+        self,
+        found.pane,
+        null,
+        rows,
+        cols,
+        opts.read_only,
+        opts.resize_policy,
+    )) |sz| {
+        try applyPaneSize(found.pane, sz.rows, sz.cols);
+    }
 
     assert(self.detached_clients.capacity >= self.detached_clients.items.len + self.clients.items.len + 1);
     self.clients.appendAssumeCapacity(client);

@@ -55,11 +55,15 @@ pub fn errorCodeFor(err: anyerror) ErrorMapping {
         e(&.{
             "InvalidParams",           "InvalidSpawnArgument", "UnknownKey",
             "ScrollbackBytesTooLarge", "InvalidName",          "InvalidAxis",
-            "InvalidDimensions",
+            "InvalidDimensions",       "InvalidRatio",         "InvalidSignal",
         }, C.invalid_params, .invalid_params),
-        e(&.{ "SessionNotFound", "WindowNotFound", "PaneNotFound", "ClientNotFound" }, C.session_error, .not_found),
+        e(&.{
+            "SessionNotFound", "WindowNotFound", "PaneNotFound", "ClientNotFound", "SplitNotFound",
+        }, C.session_error, .not_found),
         e(&.{"SessionTerminated"}, C.session_error, .terminated),
-        e(&.{ "DuplicateSessionName", "NameShadowsId", "PaneRunning" }, C.session_error, .conflict),
+        e(&.{
+            "DuplicateSessionName", "NameShadowsId", "PaneRunning", "RecordingActive",
+        }, C.session_error, .conflict),
         e(&.{"LimitExceeded"}, C.session_error, .limit),
         e(&.{ "OpenPtyFailed", "ForkFailed", "ChildSetupFailed", "SpawnFailed" }, C.session_error, .spawn_failed),
         e(&.{ "InputTimeout", "InputClosed", "BrokenPipe", "InputOutput", "WriteZero" }, C.session_error, .io),

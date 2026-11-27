@@ -11,6 +11,8 @@ const sys = @import("sys.zig");
 
 const types = @import("mux/types.zig");
 const layout = @import("mux/layout.zig");
+const layout_ops = @import("mux/layout_ops.zig");
+const metadata_mod = @import("mux/metadata.zig");
 const commands = @import("mux/commands.zig");
 const creation = @import("mux/creation.zig");
 const lookup = @import("mux/lookup.zig");
@@ -32,6 +34,19 @@ pub const ContractError = types.ContractError;
 
 /// Shared deadline `terminateAll` gives every pane after `beginTerminate`.
 pub const terminate_all_deadline_ms = types.terminate_all_deadline_ms;
+
+/// Multi-client PTY geometry resolution policy.
+pub const ResizePolicy = types.ResizePolicy;
+/// Additive client attachment mode options (`readOnly` and `resizePolicy`).
+pub const AttachOptions = types.AttachOptions;
+/// Borrowed string metadata entry passed when creating or updating metadata.
+pub const MetadataEntry = metadata_mod.Entry;
+/// Bounded string-to-string metadata map owned by a pane or session.
+pub const MetadataMap = metadata_mod.MetadataMap;
+/// Owned response snapshot for `pane.metadata`.
+pub const PaneMetadataSnapshot = metadata_mod.PaneMetadataSnapshot;
+/// Serialize one owned `ClientSnapshot` as a JSON `ClientInfo` object.
+pub const clientJson = json.clientJson;
 
 /// Owned identifiers for a pane plus one retained reference to its native
 /// session. `deinit` frees the ids and releases the native.
@@ -166,12 +181,22 @@ pub const Manager = struct {
     pub const isCurrentGeneration = lookup.isCurrentGeneration;
     pub const respawnPane = respawn.respawnPane;
     pub const attachClient = attach.attachClient;
+    pub const attachClientWithOptions = attach.attachClientWithOptions;
     pub const attachOrCreateClient = attach.attachOrCreateClient;
+    pub const attachOrCreateClientWithOptions = attach.attachOrCreateClientWithOptions;
     pub const detachClient = attach.detachClient;
     pub const detachClientRemote = attach.detachClientRemote;
     pub const takeDetachedClients = attach.takeDetachedClients;
     pub const switchClient = attach.switchClient;
     pub const resizePane = attach.resizePane;
+    pub const setClientMode = layout_ops.setClientMode;
+    pub const setSplitRatio = layout_ops.setSplitRatio;
+    pub const zoomPane = layout_ops.zoomPane;
+    pub const closePane = layout_ops.closePane;
+    pub const closeWindow = layout_ops.closeWindow;
+    pub const updatePaneMetadata = metadata_mod.updatePaneMetadata;
+    pub const setPaneMetadata = metadata_mod.setPaneMetadata;
+    pub const setSessionMetadata = metadata_mod.setSessionMetadata;
     pub const reapExitedPanes = removal.reapExitedPanes;
     pub const paneScrollbackSnapshot = removal.paneScrollbackSnapshot;
     pub const paneScrollbackTail = removal.paneScrollbackTail;
@@ -318,6 +343,8 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("mux/types.zig");
     _ = @import("mux/layout.zig");
+    _ = @import("mux/layout_ops.zig");
+    _ = @import("mux/metadata.zig");
     _ = @import("mux/commands.zig");
     _ = @import("mux/creation.zig");
     _ = @import("mux/lookup.zig");

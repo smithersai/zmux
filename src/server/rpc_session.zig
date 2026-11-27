@@ -10,6 +10,7 @@ const connection_mod = @import("connection.zig");
 const fuzz_hooks_mod = @import("fuzz_hooks.zig");
 const limits_mod = @import("limits.zig");
 const params_mod = @import("params.zig");
+const rpc_screen_mod = @import("rpc_screen.zig");
 const test_support_mod = @import("test_support.zig");
 const ClientConnection = connection_mod.ClientConnection;
 const Server = server_mod.Server;
@@ -73,8 +74,15 @@ pub fn resizeSession(self: *Server, connection: *ClientConnection, req: *const p
 /// `session.capture`: reply with the last `lines` lines (default 200) as text and base64, size-bounded.
 pub fn captureSession(self: *Server, connection: *ClientConnection, req: *const protocol.Request) !void {
     const lines = try optionalInt(usize, req.params(), "lines") orelse 200;
+    const format = try optionalString(req.params(), "format");
     const active = try self.requiredSession(req);
     defer active.release();
+
+    if (format) |fmt| {
+        if (!std.mem.eql(u8, fmt, "raw")) {
+            return rpc_screen_mod.captureSessionFormatted(self, connection, req, active, lines, fmt);
+        }
+    }
 
     const captured = try active.captureBounded(self.allocator, lines, capture_max_bytes);
     defer self.allocator.free(captured);

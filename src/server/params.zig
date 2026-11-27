@@ -57,6 +57,16 @@ pub fn optionalInt(comptime T: type, params: ?Value, key: []const u8) !?T {
     return std.math.cast(T, integer) orelse error.InvalidParams;
 }
 
+/// Numeric param `key` as `f64` (accepts integer or float JSON values), null when absent.
+pub fn optionalFloat(params: ?Value, key: []const u8) !?f64 {
+    const value = paramValue(params, key) orelse return null;
+    return switch (value) {
+        .float => |n| n,
+        .integer => |n| @floatFromInt(n),
+        else => error.InvalidParams,
+    };
+}
+
 /// Object param `key`, null when absent, `InvalidParams` when present with another type.
 pub fn objectParam(params: ?Value, key: []const u8) !?Value {
     const value = paramValue(params, key) orelse return null;
@@ -121,15 +131,18 @@ pub fn scrollbackBytesFromParams(params: ?Value) !usize {
     return bytes;
 }
 
-/// Create options parsed from request params, plus the env storage they borrow. Call `deinit`.
+/// Create options parsed from request params, plus the env and metadata storage they borrow.
 pub const MuxCreateArgs = struct {
     allocator: Allocator,
     env_entries: ?[][]const u8 = null,
+    metadata_entries: ?[]mux.MetadataEntry = null,
     opts: mux.CreateOptions,
 
     pub fn deinit(self: *MuxCreateArgs) void {
         if (self.env_entries) |entries| freeStringSlice(self.allocator, entries);
+        if (self.metadata_entries) |entries| freeMetadataEntries(self.allocator, entries);
         self.env_entries = null;
+        self.metadata_entries = null;
         self.opts = .{};
     }
 };
@@ -176,6 +189,9 @@ pub fn muxCreateArgsFromParams(allocator: Allocator, params: ?Value, options: Cr
     const env_entries = try envEntriesFromParams(allocator, params);
     errdefer if (env_entries) |entries| freeStringSlice(allocator, entries);
 
+    const metadata_entries = try metadataEntriesFromParams(allocator, params, "metadata");
+    errdefer if (metadata_entries) |entries| freeMetadataEntries(allocator, entries);
+
     // `env` merges over the daemon environment by default (D3); `clearEnv`
     // asks for full replacement.
     const opts: mux.CreateOptions = .{
@@ -188,12 +204,60 @@ pub fn muxCreateArgsFromParams(allocator: Allocator, params: ?Value, options: Cr
         .rows = rows,
         .cols = cols,
         .scrollback_bytes = scrollback_bytes,
+        .metadata = metadata_entries,
     };
     return .{
         .allocator = allocator,
         .env_entries = env_entries,
+        .metadata_entries = metadata_entries,
         .opts = opts,
     };
+}
+
+/// Parse an optional string-to-string JSON object `key` into owned `mux.MetadataEntry` pairs.
+pub fn metadataEntriesFromParams(
+    allocator: Allocator,
+    params: ?Value,
+    key: []const u8,
+) !?[]mux.MetadataEntry {
+    const obj_val = paramValue(params, key) orelse return null;
+    if (obj_val != .object) return error.InvalidParams;
+    const count = obj_val.object.count();
+    const list = try allocator.alloc(mux.MetadataEntry, count);
+    var filled: usize = 0;
+    errdefer {
+        for (list[0..filled]) |entry| {
+            allocator.free(entry.key);
+            allocator.free(entry.value);
+        }
+        allocator.free(list);
+    }
+    var it = obj_val.object.iterator();
+    while (it.next()) |entry| {
+        const k = entry.key_ptr.*;
+        const v = switch (entry.value_ptr.*) {
+            .string => |s| s,
+            else => return error.InvalidParams,
+        };
+        if (k.len == 0 or std.mem.indexOfScalar(u8, k, 0) != null) return error.InvalidParams;
+        if (std.mem.indexOfScalar(u8, v, 0) != null) return error.InvalidParams;
+        const owned_k = try allocator.dupe(u8, k);
+        errdefer allocator.free(owned_k);
+        const owned_v = try allocator.dupe(u8, v);
+        list[filled] = .{ .key = owned_k, .value = owned_v };
+        filled += 1;
+    }
+    assert(filled == count);
+    return list;
+}
+
+/// Free a slice of owned `mux.MetadataEntry` pairs returned by `metadataEntriesFromParams`.
+pub fn freeMetadataEntries(allocator: Allocator, entries: []const mux.MetadataEntry) void {
+    for (entries) |entry| {
+        allocator.free(entry.key);
+        allocator.free(entry.value);
+    }
+    allocator.free(entries);
 }
 
 /// `env` / `environment`: an object of string values only. Anything else is

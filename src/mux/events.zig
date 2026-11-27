@@ -119,7 +119,45 @@ pub fn clearEventSinks(self: *Manager) void {
 /// The sink natives get: the manager trampoline when a sink is set.
 pub fn nativeSinkLocked(self: *Manager) ?native_mod.EventSink {
     if (self.event_sink == null) return null;
-    return .{ .context = self, .emit = emitThroughManager };
+    return .{
+        .context = self,
+        .emit = emitThroughManager,
+        .emit_osc = emitOscThroughManager,
+    };
+}
+
+/// Pane id and generation of an OSC event, for respawn gating.
+pub fn oscEventGateKey(event: native_mod.OscEvent) struct { pane_id: []const u8, generation: u64 } {
+    return switch (event) {
+        .pane_title_changed => |p| .{ .pane_id = p.pane_id, .generation = p.generation },
+        .pane_cwd_changed => |p| .{ .pane_id = p.pane_id, .generation = p.generation },
+        .pane_prompt_changed => |p| .{ .pane_id = p.pane_id, .generation = p.generation },
+        .pane_status_changed => |p| .{ .pane_id = p.pane_id, .generation = p.generation },
+    };
+}
+
+/// Every native OSC event passes through here with the same respawn gating
+/// and `clearEventSinks` barrier as `emitThroughManager`.
+fn emitOscThroughManager(context: *anyopaque, event: native_mod.OscEvent) void {
+    const self: *Manager = @ptrCast(@alignCast(context));
+    const key = oscEventGateKey(event);
+    self.sink_mutex.lockUncancelable(self.io);
+    self.sink_in_flight += 1;
+    while (respawn.isGatedLocked(self, key.pane_id, key.generation)) {
+        self.gate_changed.waitUncancelable(self.io, &self.sink_mutex);
+    }
+    const sink = self.event_sink;
+    self.sink_mutex.unlock(self.io);
+
+    if (sink) |active| {
+        if (active.emit_osc) |emit_fn| {
+            const previous = sink_callback_manager;
+            sink_callback_manager = self;
+            emit_fn(active.context, event);
+            sink_callback_manager = previous;
+        }
+    }
+    finishSinkCall(self);
 }
 
 /// Every native event passes through here, so `clearEventSinks` can

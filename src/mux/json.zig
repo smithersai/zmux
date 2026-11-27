@@ -115,7 +115,12 @@ pub fn writeSessionJsonLocked(self: *Manager, writer: *std.Io.Writer, session: *
         if (index > 0) try writer.writeByte(',');
         try writeWindowJsonLocked(self, writer, window);
     }
-    try writer.writeAll("]}");
+    try writer.writeByte(']');
+    if (session.metadata.count() > 0) {
+        try writer.writeAll(",\"metadata\":");
+        try session.metadata.writeJson(writer);
+    }
+    try writer.writeByte('}');
 }
 
 /// Writes a single window JSON object while the manager mutex is held.
@@ -138,7 +143,13 @@ pub fn writeWindowJsonLocked(self: *Manager, writer: *std.Io.Writer, window: *Wi
         if (index > 0) try writer.writeByte(',');
         try writePaneJson(writer, pane);
     }
-    try writer.writeAll("]}");
+    try writer.writeAll("],\"zoomedPaneId\":");
+    if (window.zoomed_pane_id) |zid| {
+        try writer.print("{f}", .{std.json.fmt(zid, .{})});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeByte('}');
 }
 
 /// Writes the attached clients JSON array while the manager mutex is held.
@@ -146,20 +157,64 @@ pub fn writeClientsJsonLocked(self: *Manager, writer: *std.Io.Writer) !void {
     try writer.writeByte('[');
     for (self.clients.items, 0..) |client, index| {
         if (index > 0) try writer.writeByte(',');
-        try writer.print(
-            "{{\"id\":{f},\"sessionId\":{f},\"windowId\":{f},\"paneId\":{f}," ++
-                "\"rows\":{},\"cols\":{},\"active\":true}}",
-            .{
-                std.json.fmt(client.id, .{}),
-                std.json.fmt(client.session_id, .{}),
-                std.json.fmt(client.window_id, .{}),
-                std.json.fmt(client.pane_id, .{}),
-                client.rows,
-                client.cols,
-            },
+        try writeClientFields(
+            writer,
+            client.id,
+            client.session_id,
+            client.window_id,
+            client.pane_id,
+            client.rows,
+            client.cols,
+            client.read_only,
+            client.resize_policy,
         );
     }
     try writer.writeByte(']');
+}
+
+/// Serialize one owned `ClientSnapshot` as a JSON `ClientInfo` object.
+pub fn clientJson(allocator: Allocator, client: *const types.ClientSnapshot) ![]u8 {
+    var out: std.Io.Writer.Allocating = try .initCapacity(allocator, 192);
+    errdefer out.deinit();
+    try writeClientFields(
+        &out.writer,
+        client.id,
+        client.session_id,
+        client.window_id,
+        client.pane_id,
+        client.rows,
+        client.cols,
+        client.read_only,
+        client.resize_policy,
+    );
+    return out.toOwnedSlice();
+}
+
+fn writeClientFields(
+    writer: *std.Io.Writer,
+    id: []const u8,
+    session_id: []const u8,
+    window_id: []const u8,
+    pane_id: []const u8,
+    rows: u16,
+    cols: u16,
+    read_only: bool,
+    resize_policy: types.ResizePolicy,
+) !void {
+    try writer.print(
+        "{{\"id\":{f},\"sessionId\":{f},\"windowId\":{f},\"paneId\":{f}," ++
+            "\"rows\":{},\"cols\":{},\"active\":true,\"readOnly\":{},\"resizePolicy\":{f}}}",
+        .{
+            std.json.fmt(id, .{}),
+            std.json.fmt(session_id, .{}),
+            std.json.fmt(window_id, .{}),
+            std.json.fmt(pane_id, .{}),
+            rows,
+            cols,
+            read_only,
+            std.json.fmt(resize_policy.label(), .{}),
+        },
+    );
 }
 
 /// Writes the key bindings JSON array while the manager mutex is held.
@@ -202,7 +257,7 @@ fn writePaneJson(writer: *std.Io.Writer, pane: *const Pane) !void {
     if (pane.spawn.cwd) |cwd| try writer.print("{f}", .{std.json.fmt(cwd, .{})}) else try writer.writeAll("null");
     try writer.print(
         ",\"command\":{f},\"alerts\":{{\"activity\":{},\"bell\":{},\"exited\":{}," ++
-            "\"lastActivityMs\":{},\"lastBellMs\":{}}}}}",
+            "\"lastActivityMs\":{},\"lastBellMs\":{}}}",
         .{
             std.json.fmt(pane.spawn.command orelse "", .{}),
             pane.alerts.activity,
@@ -212,6 +267,11 @@ fn writePaneJson(writer: *std.Io.Writer, pane: *const Pane) !void {
             pane.alerts.last_bell_ms,
         },
     );
+    if (pane.metadata.count() > 0) {
+        try writer.writeAll(",\"metadata\":");
+        try pane.metadata.writeJson(writer);
+    }
+    try writer.writeByte('}');
 }
 
 test "mux manager creates session window and pane state" {

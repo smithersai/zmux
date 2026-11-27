@@ -67,6 +67,14 @@ pub const Event = union(enum) {
     pane_bell: PaneBellEvent,
 };
 
+/// One OSC terminal intelligence event delivered to `EventSink.emit_osc`.
+pub const OscEvent = union(enum) {
+    pane_title_changed: protocol.PaneTitleChangedParams,
+    pane_cwd_changed: protocol.PaneCwdChangedParams,
+    pane_prompt_changed: protocol.PanePromptChangedParams,
+    pane_status_changed: protocol.PaneStatusChangedParams,
+};
+
 /// A chunk of PTY output, borrowed for the duration of the callback.
 pub const PaneOutputEvent = struct {
     pane_id: []const u8,
@@ -90,10 +98,11 @@ pub const PaneBellEvent = struct {
     generation: u64,
 };
 
-/// Callback receiving every `Event`; called from the reader thread.
+/// Callback receiving every `Event` (and optional `OscEvent`); called from the reader thread.
 pub const EventSink = struct {
     context: *anyopaque,
     emit: *const fn (context: *anyopaque, event: Event) void,
+    emit_osc: ?*const fn (context: *anyopaque, event: OscEvent) void = null,
 };
 
 // -- Event sink delivery (methods of `NativeSession`) --
@@ -127,18 +136,43 @@ pub fn emitEvent(self: *NativeSession, event: Event) bool {
     return true;
 }
 
+/// Emit an OSC event when a sink with `emit_osc` is installed.
+pub fn emitOscEvent(self: *NativeSession, event: OscEvent) bool {
+    self.mutex.lockUncancelable(self.io);
+    const sink = self.event_sink orelse {
+        self.mutex.unlock(self.io);
+        return false;
+    };
+    const emit_fn = sink.emit_osc orelse {
+        self.mutex.unlock(self.io);
+        return false;
+    };
+    self.in_flight += 1;
+    self.mutex.unlock(self.io);
+
+    emit_fn(sink.context, event);
+
+    self.mutex.lockUncancelable(self.io);
+    assert(self.in_flight > 0);
+    self.in_flight -= 1;
+    if (self.in_flight == 0) self.emit_idle.broadcast(self.io);
+    self.mutex.unlock(self.io);
+    return true;
+}
+
 /// Replace the sink. Passing null from any thread other than the reader
 /// also waits for in-flight callbacks, like `clearEventSink`; from inside
 /// a callback it only prevents further events.
 pub fn setEventSink(self: *NativeSession, sink: ?EventSink) void {
     const wait_for_idle = sink == null and !session.onReaderThread(self);
     self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
     self.event_sink = sink;
     if (wait_for_idle) {
         while (self.in_flight != 0) self.emit_idle.waitUncancelable(self.io, &self.mutex);
         assert(self.in_flight == 0);
     }
+    self.mutex.unlock(self.io);
+    if (sink != null) self.wakeReader();
 }
 
 /// Remove the sink and block until no callback is in flight: once this

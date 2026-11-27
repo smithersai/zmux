@@ -70,6 +70,10 @@ pub const Pty = struct {
     pub const captureForeground = signal.captureForeground;
     /// A remembered foreground group still in this session, or null.
     pub const orphanedForegroundGroup = signal.orphanedForegroundGroup;
+    /// Current foreground process group of the terminal, or 0.
+    pub const foregroundPgid = signal.foregroundPgid;
+    /// Deliver an arbitrary POSIX signal to the foreground group or child.
+    pub const sendSignal = signal.sendSignal;
 
     /// Close the master (hanging up the terminal) and the pidfd. Idempotent.
     pub fn close(self: *Pty) void {

@@ -38,6 +38,7 @@ pub fn terminate(self: *NativeSession) void {
 pub fn stopForOwnerRelease(self: *NativeSession) void {
     assert(self.id.len > 0);
     if (!self.handle.isReaped() or self.handle.orphanedForegroundGroup() != null) self.terminate();
+    self.wakeReader();
 }
 
 /// Non-blocking start of teardown: close input (waking blocked writers),
@@ -150,6 +151,7 @@ fn markTerminated(self: *NativeSession, status: ?u32) void {
     assert(self.state_value.load(.monotonic) == .terminated);
     self.exit_status = if (status) |value| decodedExitStatus(value) else null;
     self.raw_exit_status = status;
+    self.state_changed.broadcast(self.io);
 }
 
 /// Write `text`, then Enter when `enter` is set, as one atomic input.
@@ -204,12 +206,18 @@ pub fn stopInput(self: *NativeSession) void {
     if (self.input_stopped.swap(true, .seq_cst)) return;
     // A full pipe (WouldBlock) already holds a wake-up byte.
     _ = sys.write(self.stop_pipe[1], "x") catch |err| log.debug("native_stop_input_write_failed", .{ .err = err });
+    self.mutex.lockUncancelable(self.io);
+    self.state_changed.broadcast(self.io);
+    self.mutex.unlock(self.io);
 }
 
-/// Resize the terminal; fails once the session has terminated.
+/// Resize the terminal and embedded VT grid; fails once the session has terminated.
 pub fn resize(self: *NativeSession, cols: u16, rows: u16) !void {
     if (self.state() == .terminated) return error.SessionTerminated;
     try self.handle.resize(cols, rows);
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    try self.vt.resize(rows, cols);
 }
 
 fn lineBlock(allocator: std.mem.Allocator, total: usize) ![]u8 {

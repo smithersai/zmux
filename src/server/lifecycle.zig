@@ -66,7 +66,11 @@ pub fn touch(self: *Server) void {
 /// server must not move afterwards.
 pub fn installEventSinks(self: *Server) void {
     self.manager.setRespawnListener(.{ .context = self, .notify = Server.handleRespawn });
-    self.manager.setEventSink(.{ .context = self, .emit = Server.handleNativeEvent });
+    self.manager.setEventSink(.{
+        .context = self,
+        .emit = Server.handleNativeEvent,
+        .emit_osc = Server.handleNativeOscEvent,
+    });
 }
 
 /// Every respawn path (`pane.respawn`, `command.exec`, `key.dispatch`)

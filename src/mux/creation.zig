@@ -8,6 +8,7 @@ const native_mod = @import("../native.zig");
 const types = @import("types.zig");
 const lookup = @import("lookup.zig");
 const layout = @import("layout.zig");
+const metadata_mod = @import("metadata.zig");
 const events = @import("events.zig");
 
 const Allocator = std.mem.Allocator;
@@ -248,6 +249,9 @@ pub fn createPaneLocked(
     const owned_session_id = try self.allocator.dupe(u8, session.id);
     errdefer self.allocator.free(owned_session_id);
 
+    var metadata = try metadata_mod.MetadataMap.fromEntries(self.allocator, opts.metadata);
+    errdefer metadata.deinit(self.allocator);
+
     const native_opts = spawn.nativeOptions(pane_id, events.nativeSinkLocked(self));
     const native = try NativeSession.create(self.allocator, self.io, native_opts);
     self.spawn_count += 1;
@@ -260,6 +264,7 @@ pub fn createPaneLocked(
         .title = title,
         .spawn = spawn,
         .native = native,
+        .metadata = metadata,
     };
     session.next_pane_index += 1;
     return pane;

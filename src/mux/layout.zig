@@ -33,6 +33,7 @@ pub const LayoutNode = union(enum) {
     pub const Split = struct {
         id: []u8,
         axis: Axis,
+        ratio: f32 = 0.5,
         first: *LayoutNode,
         second: *LayoutNode,
     };
@@ -168,6 +169,32 @@ pub const LayoutNode = union(enum) {
         }
     }
 
+    /// Find the split node matching `split_id`, or null if absent.
+    pub fn findSplit(self: *LayoutNode, split_id: []const u8) ?*Split {
+        switch (self.*) {
+            .leaf => return null,
+            .split => |*split| {
+                if (std.mem.eql(u8, split.id, split_id)) return split;
+                return split.first.findSplit(split_id) orelse split.second.findSplit(split_id);
+            },
+        }
+    }
+
+    /// Find the innermost split node containing leaf `pane_id`, or null when root leaf.
+    pub fn findParentSplit(self: *LayoutNode, pane_id: []const u8) ?*Split {
+        switch (self.*) {
+            .leaf => return null,
+            .split => |*split| {
+                if (split.first.findParentSplit(pane_id)) |hit| return hit;
+                if (split.second.findParentSplit(pane_id)) |hit| return hit;
+                if (layoutContainsPane(split.first, pane_id) or layoutContainsPane(split.second, pane_id)) {
+                    return split;
+                }
+                return null;
+            },
+        }
+    }
+
     pub fn writeJson(self: *const LayoutNode, writer: *std.Io.Writer) !void {
         switch (self.*) {
             .leaf => |pane_id| {
@@ -176,9 +203,11 @@ pub const LayoutNode = union(enum) {
             .split => |split| {
                 assert(split.first != split.second);
                 try writer.print(
-                    "{{\"kind\":\"split\",\"id\":{f},\"axis\":{f},\"first\":",
+                    "{{\"kind\":\"split\",\"id\":{f},\"axis\":{f},\"ratio\":",
                     .{ std.json.fmt(split.id, .{}), std.json.fmt(split.axis.label(), .{}) },
                 );
+                try writeRatioJson(writer, split.ratio);
+                try writer.writeAll(",\"first\":");
                 try split.first.writeJson(writer);
                 try writer.writeAll(",\"second\":");
                 try split.second.writeJson(writer);
@@ -187,6 +216,27 @@ pub const LayoutNode = union(enum) {
         }
     }
 };
+
+fn writeRatioJson(writer: *std.Io.Writer, ratio: f32) !void {
+    const clamped: f64 = std.math.clamp(@as(f64, ratio), 0.05, 0.95);
+    const scaled: u32 = @intFromFloat(@round(clamped * 10000.0));
+    const whole = scaled / 10000;
+    const frac = scaled % 10000;
+    if (frac == 0) {
+        try writer.print("{d}.0", .{whole});
+        return;
+    }
+    var buf = [4]u8{
+        '0' + @as(u8, @intCast((frac / 1000) % 10)),
+        '0' + @as(u8, @intCast((frac / 100) % 10)),
+        '0' + @as(u8, @intCast((frac / 10) % 10)),
+        '0' + @as(u8, @intCast(frac % 10)),
+    };
+    var len: usize = 4;
+    while (len > 1 and buf[len - 1] == '0') len -= 1;
+    assert(len >= 1 and len <= 4);
+    try writer.print("{d}.{s}", .{ whole, buf[0..len] });
+}
 
 fn layoutContainsPane(node: *const LayoutNode, pane_id: []const u8) bool {
     return switch (node.*) {

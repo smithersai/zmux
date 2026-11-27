@@ -7,14 +7,47 @@ const buffer = @import("../buffer.zig");
 const mux = @import("../mux.zig");
 const native_mod = @import("../native.zig");
 const layout = @import("layout.zig");
+const metadata_mod = @import("metadata.zig");
 
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const NativeSession = native_mod.NativeSession;
 const NativeSessionOptions = native_mod.NativeSessionOptions;
 const LayoutNode = layout.LayoutNode;
+const MetadataMap = metadata_mod.MetadataMap;
+const MetadataEntry = metadata_mod.Entry;
 const Manager = mux.Manager;
 const cat_opts = mux.test_support.cat_opts;
+
+/// Multi-client PTY geometry resolution policy.
+pub const ResizePolicy = enum {
+    latest,
+    smallest,
+    largest,
+    fixed,
+    none,
+
+    /// Wire-format label for this resize policy.
+    pub fn label(self: ResizePolicy) []const u8 {
+        return @tagName(self);
+    }
+
+    /// Parse a wire-format resize policy string, returning null for unknown names.
+    pub fn parse(text: []const u8) ?ResizePolicy {
+        if (std.mem.eql(u8, text, "latest")) return .latest;
+        if (std.mem.eql(u8, text, "smallest")) return .smallest;
+        if (std.mem.eql(u8, text, "largest")) return .largest;
+        if (std.mem.eql(u8, text, "fixed")) return .fixed;
+        if (std.mem.eql(u8, text, "none")) return .none;
+        return null;
+    }
+};
+
+/// Additive client attachment mode options (`readOnly` and `resizePolicy`).
+pub const AttachOptions = struct {
+    read_only: bool = false,
+    resize_policy: ResizePolicy = .latest,
+};
 
 /// Error names the mux contract returns (review §1.10).
 pub const ContractError = error{
@@ -201,6 +234,8 @@ pub const CreateOptions = struct {
     rows: u16 = 24,
     cols: u16 = 80,
     scrollback_bytes: usize = buffer.default_capacity,
+    /// Optional initial string key-value metadata attached to the new pane.
+    metadata: ?[]const MetadataEntry = null,
 };
 
 /// Activity, bell, and exit flags of a pane, with the last event times.
@@ -225,6 +260,8 @@ pub const Pane = struct {
     spawn: SpawnSpec,
     native: *NativeSession,
     alerts: AlertState = .{},
+    resize_policy: ResizePolicy = .latest,
+    metadata: MetadataMap = .{},
 
     /// Tears down the native. Never call this with the manager mutex held: the
     /// reader thread may be blocked in the event sink waiting for that mutex.
@@ -239,6 +276,7 @@ pub const Pane = struct {
         self.native.stopForOwnerRelease();
         self.native.destroy();
         self.spawn.deinit(allocator);
+        self.metadata.deinit(allocator);
         allocator.free(self.id);
         allocator.free(self.window_id);
         allocator.free(self.session_id);
@@ -254,6 +292,7 @@ pub const Window = struct {
     index: usize,
     name: []u8,
     active_pane_id: []u8,
+    zoomed_pane_id: ?[]u8 = null,
     panes: std.ArrayList(*Pane) = .empty,
     layout: *LayoutNode,
 
@@ -266,6 +305,7 @@ pub const Window = struct {
         allocator.free(self.session_id);
         allocator.free(self.name);
         allocator.free(self.active_pane_id);
+        if (self.zoomed_pane_id) |zid| allocator.free(zid);
         allocator.destroy(self);
     }
 };
@@ -279,10 +319,12 @@ pub const Session = struct {
     windows: std.ArrayList(*Window) = .empty,
     next_window_index: usize = 0,
     next_pane_index: usize = 0,
+    metadata: MetadataMap = .{},
 
     pub fn deinit(self: *Session, allocator: Allocator) void {
         for (self.windows.items) |window| window.deinit(allocator);
         self.windows.deinit(allocator);
+        self.metadata.deinit(allocator);
         allocator.free(self.id);
         allocator.free(self.name);
         allocator.free(self.active_window_id);
@@ -299,6 +341,8 @@ pub const Client = struct {
     pane_id: []u8,
     rows: u16,
     cols: u16,
+    read_only: bool = false,
+    resize_policy: ResizePolicy = .latest,
 
     pub fn deinit(self: *Client, allocator: Allocator) void {
         allocator.free(self.id);
@@ -322,6 +366,8 @@ pub const ClientSnapshot = struct {
     pane_id: []u8,
     rows: u16,
     cols: u16,
+    read_only: bool = false,
+    resize_policy: ResizePolicy = .latest,
 
     pub fn fromClient(allocator: Allocator, client: *const Client) !ClientSnapshot {
         const id = try allocator.dupe(u8, client.id);
@@ -339,6 +385,8 @@ pub const ClientSnapshot = struct {
             .pane_id = pane_id,
             .rows = client.rows,
             .cols = client.cols,
+            .read_only = client.read_only,
+            .resize_policy = client.resize_policy,
         };
     }
 

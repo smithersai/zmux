@@ -17,6 +17,10 @@ const session = @import("native/session.zig");
 const control = @import("native/control.zig");
 const reader = @import("native/reader.zig");
 const keys = @import("native/keys.zig");
+const vt_bridge = @import("native/vt_bridge.zig");
+const screen = @import("native/screen.zig");
+const recording = @import("native/recording.zig");
+const wait_mod = @import("native/wait.zig");
 const harness = @import("native/harness.zig");
 
 /// Decoded child exit: exactly one of the fields is set for a reaped child,
@@ -70,6 +74,8 @@ pub const NativeSessionState = events.NativeSessionState;
 pub const NativeSessionOptions = events.NativeSessionOptions;
 /// One notification delivered to an `EventSink`.
 pub const Event = events.Event;
+/// One OSC semantic notification delivered to `EventSink.emit_osc`.
+pub const OscEvent = events.OscEvent;
 /// A chunk of PTY output.
 pub const PaneOutputEvent = events.PaneOutputEvent;
 /// Output resumed after silence.
@@ -78,6 +84,24 @@ pub const PaneActivityEvent = events.PaneActivityEvent;
 pub const PaneBellEvent = events.PaneBellEvent;
 /// Callback receiving every `Event`.
 pub const EventSink = events.EventSink;
+/// Semantic pane status combining process state, OSC 7501/133, and idle time.
+pub const SemanticStatus = vt_bridge.SemanticStatus;
+/// Options controlling `NativeSession.screenJson`.
+pub const ScreenJsonOptions = screen.ScreenJsonOptions;
+/// Delta scrollback slice returned by `NativeSession.scrollbackSliceSince`.
+pub const DeltaTail = vt_bridge.DeltaTail;
+/// Options for `NativeSession.startRecording`.
+pub const RecordStartOptions = recording.StartOptions;
+/// Recording status snapshot returned by `NativeSession.recordingStatus`.
+pub const RecordStatus = recording.RecordStatus;
+/// Wait conditions for `NativeSession.waitCondition`.
+pub const WaitOptions = wait_mod.WaitOptions;
+/// Wait outcome returned by `NativeSession.waitCondition`.
+pub const WaitResult = wait_mod.WaitResult;
+/// Why `NativeSession.waitCondition` resolved.
+pub const WaitReason = wait_mod.WaitReason;
+/// Result of `NativeSession.execInPane`.
+pub const ExecResult = wait_mod.ExecResult;
 /// A single PTY-backed shell; see `native/session.zig`.
 pub const NativeSession = session.NativeSession;
 /// Terminal byte sequence for a tmux-style key name.
@@ -121,6 +145,10 @@ test {
     _ = @import("native/control.zig");
     _ = @import("native/reader.zig");
     _ = @import("native/keys.zig");
+    _ = @import("native/vt_bridge.zig");
+    _ = @import("native/screen.zig");
+    _ = @import("native/recording.zig");
+    _ = @import("native/wait.zig");
     _ = @import("native/harness.zig");
 }
 

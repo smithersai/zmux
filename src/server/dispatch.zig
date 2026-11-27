@@ -83,6 +83,21 @@ pub fn dispatch(self: *Server, connection: *ClientConnection, req: *const protoc
     if (std.mem.eql(u8, req.method, "key.list")) return self.listKeys(connection, req);
     if (std.mem.eql(u8, req.method, "command.exec")) return self.execCommand(connection, req);
 
+    return dispatchExtension(self, connection, req);
+}
+
+fn dispatchExtension(self: *Server, connection: *ClientConnection, req: *const protocol.Request) !void {
+    if (std.mem.eql(u8, req.method, "session.screen")) return self.screenSession(connection, req);
+    if (std.mem.eql(u8, req.method, "pane.wait")) return self.waitPane(connection, req);
+    if (std.mem.eql(u8, req.method, "pane.exec")) return self.execPane(connection, req);
+    if (std.mem.eql(u8, req.method, "pane.signal")) return self.signalPane(connection, req);
+    if (std.mem.eql(u8, req.method, "pane.close")) return self.closePane(connection, req);
+    if (std.mem.eql(u8, req.method, "window.close")) return self.closeWindow(connection, req);
+    if (std.mem.eql(u8, req.method, "pane.resizeSplit")) return self.resizeSplit(connection, req);
+    if (std.mem.eql(u8, req.method, "pane.zoom")) return self.zoomPane(connection, req);
+    if (std.mem.eql(u8, req.method, "pane.metadata")) return self.metadataPane(connection, req);
+    if (std.mem.eql(u8, req.method, "pane.record")) return self.recordPane(connection, req);
+    if (std.mem.eql(u8, req.method, "client.setMode")) return self.setClientMode(connection, req);
     return error.MethodNotFound;
 }
 

@@ -205,6 +205,18 @@ pub fn handleNativeEvent(context: *anyopaque, event: native_mod.Event) void {
     }
 }
 
+/// OSC event sink callback: broadcast dynamic title, CWD, OSC 133 prompt, and
+/// OSC 7501/9/777 agent status notifications to connected clients.
+pub fn handleNativeOscEvent(context: *anyopaque, event: native_mod.OscEvent) void {
+    const self: *Server = @ptrCast(@alignCast(context));
+    switch (event) {
+        .pane_title_changed => |params| self.broadcastNotification(protocol.pane_title_changed_method, params),
+        .pane_cwd_changed => |params| self.broadcastNotification(protocol.pane_cwd_changed_method, params),
+        .pane_prompt_changed => |params| self.broadcastNotification(protocol.pane_prompt_changed_method, params),
+        .pane_status_changed => |params| self.broadcastNotification(protocol.pane_status_changed_method, params),
+    }
+}
+
 /// Tell `owner` that its mux client `client_id` was detached, and why.
 pub fn notifyClientDetached(self: *Server, owner: *ClientConnection, client_id: []const u8, reason: []const u8) void {
     assert(reason.len > 0);

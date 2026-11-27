@@ -47,23 +47,7 @@ pub fn checkInvariants(self: *Manager, allocator: Allocator) !void {
             if ((try seen_windows.fetchPut(window.id, {})) != null) return error.DuplicateWindowId;
             if (!std.mem.eql(u8, window.session_id, session.id)) return error.WindowSessionMismatch;
             if (std.mem.eql(u8, window.id, session.active_window_id)) active_window_found = true;
-            if (window.panes.items.len == 0) return error.EmptyWindow;
-
-            var layout_leaves = std.StringHashMap(void).init(allocator);
-            defer layout_leaves.deinit();
-            try collectLayoutLeaves(window.layout, &layout_leaves);
-
-            var active_pane_found = false;
-            for (window.panes.items) |pane| {
-                if ((try seen_panes.fetchPut(pane.id, {})) != null) return error.DuplicatePaneId;
-                if (!std.mem.eql(u8, pane.session_id, session.id)) return error.PaneSessionMismatch;
-                if (!std.mem.eql(u8, pane.window_id, window.id)) return error.PaneWindowMismatch;
-                if (!std.mem.eql(u8, pane.native.id, pane.id)) return error.PaneNativeIdMismatch;
-                if (std.mem.eql(u8, pane.id, window.active_pane_id)) active_pane_found = true;
-                if (!layout_leaves.contains(pane.id)) return error.PaneMissingFromLayout;
-            }
-            if (!active_pane_found) return error.DanglingActivePane;
-            if (layout_leaves.count() != window.panes.items.len) return error.LayoutPaneCountMismatch;
+            try checkWindowInvariantsLocked(allocator, session, window, &seen_panes);
         }
         if (!active_window_found) return error.DanglingActiveWindow;
     }
@@ -87,6 +71,35 @@ pub fn checkInvariants(self: *Manager, allocator: Allocator) !void {
     if (self.detached_clients.capacity < self.detached_clients.items.len + self.clients.items.len) {
         return error.DetachedCapacityShort;
     }
+}
+
+fn checkWindowInvariantsLocked(
+    allocator: Allocator,
+    session: *const types.Session,
+    window: *const types.Window,
+    seen_panes: *std.StringHashMap(void),
+) !void {
+    if (window.panes.items.len == 0) return error.EmptyWindow;
+    var layout_leaves = std.StringHashMap(void).init(allocator);
+    defer layout_leaves.deinit();
+    try collectLayoutLeaves(window.layout, &layout_leaves);
+
+    var active_pane_found = false;
+    var zoomed_pane_found = window.zoomed_pane_id == null;
+    for (window.panes.items) |pane| {
+        if ((try seen_panes.fetchPut(pane.id, {})) != null) return error.DuplicatePaneId;
+        if (!std.mem.eql(u8, pane.session_id, session.id)) return error.PaneSessionMismatch;
+        if (!std.mem.eql(u8, pane.window_id, window.id)) return error.PaneWindowMismatch;
+        if (!std.mem.eql(u8, pane.native.id, pane.id)) return error.PaneNativeIdMismatch;
+        if (std.mem.eql(u8, pane.id, window.active_pane_id)) active_pane_found = true;
+        if (window.zoomed_pane_id) |zid| {
+            if (std.mem.eql(u8, pane.id, zid)) zoomed_pane_found = true;
+        }
+        if (!layout_leaves.contains(pane.id)) return error.PaneMissingFromLayout;
+    }
+    if (!active_pane_found) return error.DanglingActivePane;
+    if (!zoomed_pane_found) return error.DanglingZoomedPane;
+    if (layout_leaves.count() != window.panes.items.len) return error.LayoutPaneCountMismatch;
 }
 
 /// Every pane in the tree has a `panes_by_id` entry pointing back at it.

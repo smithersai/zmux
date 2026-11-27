@@ -4,12 +4,14 @@ const std = @import("std");
 const builtin = @import("builtin");
 const buffer = @import("../buffer.zig");
 const foreground = @import("../foreground.zig");
+const reactor_mod = @import("../reactor.zig");
 const sys = @import("../sys.zig");
 const log = @import("../log.zig");
 const root = @import("../native.zig");
 const session = @import("session.zig");
 const events = @import("events.zig");
 const control = @import("control.zig");
+const vt_bridge = @import("vt_bridge.zig");
 const harness = @import("harness.zig");
 const assert = std.debug.assert;
 const NativeSession = session.NativeSession;
@@ -23,12 +25,19 @@ const Recorder = harness.Recorder;
 const testCreate = harness.testCreate;
 const Reaper = harness.Reaper;
 
+/// Reactor correlation token for the PTY master descriptor.
+pub const master_token: u64 = 1;
+/// Reactor correlation token for the child process exit watch.
+pub const pid_token: u64 = 2;
+
 /// Extra lookups (with doubling backoff) for a foreground group whose
 /// process info could not be read, before the fallback form is accepted.
 const foreground_degraded_retries: u8 = 4;
 
-/// Reader thread body: drain PTY output until the child is reaped and the
-/// stream is final, then run the epilogue.
+const WaitStep = enum { readable, hup_try_read, retry, stop_overtime };
+
+/// Reader thread body: drain PTY output via the OS reactor until the child
+/// is reaped and the stream is final, then run the epilogue.
 pub fn readerLoop(self: *NativeSession) void {
     assert(!self.reader_finished.load(.seq_cst));
     self.reader_tid.store(session.currentThreadTag(), .seq_cst);
@@ -36,81 +45,109 @@ pub fn readerLoop(self: *NativeSession) void {
     var read_buf: [32 * 1024]u8 = undefined;
     var pty_eof = false;
     var exit_seen_ms: ?i64 = null;
-    // Bytes read after the idle wait ended; see `exit_drain_max_bytes`.
     var overtime_bytes: usize = 0;
 
-    // The loop runs until the child is reaped and the PTY is drained.
-    // `reader_stop` and the post-exit grace end only the *waiting*: data
-    // that is immediately readable is still delivered, because the
-    // kernel buffer holds the only copy of it.
     while (true) {
         const stopping = self.reader_stop.load(.seq_cst);
-        // The last reference was dropped from inside a callback on this
-        // thread: the owner is gone, deliver nothing more.
         if (stopping and self.destroy_on_reader_exit.load(.seq_cst)) break;
-
         if (exit_seen_ms == null and control.reapIsDone(self)) exit_seen_ms = session.monotonicMs(self);
 
         const wait = switch (readerWait(self, stopping, pty_eof, exit_seen_ms, overtime_bytes)) {
             .done => break,
-            .wait => |wait| wait,
+            .wait => |w| w,
         };
-        const overtime = wait.overtime;
-
-        // Negative descriptors are ignored by poll(2). After PTY EOF with
-        // a live child (it closed its terminal) only the exit is awaited.
-        const master_fd = if (pty_eof) -1 else self.handle.master_fd;
-        const pid_fd = if (exit_seen_ms == null) self.handle.pid_fd else -1;
-        var fds = [_]std.posix.pollfd{
-            .{ .fd = master_fd, .events = std.posix.POLL.IN, .revents = 0 },
-            .{ .fd = pid_fd, .events = std.posix.POLL.IN, .revents = 0 },
-        };
-        const ready = std.posix.poll(&fds, wait.timeout_ms) catch {
-            if (overtime) break;
-            session.sleepMs(self, 10);
-            continue;
-        };
-        if (ready == 0 or fds[0].revents == 0) {
-            // Nothing is buffered any more: the stream is final.
-            if (overtime) break;
-            continue;
-        }
-
-        const n = self.handle.read(&read_buf) catch |err| switch (err) {
-            error.WouldBlock => {
-                if (overtime) break;
-                continue;
+        const step = waitForReactor(self, wait.timeout_ms, wait.overtime, &exit_seen_ms);
+        switch (step) {
+            .stop_overtime => break,
+            .retry => continue,
+            .readable, .hup_try_read => {
+                const n = self.handle.read(&read_buf) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        if (step == .hup_try_read) {
+                            markPtyEof(self, &pty_eof);
+                            continue;
+                        }
+                        if (wait.overtime) break;
+                        continue;
+                    },
+                    else => {
+                        markPtyEof(self, &pty_eof);
+                        continue;
+                    },
+                };
+                if (n == 0) {
+                    markPtyEof(self, &pty_eof);
+                    continue;
+                }
+                assert(n <= read_buf.len);
+                if (wait.overtime) overtime_bytes += n;
+                handleOutput(self, read_buf[0..n]);
             },
-            // Linux reports EIO once every slave descriptor is closed.
-            else => {
-                pty_eof = true;
-                continue;
-            },
-        };
-        if (n == 0) {
-            pty_eof = true;
-            continue;
         }
-        assert(n <= read_buf.len);
-        if (overtime) overtime_bytes += n;
-        handleOutput(self, read_buf[0..n]);
     }
 
     finishReader(self);
+}
+
+fn markPtyEof(self: *NativeSession, pty_eof: *bool) void {
+    pty_eof.* = true;
+    self.reactor.unwatchFd(self.handle.master_fd);
+}
+
+fn waitForReactor(
+    self: *NativeSession,
+    timeout_ms: ?i32,
+    overtime: bool,
+    exit_seen_ms: *?i64,
+) WaitStep {
+    var ev_buf: [8]reactor_mod.Event = undefined;
+    const ready = self.reactor.wait(&ev_buf, timeout_ms) catch {
+        if (overtime) return .stop_overtime;
+        session.sleepMs(self, 10);
+        return .retry;
+    };
+    if (ready.len == 0) return if (overtime) .stop_overtime else .retry;
+
+    var saw_readable = false;
+    var saw_hup = false;
+    for (ready) |ev| {
+        switch (ev.kind) {
+            .fd_readable => if (ev.token == master_token) {
+                saw_readable = true;
+            },
+            .fd_hup, .fd_err => if (ev.token == master_token) {
+                saw_hup = true;
+            },
+            .pid_exited => {
+                if (exit_seen_ms.* == null) {
+                    if (control.reapIsDone(self)) {
+                        exit_seen_ms.* = session.monotonicMs(self);
+                    } else {
+                        self.pid_watched = false;
+                    }
+                }
+            },
+            .wakeup, .fd_writable => {},
+        }
+    }
+    if (saw_readable) return .readable;
+    if (saw_hup) return .hup_try_read;
+    return .retry;
 }
 
 const ReaderWait = union(enum) {
     /// The child is reaped and the stream is drained (or abandoned).
     done,
     wait: struct {
-        timeout_ms: i32,
+        timeout_ms: ?i32,
         /// No more waiting, only draining what is already readable.
         overtime: bool,
     },
 };
 
-/// Decide how long the reader's next poll may block. Also runs the
-/// periodic foreground-process check while the child is alive.
+/// Decide how long the reader's next reactor wait may block. Runs periodic
+/// foreground polling only while an event sink is attached; otherwise waits
+/// indefinitely with zero polling until output, process exit, or wakeup.
 fn readerWait(
     self: *NativeSession,
     stopping: bool,
@@ -118,39 +155,44 @@ fn readerWait(
     exit_seen_ms: ?i64,
     overtime_bytes: usize,
 ) ReaderWait {
-    // With a pidfd the exit wakes the poll; without one (Darwin) a
-    // short timeout bounds how late the exit is noticed.
-    var timeout_ms: i32 = if (self.handle.pid_fd >= 0) 100 else 25;
+    var timeout_ms: ?i32 = if (self.pid_watched) null else 100;
     var overtime = false;
     if (stopping) {
         if (pty_eof) return .done;
         overtime = true;
     } else if (exit_seen_ms) |seen| {
         if (pty_eof) return .done;
-        // A descendant still holds the slave open: stop waiting for
-        // an EOF that may never come.
         const remaining = exit_drain_grace_ms - (session.monotonicMs(self) - seen);
         if (remaining <= 0) overtime = true else timeout_ms = @intCast(remaining);
-    } else if (!pty_eof) {
-        // A failed lookup is retried on the next poll interval.
+    } else if (!pty_eof and events.hasEventSink(self)) {
         pollForegroundChange(self) catch |err| log.debug("native_foreground_poll_failed", .{ .err = err });
+        const rem = @max(@as(i64, 1), self.next_foreground_check_ms - session.monotonicMs(self));
+        const fg_timeout: i32 = @intCast(@min(rem, std.math.maxInt(i32)));
+        timeout_ms = if (timeout_ms) |cap| @min(cap, fg_timeout) else fg_timeout;
     }
     if (overtime) {
         if (overtime_bytes >= exit_drain_max_bytes) return .done;
         timeout_ms = 0;
     }
-    assert(timeout_ms >= 0);
+    assert(timeout_ms == null or timeout_ms.? >= 0);
     return .{ .wait = .{ .timeout_ms = timeout_ms, .overtime = overtime } };
 }
 
 fn handleOutput(self: *NativeSession, data: []const u8) void {
     assert(data.len > 0);
-    // The offset is taken under the same lock as the append, so
-    // consecutive events carry contiguous offsets.
+    const now_ms = session.nowMs(self);
+    const mono_ms = session.monotonicMs(self);
+    var osc_collector: vt_bridge.OscCollector = .{ .term = &self.vt };
+
     self.mutex.lockUncancelable(self.io);
     const offset = self.scrollback.endOffset();
     self.scrollback.append(data);
     assert(self.scrollback.endOffset() == offset + data.len);
+    self.recorder.recordChunk(self.allocator, self.io, data);
+    vt_bridge.feedVtLocked(self, data, &osc_collector);
+    const was_idle = if (self.last_output_ms) |last| mono_ms - last >= activity_idle_ms else true;
+    self.last_output_ms = mono_ms;
+    self.state_changed.broadcast(self.io);
     self.mutex.unlock(self.io);
 
     _ = events.emitEvent(self, .{ .pane_output = .{
@@ -159,11 +201,6 @@ fn handleOutput(self: *NativeSession, data: []const u8) void {
         .offset = offset,
         .generation = self.generation_value,
     } });
-
-    const now_ms = session.nowMs(self);
-    const mono_ms = session.monotonicMs(self);
-    const was_idle = if (self.last_output_ms) |last| mono_ms - last >= activity_idle_ms else true;
-    self.last_output_ms = mono_ms;
     if (was_idle) {
         _ = events.emitEvent(self, .{ .pane_activity = .{
             .pane_id = self.id,
@@ -178,22 +215,22 @@ fn handleOutput(self: *NativeSession, data: []const u8) void {
             .generation = self.generation_value,
         } });
     }
+    if (osc_collector.anyChanged()) osc_collector.emitAll(self);
 }
 
 /// Reader epilogue: emit `session_exited` once (after every
 /// `pane_output`), release the master, and hand off or finish teardown.
 fn finishReader(self: *NativeSession) void {
     assert(session.onReaderThread(self));
+    self.reactor.unwatchFd(self.handle.master_fd);
+    self.reactor.unwatchPid(self.handle.child_pid);
+
     if (self.handle.isReaped()) {
-        // Re-verify any remembered foreground group right at reap time so
-        // a short-lived job that already exited is cleared immediately and
-        // cannot match a later PID wrap on a retained exited pane.
         _ = self.handle.orphanedForegroundGroup();
-        // All PTY output is now in scrollback. Flip `stream_finalized`
-        // before emitting `session_exited` so a concurrent attach either
-        // sees `finalizedExitInfo() == null` and receives `session_exited`,
-        // or sees `finalizedExitInfo() != null` with the complete tail.
         self.stream_finalized.store(true, .seq_cst);
+        self.mutex.lockUncancelable(self.io);
+        self.state_changed.broadcast(self.io);
+        self.mutex.unlock(self.io);
         const exit: ExitInfo = self.exitInfo() orelse .{ .exit_code = null, .signal = null };
         _ = events.emitEvent(self, .{ .session_exited = .{
             .session_id = self.id,
@@ -203,10 +240,6 @@ fn finishReader(self: *NativeSession) void {
             .generation = self.generation_value,
         } });
 
-        // An exited pane keeps its scrollback but not its descriptors.
-        // `input_mutex` keeps the close from racing an in-flight write;
-        // stopping input first wakes a writer blocked on a full queue,
-        // so the lock is not held up for the rest of its deadline.
         self.stopInput();
         self.input_mutex.lockUncancelable(self.io);
         self.handle.close();
@@ -217,8 +250,6 @@ fn finishReader(self: *NativeSession) void {
     self.reader_finished.store(true, .seq_cst);
 
     if (self.destroy_on_reader_exit.load(.seq_cst)) {
-        // The owner dropped the last reference from inside a callback on
-        // this thread. Nobody will join us: detach and finish teardown.
         if (self.reader_thread) |thread| thread.detach();
         self.stopForOwnerRelease();
         session.freeResources(self);

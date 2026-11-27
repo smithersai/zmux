@@ -11,6 +11,7 @@ const connection_mod = @import("connection.zig");
 const fuzz_hooks_mod = @import("fuzz_hooks.zig");
 const limits_mod = @import("limits.zig");
 const params_mod = @import("params.zig");
+const rpc_screen_mod = @import("rpc_screen.zig");
 const rpc_session_mod = @import("rpc_session.zig");
 const test_support_mod = @import("test_support.zig");
 const ClientConnection = connection_mod.ClientConnection;
@@ -30,6 +31,7 @@ const max_response_bytes = server_mod.max_response_bytes;
 const muxCreateArgsFromParams = params_mod.muxCreateArgsFromParams;
 const objectParam = params_mod.objectParam;
 const optionalBool = params_mod.optionalBool;
+const optionalInt = params_mod.optionalInt;
 const optionalString = params_mod.optionalString;
 const paneIdParam = params_mod.paneIdParam;
 const resultOf = test_support_mod.resultOf;
@@ -46,12 +48,41 @@ pub fn attachCreateArgs(self: *Server, params: ?Value) !?MuxCreateArgs {
     return args;
 }
 
+const ParsedAttachParams = struct {
+    attach_opts: mux.AttachOptions,
+    replay_opts: rpc_screen_mod.AttachReplayOpts,
+};
+
+fn parseAttachOpts(params: ?Value) !ParsedAttachParams {
+    const read_only = try optionalBool(params, "readOnly") orelse false;
+    const policy = if (try optionalString(params, "resizePolicy")) |s|
+        (mux.ResizePolicy.parse(s) orelse return error.InvalidParams)
+    else
+        .latest;
+    const replay_mode = if (try optionalString(params, "replayMode")) |s|
+        (rpc_screen_mod.ReplayMode.parse(s) orelse return error.InvalidParams)
+    else
+        .raw;
+    const resume_off = try optionalInt(u64, params, "resumeFromOffset");
+    const resume_gen = try optionalInt(u64, params, "resumeGeneration");
+    return .{
+        .attach_opts = .{ .read_only = read_only, .resize_policy = policy },
+        .replay_opts = .{
+            .mode = replay_mode,
+            .resume_from_offset = resume_off,
+            .resume_generation = resume_gen,
+            .read_only = read_only,
+        },
+    };
+}
+
 /// `client.attach`: attach a mux client to a pane, creating it when missing, and reply with a replay.
 pub fn attachMuxClient(self: *Server, connection: *ClientConnection, req: *const protocol.Request) !void {
     const params = req.params();
     const target = try paneIdParam(params) orelse return error.InvalidParams;
     const rows = try dimensionParam(params, "rows", 24);
     const cols = try dimensionParam(params, "cols", 80);
+    const parsed = try parseAttachOpts(params);
 
     var create_args = try self.attachCreateArgs(params);
     defer if (create_args) |*args| args.deinit();
@@ -63,7 +94,13 @@ pub fn attachMuxClient(self: *Server, connection: *ClientConnection, req: *const
     defer if (routing_held) self.routing_mutex.unlock(self.io);
 
     const create_opts = if (create_args) |args| args.opts else null;
-    var attached = try self.manager.attachOrCreateClient(target, rows, cols, create_opts);
+    var attached = try self.manager.attachOrCreateClientWithOptions(
+        target,
+        rows,
+        cols,
+        create_opts,
+        parsed.attach_opts,
+    );
     defer attached.client.deinit(self.allocator);
     const client = &attached.client;
     errdefer _ = self.manager.detachClient(client.id);
@@ -72,9 +109,7 @@ pub fn attachMuxClient(self: *Server, connection: *ClientConnection, req: *const
     // Hold the write side so the response is on the wire before any
     // `pane_output` this attach subscribes to, and before any lifecycle
     // notification (`session_exited`, `pane_respawned`) queued after the
-    // state below is read. Subscribing before the snapshot leaves no
-    // gap: every output event at or after `replayEndOffset` is delivered,
-    // and anything earlier is in the replay.
+    // state below is read.
     connection.write_mutex.lockUncancelable(connection.io);
     defer connection.write_mutex.unlock(connection.io);
 
@@ -84,56 +119,9 @@ pub fn attachMuxClient(self: *Server, connection: *ClientConnection, req: *const
     self.routing_mutex.unlock(self.io);
     routing_held = false;
 
-    // Status, generation, and replay all come from one retained native,
-    // read after the write lock: an exit or respawn either shows up here
-    // or is announced after this reply, never in between.
     const native = self.manager.find(client.pane_id) orelse return error.PaneNotFound;
     defer native.release();
-    try writeAttachReply(self, connection, req, client, attached.created, native);
-}
-
-/// Reply to `client.attach` with the pane state and an offset-aligned
-/// replay. Caller holds `connection.write_mutex`.
-fn writeAttachReply(
-    self: *Server,
-    connection: *ClientConnection,
-    req: *const protocol.Request,
-    client: *const mux.ClientSnapshot,
-    created: bool,
-    native: *native_mod.NativeSession,
-) !void {
-    const exit = native.finalizedExitInfo();
-    const generation = native.generation();
-    const tail = try native.scrollbackTail(self.allocator, attach_replay_max_bytes);
-    defer self.allocator.free(tail.bytes);
-    assert(tail.bytes.len <= attach_replay_max_bytes);
-    assert(tail.end_offset - tail.start_offset == tail.bytes.len);
-    const replay_b64 = try base64Encode(self.allocator, tail.bytes);
-    defer self.allocator.free(replay_b64);
-
-    const exit_code: ?u32 = if (exit) |info| info.exit_code else null;
-    const signal: ?u32 = if (exit) |info| info.signal else null;
-    if (protocol.isNotification(req)) return;
-    const response = try protocol.result(self.allocator, req.id_json, .{
-        .clientId = client.id,
-        .sessionId = client.session_id,
-        .windowId = client.window_id,
-        .paneId = client.pane_id,
-        .rows = client.rows,
-        .cols = client.cols,
-        .created = created,
-        .exited = exit != null,
-        .exitCode = exit_code,
-        .signal = signal,
-        .generation = generation,
-        .replayBase64 = replay_b64,
-        .replayStartOffset = tail.start_offset,
-        .replayEndOffset = tail.end_offset,
-    });
-    defer self.allocator.free(response);
-    if (response.len > max_response_bytes) return error.LimitExceeded;
-    assert(response.len > replay_b64.len);
-    try connection.writeLocked(response);
+    try rpc_screen_mod.writeAttachReply(self, connection, req, client, attached.created, native, parsed.replay_opts);
 }
 
 /// `client.detach`: detach a mux client and notify its owner when it lives on another connection.

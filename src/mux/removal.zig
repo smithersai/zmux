@@ -219,6 +219,12 @@ pub fn takePaneLocked(self: *Manager, found: PaneRef) !RemovedItems {
     const removed = window.panes.swapRemove(index);
     _ = self.panes_by_id.remove(removed.id);
     _ = window.layout.removeLeaf(self.allocator, removed.id);
+    if (window.zoomed_pane_id) |zid| {
+        if (std.mem.eql(u8, zid, removed.id)) {
+            self.allocator.free(zid);
+            window.zoomed_pane_id = null;
+        }
+    }
     if (new_active_pane) |value| {
         self.allocator.free(window.active_pane_id);
         window.active_pane_id = value;
@@ -232,6 +238,35 @@ pub fn takePaneLocked(self: *Manager, found: PaneRef) !RemovedItems {
         session.active_window_id = value;
     }
     return .{ .window = removed_window, .pane = removed };
+}
+
+/// Removes one window (not the last window of its session) and detaches all
+/// clients attached to panes in that window. Caller handles the last-window
+/// case with `takeSessionLocked`.
+pub fn takeWindowLocked(self: *Manager, found: types.WindowRef) !RemovedItems {
+    const session = found.session;
+    const window = found.window;
+    assert(session.windows.items.len > 1);
+    const window_index = std.mem.indexOfScalar(*Window, session.windows.items, window) orelse return .{};
+
+    var new_active_window: ?[]u8 = null;
+    if (std.mem.eql(u8, session.active_window_id, window.id)) {
+        const successor = session.windows.items[if (window_index == 0) 1 else 0];
+        assert(successor != window);
+        new_active_window = try self.allocator.dupe(u8, successor.id);
+    }
+
+    // Commit: nothing below can fail.
+    for (window.panes.items) |pane| {
+        attach.detachClientsLocked(self, .pane, pane.id, .pane_removed);
+        _ = self.panes_by_id.remove(pane.id);
+    }
+    const removed_window = session.windows.swapRemove(window_index);
+    if (new_active_window) |value| {
+        self.allocator.free(session.active_window_id);
+        session.active_window_id = value;
+    }
+    return .{ .window = removed_window };
 }
 
 test "terminate by session id removes the whole session" {

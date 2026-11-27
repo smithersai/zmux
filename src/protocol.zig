@@ -68,6 +68,14 @@ pub const pane_output_dropped_method = "pane_output_dropped";
 pub const pane_respawned_method = "pane_respawned";
 /// Notification method sent when the daemon detaches a client.
 pub const client_detached_method = "client_detached";
+/// Notification method sent when OSC 0 or OSC 2 updates a pane's dynamic title.
+pub const pane_title_changed_method = "pane_title_changed";
+/// Notification method sent when OSC 7 reports a pane working directory change.
+pub const pane_cwd_changed_method = "pane_cwd_changed";
+/// Notification method sent when OSC 133 updates shell prompt state or command exit.
+pub const pane_prompt_changed_method = "pane_prompt_changed";
+/// Notification method sent when OSC 7501, OSC 9, or OSC 777 updates agent status.
+pub const pane_status_changed_method = "pane_status_changed";
 
 /// Params of a `foreground_changed` notification.
 pub const ForegroundChangedParams = struct {
@@ -133,6 +141,37 @@ pub const ClientDetachedParams = struct {
     client_id: []const u8,
     /// `"pane_removed"`, `"session_removed"`, or `"remote_detach"`.
     reason: []const u8,
+};
+
+/// Params of a `pane_title_changed` notification (OSC 0 / OSC 2).
+pub const PaneTitleChangedParams = struct {
+    pane_id: []const u8,
+    title: []const u8,
+    generation: u64 = 0,
+};
+
+/// Params of a `pane_cwd_changed` notification (OSC 7).
+pub const PaneCwdChangedParams = struct {
+    pane_id: []const u8,
+    cwd: []const u8,
+    generation: u64 = 0,
+};
+
+/// Params of a `pane_prompt_changed` notification (OSC 133).
+pub const PanePromptChangedParams = struct {
+    pane_id: []const u8,
+    prompt_state: []const u8,
+    last_exit_code: ?i32 = null,
+    command_seq: u64 = 0,
+    generation: u64 = 0,
+};
+
+/// Params of a `pane_status_changed` notification (OSC 7501 / 9 / 777).
+pub const PaneStatusChangedParams = struct {
+    pane_id: []const u8,
+    status: []const u8,
+    message: ?[]const u8 = null,
+    generation: u64 = 0,
 };
 
 /// Format `{"jsonrpc":"2.0","id":<id>,"result":<value>}\n` into a new

@@ -88,19 +88,67 @@ pub fn orphanedForegroundGroup(self: *Pty) ?posix.pid_t {
     return rememberedForegroundLocked(self);
 }
 
+/// Current foreground process group of the terminal, or 0 when unavailable or reaped.
+pub fn foregroundPgid(self: *Pty) posix.pid_t {
+    assert(self.child_pid > 0);
+    self.wait_mutex.lockUncancelable(self.io);
+    defer self.wait_mutex.unlock(self.io);
+    if (self.reaped or self.master_fd < 0) return 0;
+    const fg = tcgetpgrp(self.master_fd);
+    return if (fg > 0) fg else 0;
+}
+
+/// Deliver `sig` to the terminal foreground process group (when `to_group` is
+/// true, falling back to the shell process group) or directly to the child
+/// process, without tearing down the pane. Fails with `SessionTerminated` once
+/// the child has been reaped.
+pub fn sendSignal(
+    self: *Pty,
+    sig: posix.SIG,
+    to_group: bool,
+) error{ SessionTerminated, InputOutput }!void {
+    assert(self.child_pid > 0);
+    self.wait_mutex.lockUncancelable(self.io);
+    const notify = self.refreshReapLocked();
+    if (self.reaped) {
+        self.wait_mutex.unlock(self.io);
+        self.notifyExit(notify);
+        return error.SessionTerminated;
+    }
+    const delivered = if (to_group) blk: {
+        if (foregroundTargetLocked(self)) |fg| {
+            assert(fg > 1);
+            break :blk sys.kill(-fg, sig);
+        }
+        break :blk signalShellGroupResultLocked(self, sig);
+    } else blk: {
+        if (is_linux and self.pid_fd >= 0) {
+            break :blk sys.pidfdSendSignal(self.pid_fd, sig);
+        }
+        break :blk sys.kill(self.child_pid, sig);
+    };
+    self.wait_mutex.unlock(self.io);
+    self.notifyExit(notify);
+    if (!delivered) return error.InputOutput;
+}
+
 /// Signal the shell's process group (or the shell alone before `setsid`).
 fn signalShellGroupLocked(self: *Pty, sig: posix.SIG) void {
+    _ = signalShellGroupResultLocked(self, sig);
+}
+
+/// Signal the shell's process group (or child fallback) and return whether the syscall succeeded.
+fn signalShellGroupResultLocked(self: *Pty, sig: posix.SIG) bool {
     assert(self.child_pid > 0);
     // The child calls `setsid`, so its PID is also its group id.
-    if (sys.kill(-self.child_pid, sig)) return;
+    if (sys.kill(-self.child_pid, sig)) return true;
     // The instant before `setsid` has run there is no such group yet.
     // With a pidfd the signal goes to exactly the process that was
     // forked, never to one that reused the PID after an external reap.
     if (is_linux and self.pid_fd >= 0) {
-        _ = sys.pidfdSendSignal(self.pid_fd, sig);
-        return;
+        return sys.pidfdSendSignal(self.pid_fd, sig);
     }
-    _ = sys.kill(self.child_pid, sig);
+    return sys.kill(self.child_pid, sig);
 }
 
 /// The group to signal as "the foreground job": the terminal's live
@@ -404,4 +452,44 @@ test "a remembered foreground group outside the session is never signalled" {
     child.hangupForeground();
     try std.testing.expectEqual(kills_before, sys.kill_call_count.load(.seq_cst));
     try std.testing.expectEqual(@as(posix.pid_t, 0), child.foreground_pgid);
+}
+
+test "sendSignal delivers SIGUSR1 without terminating the pane and rejects exited children" {
+    if (!supported_os) return error.SkipZigTest;
+    var child = try Pty.spawn(std.testing.allocator, std.testing.io, .{
+        .shell = "/bin/sh",
+        .command = "trap 'printf GOT_USR1; exit 0' USR1; printf READY; sleep 10 & wait",
+    });
+    defer proc.cleanupPtyForTest(&child);
+
+    var buf: [256]u8 = undefined;
+    var acc: [512]u8 = undefined;
+    var len: usize = 0;
+    const deadline = sys.monotonicMs() + 5_000;
+    while (std.mem.indexOf(u8, acc[0..len], "READY") == null and sys.monotonicMs() < deadline) {
+        var fds = [_]posix.pollfd{.{ .fd = child.master_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if ((posix.poll(&fds, 50) catch 0) > 0) {
+            const n = posix.read(child.master_fd, &buf) catch break;
+            if (n == 0) break;
+            const take = @min(n, acc.len - len);
+            @memcpy(acc[len .. len + take], buf[0..take]);
+            len += take;
+        }
+    }
+    try std.testing.expect(std.mem.indexOf(u8, acc[0..len], "READY") != null);
+    try child.sendSignal(.USR1, true);
+    // Drain master output so Darwin ttyclose does not block child exit on unread bytes.
+    while (std.mem.indexOf(u8, acc[0..len], "GOT_USR1") == null and sys.monotonicMs() < deadline) {
+        var fds = [_]posix.pollfd{.{ .fd = child.master_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if ((posix.poll(&fds, 50) catch 0) > 0) {
+            const n = posix.read(child.master_fd, &buf) catch break;
+            if (n == 0) break;
+            const take = @min(n, acc.len - len);
+            @memcpy(acc[len .. len + take], buf[0..take]);
+            len += take;
+        }
+    }
+    try std.testing.expect(std.mem.indexOf(u8, acc[0..len], "GOT_USR1") != null);
+    try std.testing.expect(child.waitBlocking(5_000));
+    try std.testing.expectError(error.SessionTerminated, child.sendSignal(.USR1, true));
 }
